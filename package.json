@@ -1,8 +1,9 @@
 {
   "name": "twilio-voice-bot",
   "version": "1.0.0",
-  "type": "commonjs",
+  "private": true,
   "main": "server.js",
+  "type": "commonjs",
   "engines": {
     "node": ">=18"
   },
@@ -11,7 +12,7 @@
   },
   "dependencies": {
     "express": "^4.18.2",
+    "googleapis": "^140.0.0",
     "twilio": "^4.19.0"
   }
 }
-"googleapis": "^140.0.0"
