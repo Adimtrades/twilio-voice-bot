@@ -9,6 +9,7 @@ app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
 
 const memory = new Map();
+const noInputCount = new Map(); // tracks silence per caller
 
 /* ================= OPENAI ================= */
 
@@ -70,21 +71,46 @@ app.post("/voice", async (req, res) => {
   const twiml = new VoiceResponse();
 
   try {
-    const speech = (req.body?.SpeechResult || "").trim();
-    const from = req.body?.From || "unknown";
+  const speech = (req.body?.SpeechResult || "").trim();
+const from = req.body?.From || "unknown";
+if (speech) noInputCount.set(from, 0);
+
 
     console.log("CALL FROM:", from);
     console.log("USER SAID:", speech);
 
     /* FIRST TIME — ASK QUESTION */
-    if (!speech) {
-      const gather = twiml.gather({
-        input: "speech",
-        action: "/voice",
-        method: "POST",
-        speechTimeout: "auto",
-        timeout: 5,
-      });
+   if (!speech) {
+  const fromKey = from;
+
+  const count = (noInputCount.get(fromKey) || 0) + 1;
+  noInputCount.set(fromKey, count);
+
+  const gather = twiml.gather({
+    input: "speech",
+    action: "/voice",
+    method: "POST",
+    speechTimeout: "auto",
+    timeout: 8, // was 5 (give them more time)
+  });
+
+  if (count === 1) {
+    gather.say({ voice: "alice" }, "Hi, what do you need help with today?");
+  } else if (count === 2) {
+    gather.say({ voice: "alice" }, "No worries. Just say it in a short sentence.");
+  } else {
+    // stop looping forever
+    twiml.say({ voice: "alice" }, "All good. Call back when ready. Goodbye.");
+    twiml.hangup();
+    res.type("text/xml").send(twiml.toString());
+    return;
+  }
+
+  twiml.redirect({ method: "POST" }, "/voice");
+  res.type("text/xml").send(twiml.toString());
+  return;
+}
+
 
       gather.say(
         { voice: "alice" },
