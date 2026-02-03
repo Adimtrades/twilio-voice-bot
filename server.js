@@ -1,169 +1,228 @@
 // server.js
 const express = require("express");
+const { google } = require("googleapis");
 const VoiceResponse = require("twilio").twiml.VoiceResponse;
 
+// Node 18+ has fetch built in. If not, upgrade node.
 const app = express();
 
-// Twilio sends application/x-www-form-urlencoded
+// Twilio sends x-www-form-urlencoded
 app.use(express.urlencoded({ extended: false }));
 
-// In-memory call memory (ok for testing; use DB later)
-const memory = new Map();
+// -------------------------
+// Simple in-memory memory (OK for testing, use DB later)
+// -------------------------
+const memory = new Map(); // key: caller number, value: { history: [] }
 
-/**
- * Call OpenAI to generate the next short receptionist response.
- * Keeps replies short and asks ONE question at a time.
- */
-async function askAI({ from, userText }) {
-  const apiKey = process.env.OPENAI_API_KEY;
-  if (!apiKey) {
-    return "System is not configured. Please try again later.";
+// -------------------------
+// Env
+// -------------------------
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4.1-mini";
+
+const GCAL_SERVICE_ACCOUNT_JSON = process.env.GCAL_SERVICE_ACCOUNT_JSON;
+const GCAL_CALENDAR_ID = process.env.GCAL_CALENDAR_ID;
+const TZ = process.env.TZ || "Australia/Sydney";
+
+const PORT = process.env.PORT || 3000;
+
+// -------------------------
+// Google Calendar Client
+// -------------------------
+function getCalendarClient() {
+  if (!GCAL_SERVICE_ACCOUNT_JSON) {
+    throw new Error("Missing GCAL_SERVICE_ACCOUNT_JSON");
   }
+  const creds = JSON.parse(GCAL_SERVICE_ACCOUNT_JSON);
 
-  const history = memory.get(from) || [];
+  const auth = new google.auth.JWT(
+    creds.client_email,
+    null,
+    creds.private_key,
+    ["https://www.googleapis.com/auth/calendar"]
+  );
+
+  return google.calendar({ version: "v3", auth });
+}
+
+// -------------------------
+// Calendar booking helper (used by /test-booking now, and later by phone flow)
+// -------------------------
+async function createBooking({ title, description, location, start, end }) {
+  if (!GCAL_CALENDAR_ID) throw new Error("Missing GCAL_CALENDAR_ID");
+
+  const cal = getCalendarClient();
+
+  const event = await cal.events.insert({
+    calendarId: GCAL_CALENDAR_ID,
+    requestBody: {
+      summary: title,
+      description,
+      location,
+      start: { dateTime: start.toISOString(), timeZone: TZ },
+      end: { dateTime: end.toISOString(), timeZone: TZ }
+    }
+  });
+
+  return event.data;
+}
+
+// -------------------------
+// OpenAI helper (short receptionist replies)
+// -------------------------
+async function askAI(from, userText) {
+  if (!OPENAI_API_KEY) return "System is not configured. Please try again later.";
+
+  const state = memory.get(from) || { history: [] };
 
   const messages = [
     {
       role: "system",
       content:
-        "You are a phone receptionist for a tradie. Speak naturally. Keep replies under 10 words. Ask ONE question at a time. Goal: collect name, job type, suburb/address, urgency, and preferred time window. If audio unclear, ask them to repeat slowly.",
+        "You are a phone receptionist for a tradie/handyman. Speak naturally. Keep replies under 12 words. Ask ONE question at a time. Goal: collect name, job type, suburb/address, urgency, and preferred time window. If user already gave a detail, do not ask again."
     },
-    ...history,
-    { role: "user", content: userText || "Caller said nothing." },
+    ...state.history,
+    { role: "user", content: userText || "Caller said nothing." }
   ];
 
   try {
     const resp = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${apiKey}`,
-        "Content-Type": "application/json",
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        "Content-Type": "application/json"
       },
       body: JSON.stringify({
-        model: "gpt-4.1-mini",
+        model: OPENAI_MODEL,
         messages,
         temperature: 0.3,
-      }),
+        max_tokens: 60
+      })
     });
 
     if (!resp.ok) {
-      const errText = await resp.text();
-      console.log("OpenAI error:", resp.status, errText);
-      return "Sorry, try again. What do you need?";
+      const txt = await resp.text();
+      console.log("OpenAI error:", resp.status, txt);
+      // fallback response so call still flows
+      return "Sorry—what suburb are you in?";
     }
 
     const data = await resp.json();
-    const aiText =
-      data?.choices?.[0]?.message?.content?.trim() ||
-      "Sorry—what do you need help with?";
+    const reply = data?.choices?.[0]?.message?.content?.trim() || "Sorry—can you repeat that?";
 
-    // Save short rolling history
-    const newHistory = [
-      ...history,
-      { role: "user", content: userText || "" },
-      { role: "assistant", content: aiText },
-    ].slice(-10);
+    // store short memory
+    state.history.push({ role: "user", content: userText });
+    state.history.push({ role: "assistant", content: reply });
+    // keep last 8 turns max
+    state.history = state.history.slice(-16);
 
-    memory.set(from, newHistory);
+    memory.set(from, state);
 
-    return aiText;
+    return reply;
   } catch (e) {
-    console.log("OpenAI fetch failed:", e);
-    return "Sorry, connection issue. Please repeat.";
+    console.log("askAI exception:", e);
+    return "Sorry—can you repeat that?";
   }
 }
 
-/**
- * Helper: creates a Gather (speech capture) with best phone settings.
- */
-function makeGather(twiml) {
-  return twiml.gather({
-    input: "speech",
-    action: "/listen",
-    method: "POST",
-    speechTimeout: "auto",
-    enhanced: true,
-    speechModel: "phone_call",
-  });
-}
-
-// Health check
-app.get("/", (req, res) => res.status(200).send("OK"));
-
-// Entry: answer call + ask first question + listen
-app.post("/voice", (req, res) => {
-  const twiml = new VoiceResponse();
-
-  twiml.say("Hi. What do you need help with?");
-  makeGather(twiml);
-
-  // If caller says nothing, re-prompt once
-  twiml.say("Sorry, I didn't catch that. Please say it again.");
-  makeGather(twiml);
-
-  res.type("text/xml").send(twiml.toString());
+// -------------------------
+// HEALTH CHECK
+// -------------------------
+app.get("/", (req, res) => {
+  res.send("OK: twilio-voice-bot running");
 });
 
-// Listen: get speech text -> ask AI -> speak -> gather again
-app.post("/listen", async (req, res) => {
-  const twiml = new VoiceResponse();
-
-  const from = req.body.From || "unknown";
-
-  // Twilio speech text field:
-  const speech = (req.body.SpeechResult || "").trim();
-  const confidence = req.body.Confidence;
-
-  console.log("From:", from, "SpeechResult:", speech, "Confidence:", confidence);
-
-  // If speech is empty, ask to repeat
-  if (!speech) {
-    twiml.say("Sorry. Please repeat slowly.");
-    makeGather(twiml);
-    return res.type("text/xml").send(twiml.toString());
-  }
-
-  const reply = await askAI({ from, userText: speech });
-
-  twiml.say(reply);
-  makeGather(twiml);
-
-  // safety re-prompt
-  twiml.say("Sorry, say that again please.");
-  makeGather(twiml);
-
-  res.type("text/xml").send(twiml.toString());
-});
-
-// Start server
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log("Server running on port", PORT));
+// -------------------------
+// TEST BOOKING ENDPOINT (browser test)
+// -------------------------
 app.get("/test-booking", async (req, res) => {
   try {
-    const cal = getCalendarClient(); // uses your GCAL_SERVICE_ACCOUNT_JSON
-    const calendarId = process.env.GCAL_CALENDAR_ID;
-
-    if (!calendarId) return res.status(400).send("Missing GCAL_CALENDAR_ID");
-
     const start = new Date(Date.now() + 60 * 60 * 1000); // 1 hour from now
     const end = new Date(start);
     end.setMinutes(end.getMinutes() + 60);
 
-    const event = await cal.events.insert({
-      calendarId,
-      requestBody: {
-        summary: "Test Booking (AI Bot)",
-        description: "Created from /test-booking",
-        location: "Newcastle NSW",
-        start: { dateTime: start.toISOString() },
-        end: { dateTime: end.toISOString() }
-      }
+    const ev = await createBooking({
+      title: "Test Booking (AI Bot)",
+      description: "Created from /test-booking",
+      location: "Newcastle NSW",
+      start,
+      end
     });
 
-    res.json({ ok: true, eventId: event.data.id, link: event.data.htmlLink });
+    res.json({ ok: true, eventId: ev.id, link: ev.htmlLink });
   } catch (e) {
     console.log("test-booking error:", e);
     res.status(500).json({ ok: false, error: String(e) });
   }
 });
 
+// -------------------------
+// TWILIO VOICE WEBHOOK
+// -------------------------
+app.post("/voice", async (req, res) => {
+  try {
+    const twiml = new VoiceResponse();
+
+    // caller number (E.164 format)
+    const from = req.body.From || "unknown";
+    const speech = (req.body.SpeechResult || "").trim();
+    const confidence = req.body.Confidence;
+
+    if (speech) {
+      console.log(`From: ${from} SpeechResult: ${speech} Confidence: ${confidence}`);
+    } else {
+      console.log(`From: ${from} (no speech captured)`);
+    }
+
+    // If no speech, prompt again (improves success)
+    if (!speech) {
+      twiml.say("Sorry, I didn't catch that.");
+      twiml.gather({
+        input: "speech",
+        action: "/voice",
+        method: "POST",
+        timeout: 5,
+        speechTimeout: "auto",
+        language: "en-AU",
+        hints: "leaking sink, blocked drain, plumber, electrician, quote, today, tomorrow, Newcastle, Maitland, Lake Macquarie",
+      }).say("What do you need help with?");
+      res.type("text/xml").send(twiml.toString());
+      return;
+    }
+
+    // Ask AI for next question
+    const aiReply = await askAI(from, speech);
+
+    // Speak + gather again (loop)
+    const gather = twiml.gather({
+      input: "speech",
+      action: "/voice",
+      method: "POST",
+      timeout: 6,
+      speechTimeout: "auto",
+      language: "en-AU",
+      hints: "name, address, suburb, urgency, today, tomorrow, morning, afternoon, Newcastle, Maitland, Lake Macquarie",
+    });
+
+    gather.say(aiReply);
+
+    // If caller stays silent, Twilio will continue here
+    twiml.say("Sorry—call back anytime. Goodbye.");
+    twiml.hangup();
+
+    res.type("text/xml").send(twiml.toString());
+  } catch (e) {
+    console.log("voice webhook error:", e);
+    const twiml = new VoiceResponse();
+    twiml.say("Sorry, something went wrong. Please call back.");
+    twiml.hangup();
+    res.type("text/xml").send(twiml.toString());
+  }
+});
+
+// -------------------------
+// START
+// -------------------------
+app.listen(PORT, () => {
+  console.log(`Server listening on port ${PORT}`);
+});
