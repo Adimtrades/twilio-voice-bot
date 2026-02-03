@@ -186,34 +186,62 @@ app.post("/voice", async (req, res) => {
   const twiml = new VoiceResponse();
 
   try {
-    console.log("CALL RECEIVED");
+    const userText = (req.body?.SpeechResult || "").trim();
+    const from = req.body?.From || "unknown";
 
-    let safeText = "Hello, how can I help you today?";
+    // If Twilio didn't capture speech yet, prompt them
+    if (!userText) {
+      const gather = twiml.gather({
+        input: "speech",
+        action: "/voice",
+        method: "POST",
+        speechTimeout: "auto",
+        timeout: 6,
+      });
 
-    if (req.body && req.body.SpeechResult) {
-      safeText = String(req.body.SpeechResult).slice(0, 200);
+      gather.say(
+        { voice: "alice" },
+        "Hi, what do you need help with today?"
+      );
+
+      // If they say nothing, loop once more
+      twiml.redirect({ method: "POST" }, "/voice");
+
+      res.type("text/xml").send(twiml.toString());
+      return;
     }
 
+    // ✅ HERE is where we use OpenAI (instead of repeating SpeechResult)
+    const aiReply = await askAI(from, userText);
+
+    const safeReply = String(aiReply || "")
+      .replace(/[<>]/g, "") // avoid XML issues
+      .slice(0, 350) || "Sorry, I missed that. Can you repeat?";
+
+    twiml.say({ voice: "alice" }, safeReply);
+
+    // keep the conversation going
     const gather = twiml.gather({
       input: "speech",
       action: "/voice",
       method: "POST",
-      speechTimeout: "auto"
+      speechTimeout: "auto",
+      timeout: 6,
     });
 
-    gather.say({
-      voice: "alice"
-    }, safeText);
+    gather.say(
+      { voice: "alice" },
+      "One more question. What suburb are you in?"
+    );
 
+    twiml.redirect({ method: "POST" }, "/voice");
   } catch (err) {
     console.log("VOICE ERROR:", err);
-    twiml.say("Sorry, system error. Please try again.");
+    twiml.say({ voice: "alice" }, "Sorry, something broke. Try again.");
   }
 
-  res.type("text/xml");
-  res.send(twiml.toString());
+  res.type("text/xml").send(twiml.toString());
 });
-
 
 // -------------------- Routes --------------------
 app.get("/health", (req, res) => res.json({ ok: true }));
