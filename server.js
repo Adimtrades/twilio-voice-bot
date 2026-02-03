@@ -50,12 +50,14 @@ app.post("/voice", (req, res) => {
 
   twiml.say("Hi, thanks for calling. Tell me what you need help with.");
 
-  twiml.gather({
-    input: "speech",
-    action: "/listen",
-    method: "POST",
-    speechTimeout: "auto",
-  });
+twiml.gather({
+  input: "speech",
+  action: "/listen",
+  method: "POST",
+  speechTimeout: "auto",
+  enhanced: true,
+  speechModel: "phone_call"
+});
 
   res.type("text/xml").send(twiml.toString());
 });
@@ -64,7 +66,8 @@ app.post("/listen", async (req, res) => {
   const twiml = new VoiceResponse();
 
   const from = req.body.From || "unknown";
-  const said = req.body.SpeechResult || "";
+const said = req.body.SpeechResult || req.body.SpeechResultText || "Caller was silent";
+
 
   const reply = await askAI({ from, userText: said });
 
@@ -83,3 +86,4 @@ app.post("/listen", async (req, res) => {
 
 app.get("/", (req, res) => res.send("OK"));
 app.listen(process.env.PORT || 3000);
+console.log("Caller said:", req.body.SpeechResult);
