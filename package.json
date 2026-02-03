@@ -1,7 +1,6 @@
 {
-  "name": "twilio-voice-bot",
+  "name": "twilio-voice-booking-bot",
   "version": "1.0.0",
-  "private": true,
   "main": "server.js",
   "type": "commonjs",
   "engines": {
@@ -11,8 +10,9 @@
     "start": "node server.js"
   },
   "dependencies": {
-    "express": "^4.18.2",
+    "express": "^4.19.2",
     "googleapis": "^140.0.0",
-    "twilio": "^4.19.0"
+    "twilio": "^4.23.0"
   }
 }
+
