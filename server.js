@@ -138,3 +138,32 @@ app.post("/listen", async (req, res) => {
 // Start server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log("Server running on port", PORT));
+app.get("/test-booking", async (req, res) => {
+  try {
+    const cal = getCalendarClient(); // uses your GCAL_SERVICE_ACCOUNT_JSON
+    const calendarId = process.env.GCAL_CALENDAR_ID;
+
+    if (!calendarId) return res.status(400).send("Missing GCAL_CALENDAR_ID");
+
+    const start = new Date(Date.now() + 60 * 60 * 1000); // 1 hour from now
+    const end = new Date(start);
+    end.setMinutes(end.getMinutes() + 60);
+
+    const event = await cal.events.insert({
+      calendarId,
+      requestBody: {
+        summary: "Test Booking (AI Bot)",
+        description: "Created from /test-booking",
+        location: "Newcastle NSW",
+        start: { dateTime: start.toISOString() },
+        end: { dateTime: end.toISOString() }
+      }
+    });
+
+    res.json({ ok: true, eventId: event.data.id, link: event.data.htmlLink });
+  } catch (e) {
+    console.log("test-booking error:", e);
+    res.status(500).json({ ok: false, error: String(e) });
+  }
+});
+
