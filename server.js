@@ -182,84 +182,38 @@ Google Maps: ${gmaps}${notesText}
 }
 
 // -------------------- Voice UX helpers --------------------
-function twimlSayGather({ prompt, actionUrl }) {
-  const vr = new twilio.twiml.VoiceResponse();
+app.post("/voice", async (req, res) => {
+  const twiml = new VoiceResponse();
 
-  const gather = vr.gather({
-    input: "speech",
-    action: actionUrl,
-    method: "POST",
-    language: "en-AU",
-    speechTimeout: "auto",
-    timeout: 6,
-    hints: "plumber, electrician, leak, blocked drain, hot water, repair, quote, Newcastle, tomorrow, urgent",
-    profanityFilter: false
-  });
+  try {
+    console.log("CALL RECEIVED");
 
-  // Slightly slower + clear
-  gather.say({ voice: "Polly.Olivia", language: "en-AU" }, prompt);
+    let safeText = "Hello, how can I help you today?";
 
-  // If no speech captured, loop once with a clearer prompt
-  vr.redirect({ method: "POST" }, "/voice");
+    if (req.body && req.body.SpeechResult) {
+      safeText = String(req.body.SpeechResult).slice(0, 200);
+    }
 
-  return vr;
-}
+    const gather = twiml.gather({
+      input: "speech",
+      action: "/voice",
+      method: "POST",
+      speechTimeout: "auto"
+    });
 
-function baseUrl(req) {
-  if (BASE_URL && BASE_URL.startsWith("http")) return BASE_URL;
-  return `${req.protocol}://${req.get("host")}`;
-}
+    gather.say({
+      voice: "alice"
+    }, safeText);
 
-function nextQuestion(sess) {
-  // Ask ONE question at a time
-  if (!sess.jobType) return { step: "jobType", q: "What job do you need help with? Plumber, electrician, or handyman?" };
-  if (!sess.suburb) return { step: "suburb", q: "What suburb are you in?" };
-  if (!sess.address) return { step: "address", q: "What’s the street address? You can say it slowly." };
-  if (!sess.urgency) return { step: "urgency", q: "Is it urgent today, or standard?" };
-  if (!sess.preferredTime) return { step: "preferredTime", q: "What time suits you? For example, tomorrow morning." };
-  if (!sess.name) return { step: "name", q: "What’s your name?" };
-  // optional upgrades
-  if (!sess.budget) return { step: "budget", q: "Do you have a budget or want a quote? Say a number, or say skip." };
-  // done
-  return { step: "done", q: null };
-}
-
-// Very simple field assignment based on current step
-function applyAnswer(sess, step, text) {
-  const t = normalize(text);
-
-  if (!t) return;
-
-  // allow "skip" for optional budget
-  const isSkip = /^(skip|no|nope|nah)$/i.test(t);
-
-  switch (step) {
-    case "jobType":
-      sess.jobType = t;
-      break;
-    case "suburb":
-      sess.suburb = t;
-      break;
-    case "address":
-      sess.address = t;
-      break;
-    case "urgency":
-      sess.urgency = /urgent|asap|today|now/i.test(t) ? "URGENT" : "Standard";
-      break;
-    case "preferredTime":
-      sess.preferredTime = t;
-      break;
-    case "name":
-      sess.name = t;
-      break;
-    case "budget":
-      if (!isSkip) sess.budget = t;
-      else sess.budget = "Skipped";
-      break;
-    default:
-      setNote(sess, t);
+  } catch (err) {
+    console.log("VOICE ERROR:", err);
+    twiml.say("Sorry, system error. Please try again.");
   }
-}
+
+  res.type("text/xml");
+  res.send(twiml.toString());
+});
+
 
 // -------------------- Routes --------------------
 app.get("/health", (req, res) => res.json({ ok: true }));
