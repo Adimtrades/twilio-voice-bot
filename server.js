@@ -57,19 +57,22 @@ app.post("/voice", async (req, res) => {
   console.log("CALL FROM:", from);
   console.log("Speech:", speech, "Confidence:", confidence);
 
-  let session = sessions.get(from) || {
-    step: "job",
-    job: "",
-    suburb: "",
-    name: "",
-    time: ""
-  };
+let session = sessions.get(from) || {
+  step: "job",
+  job: "",
+  suburb: "",
+  name: "",
+  time: "",
+  retries: 0
+};
+
 
   // ===== LOW CONFIDENCE FILTER =====
-  if (confidence < 0.45 && speech.split(" ").length <= 2) {
-    gatherSpeech(twiml, "Sorry, could you repeat that?", "/voice");
-    return res.type("text/xml").send(twiml.toString());
-  }
+// Only reject if literally nothing heard
+if (!speech || speech.length < 2) {
+  gatherSpeech(twiml, "Sorry, I didn’t catch that. Please repeat.", "/voice");
+  return res.type("text/xml").send(twiml.toString());
+}
 
   try {
 
@@ -90,15 +93,31 @@ app.post("/voice", async (req, res) => {
     }
 
     // ===== SUBURB =====
-    if (session.step === "suburb") {
+   if (session.step === "suburb") {
 
-      session.suburb = speech || session.suburb;
-      session.step = "name";
-      sessions.set(from, session);
+  if (!speech) {
+    session.retries++;
 
-      gatherSpeech(twiml, "What is your name?", "/voice");
+    if (session.retries >= 2) {
+      twiml.say("I'll text you to finish booking.");
+      sessions.delete(from);
+      twiml.hangup();
       return res.type("text/xml").send(twiml.toString());
     }
+
+    gatherSpeech(twiml, "Sorry, what suburb are you in?", "/voice");
+    return res.type("text/xml").send(twiml.toString());
+  }
+
+  session.suburb = speech;
+  session.retries = 0;
+  session.step = "name";
+
+  sessions.set(from, session);
+
+  gatherSpeech(twiml, "What is your name?", "/voice");
+  return res.type("text/xml").send(twiml.toString());
+}
 
     // ===== NAME =====
     if (session.step === "name") {
