@@ -43,6 +43,12 @@ function cleanSpeech(text) {
   if (!text) return "";
   return text.toLowerCase().replace(/[^\w\s]/g, "").trim();
 }
+// Ignore garbage or silence completely
+if (!speech || speech.length < 2) {
+  const twiml = new VoiceResponse();
+  gatherSpeech(twiml, "Sorry, please say that again.", "/voice");
+  return res.type("text/xml").send(twiml.toString());
+}
 
 // ===== MAIN VOICE ROUTE =====
 app.post("/voice", async (req, res) => {
@@ -57,14 +63,19 @@ app.post("/voice", async (req, res) => {
   console.log("CALL FROM:", from);
   console.log("Speech:", speech, "Confidence:", confidence);
 
-let session = sessions.get(from) || {
-  step: "job",
-  job: "",
-  suburb: "",
-  name: "",
-  time: "",
-  retries: 0
-};
+let session = sessions.get(from);
+
+if (!session) {
+  session = {
+    step: "job",
+    job: "",
+    suburb: "",
+    name: "",
+    time: "",
+    retries: 0
+  };
+}
+
 
 
   // ===== LOW CONFIDENCE FILTER =====
@@ -77,20 +88,24 @@ if (!speech || speech.length < 2) {
   try {
 
     // ===== JOB =====
-    if (session.step === "job") {
+ if (session.step === "job") {
 
-      if (!speech) {
-        gatherSpeech(twiml, "What job do you need help with?", "/voice");
-        return res.type("text/xml").send(twiml.toString());
-      }
+  if (!session.job) {
 
-      session.job = speech;
-      session.step = "suburb";
-      sessions.set(from, session);
-
-      gatherSpeech(twiml, "What suburb are you in?", "/voice");
+    if (!speech) {
+      gatherSpeech(twiml, "What job do you need help with?", "/voice");
       return res.type("text/xml").send(twiml.toString());
     }
+
+    session.job = speech;
+    session.step = "suburb";
+    sessions.set(from, session);
+
+    gatherSpeech(twiml, "What suburb are you in?", "/voice");
+    return res.type("text/xml").send(twiml.toString());
+  }
+}
+
 
     // ===== SUBURB =====
    if (session.step === "suburb") {
