@@ -1,180 +1,296 @@
-require("dotenv").config();
+// server.js
+
+// Safe dotenv: works locally, won't crash if missing in prod
+try {
+  require("dotenv").config();
+} catch (e) {
+  // ignore in Render if not needed
+}
 
 const express = require("express");
 const twilio = require("twilio");
 const { google } = require("googleapis");
 
 const app = express();
+
+// Twilio sends application/x-www-form-urlencoded
 app.use(express.urlencoded({ extended: false }));
 
 const VoiceResponse = twilio.twiml.VoiceResponse;
 
+// --------------------
+// Session store
+// Key by CallSid (better than From)
+// --------------------
 const sessions = new Map();
 
-/* ================= GOOGLE CALENDAR ================= */
-
-function getCalendarClient() {
-  if (!process.env.GOOGLE_SERVICE_JSON) {
-    throw new Error("Missing GOOGLE_SERVICE_JSON env variable");
+function getSession(callSid) {
+  if (!sessions.has(callSid)) {
+    sessions.set(callSid, {
+      step: "job",
+      job: "",
+      suburb: "",
+      name: "",
+      time: "",
+      lastPrompt: "",
+      tries: 0
+    });
   }
-
-  const auth = new google.auth.GoogleAuth({
-    credentials: JSON.parse(process.env.GOOGLE_SERVICE_JSON),
-    scopes: ["https://www.googleapis.com/auth/calendar"]
-  });
-
-  return google.calendar({ version: "v3", auth });
+  return sessions.get(callSid);
 }
 
-/* ================= HELPERS ================= */
+function resetSession(callSid) {
+  sessions.delete(callSid);
+}
 
+// --------------------
+// Helpers
+// --------------------
 function cleanSpeech(text) {
   if (!text) return "";
-  return text.toLowerCase().replace(/[^\w\s]/g, "").trim();
+  return String(text)
+    .trim()
+    .replace(/\s+/g, " ");
 }
 
-function gatherSpeech(twiml, text) {
+function ask(twiml, prompt, actionUrl) {
   const gather = twiml.gather({
     input: "speech",
-    action: "/voice",
+    action: actionUrl,
     method: "POST",
     timeout: 5,
     speechTimeout: "auto",
     language: "en-AU"
   });
 
-  gather.say(text, { voice: "Polly.Amy", language: "en-AU" });
+  // Never pass empty text to say (prevents Twilio 13520)
+  gather.say(prompt || "Sorry, can you repeat that?", {
+    voice: "Polly.Amy",
+    language: "en-AU"
+  });
 }
 
-/* ================= MAIN ROUTE ================= */
+// Accept speech with step-specific tolerance.
+// Suburb often comes back low confidence, so we allow it more.
+function shouldReject(step, speech, confidence) {
+  const s = speech.toLowerCase();
 
+  // If they said literally nothing / noise
+  if (!speech || speech.length < 2) return true;
+
+  // Common garbage from STT
+  if (s === "hello" || s === "hi" || s === "yeah" || s === "yes") {
+    // allow "hello" only for first job step if they haven’t said job yet
+    return step !== "job";
+  }
+
+  // Confidence tuning:
+  // job: needs to be reasonable
+  // suburb/name/time: allow lower confidence (Twilio often low here)
+  const minConf = step === "job" ? 0.35 : 0.15;
+
+  // If confidence is provided and very low AND the utterance is tiny, reject.
+  if (typeof confidence === "number" && confidence > 0 && confidence < minConf) {
+    if (speech.split(" ").length <= 2) return true;
+  }
+
+  return false;
+}
+
+// --------------------
+// Google Calendar client
+// --------------------
+function parseGoogleServiceJson() {
+  const raw = process.env.GOOGLE_SERVICE_JSON;
+  if (!raw) throw new Error("Missing GOOGLE_SERVICE_JSON env variable");
+
+  // People often paste either:
+  // 1) real JSON object text: { "type": "...", ... }
+  // 2) a JSON-stringified version (starts/ends with quotes) containing \n
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (e) {
+    // If they pasted raw JSON but with newlines mangled, still try:
+    parsed = JSON.parse(raw.replace(/\r?\n/g, "\\n"));
+  }
+
+  // If it parsed into a STRING, parse again to get object
+  if (typeof parsed === "string") {
+    parsed = JSON.parse(parsed);
+  }
+
+  return parsed;
+}
+
+function getCalendarClient() {
+  const credentials = parseGoogleServiceJson();
+
+  const auth = new google.auth.GoogleAuth({
+    credentials,
+    scopes: ["https://www.googleapis.com/auth/calendar"]
+  });
+
+  return google.calendar({ version: "v3", auth });
+}
+
+// --------------------
+// Voice route
+// --------------------
 app.post("/voice", async (req, res) => {
   const twiml = new VoiceResponse();
 
-  try {
-    const from = req.body.From || "unknown";
+  const callSid = req.body.CallSid || req.body.CallSID || "unknown";
+  const confidence = Number(req.body.Confidence || 0);
+  const speechRaw = req.body.SpeechResult || "";
+  const speech = cleanSpeech(speechRaw);
 
-    const speechRaw = req.body.SpeechResult || "";
-    const confidence = Number(req.body.Confidence || 0);
+  const session = getSession(callSid);
 
-    const speech = cleanSpeech(speechRaw);
+  console.log(
+    `CALLSID=${callSid} STEP=${session.step} Speech="${speech}" Confidence=${confidence}`
+  );
 
-    console.log("CALL FROM:", from);
-    console.log("Speech:", speech, "Confidence:", confidence);
+  // If Twilio hits the webhook with no speech (start of call or timeout),
+  // repeat the last prompt or ask the current step question.
+  if (!speech) {
+    session.tries += 1;
 
-    let session = sessions.get(from) || {
-      step: "job",
-      job: "",
-      suburb: "",
-      name: "",
-      time: "",
-      lastPrompt: ""
+    // If they keep not responding, bail gracefully.
+    if (session.tries >= 3) {
+      twiml.say("No worries. Please call back when ready.", {
+        voice: "Polly.Amy",
+        language: "en-AU"
+      });
+      twiml.hangup();
+      resetSession(callSid);
+      return res.type("text/xml").send(twiml.toString());
+    }
+
+    const promptMap = {
+      job: "What job do you need help with?",
+      suburb: "What suburb are you in?",
+      name: "What is your name?",
+      time: "What time would you like?"
     };
 
-    /* ===== BAD INPUT FILTER ===== */
-    if (!speech && confidence < 0.4) {
-      gatherSpeech(twiml, "Sorry, could you repeat that?");
-      return res.type("text/xml").send(twiml.toString());
-    }
+    const prompt = session.lastPrompt || promptMap[session.step] || "Can you repeat that?";
+    session.lastPrompt = prompt;
 
-    /* ================= JOB ================= */
+    ask(twiml, prompt, "/voice");
+    return res.type("text/xml").send(twiml.toString());
+  }
+
+  // We got speech → reset tries
+  session.tries = 0;
+
+  // Reject bad recognition for the current step
+  if (shouldReject(session.step, speech, confidence)) {
+    const repromptMap = {
+      job: "Sorry — what job do you need help with?",
+      suburb: "Sorry — what suburb are you in?",
+      name: "Sorry — what is your name?",
+      time: "Sorry — what time would you like?"
+    };
+
+    const reprompt = repromptMap[session.step] || "Sorry, can you repeat that?";
+    session.lastPrompt = reprompt;
+    ask(twiml, reprompt, "/voice");
+    return res.type("text/xml").send(twiml.toString());
+  }
+
+  try {
+    // Step machine
     if (session.step === "job") {
-
-      if (!speech) {
-        gatherSpeech(twiml, "What job do you need help with?");
-        return res.type("text/xml").send(twiml.toString());
-      }
-
       session.job = speech;
       session.step = "suburb";
-      sessions.set(from, session);
-
-      gatherSpeech(twiml, "What suburb are you in?");
+      session.lastPrompt = "What suburb are you in?";
+      ask(twiml, session.lastPrompt, "/voice");
       return res.type("text/xml").send(twiml.toString());
     }
 
-    /* ================= SUBURB ================= */
     if (session.step === "suburb") {
-
-      if (!speech) {
-        gatherSpeech(twiml, "Sorry, what suburb?");
-        return res.type("text/xml").send(twiml.toString());
-      }
-
       session.suburb = speech;
       session.step = "name";
-      sessions.set(from, session);
-
-      gatherSpeech(twiml, "What is your name?");
+      session.lastPrompt = "What is your name?";
+      ask(twiml, session.lastPrompt, "/voice");
       return res.type("text/xml").send(twiml.toString());
     }
 
-    /* ================= NAME ================= */
     if (session.step === "name") {
-
-      if (!speech) {
-        gatherSpeech(twiml, "Sorry, what is your name?");
-        return res.type("text/xml").send(twiml.toString());
-      }
-
       session.name = speech;
       session.step = "time";
-      sessions.set(from, session);
-
-      gatherSpeech(twiml, "When do you need this done?");
+      session.lastPrompt = "What time would you like?";
+      ask(twiml, session.lastPrompt, "/voice");
       return res.type("text/xml").send(twiml.toString());
     }
 
-    /* ================= TIME ================= */
     if (session.step === "time") {
-
-      if (!speech) {
-        gatherSpeech(twiml, "What time suits you?");
-        return res.type("text/xml").send(twiml.toString());
-      }
-
       session.time = speech;
 
-      const summary =
-        `${session.name} needs ${session.job} in ${session.suburb} at ${session.time}`;
+      const summary = `${session.name} needs ${session.job} in ${session.suburb} at ${session.time}.`;
 
-      console.log("BOOKING:", summary);
+      twiml.say(`Booking confirmed. ${summary}`, {
+        voice: "Polly.Amy",
+        language: "en-AU"
+      });
 
-      twiml.say(`Booking confirmed. ${summary}`);
-
-      try {
-        const calendar = getCalendarClient();
-
-        await calendar.events.insert({
-          calendarId: process.env.GOOGLE_CALENDAR_ID,
-          requestBody: {
-            summary: `${session.job} - ${session.name}`,
-            description: summary,
-            start: { dateTime: new Date().toISOString() },
-            end: { dateTime: new Date(Date.now() + 3600000).toISOString() }
-          }
-        });
-
-      } catch (calendarErr) {
-        console.error("Calendar error:", calendarErr.message);
+      // Create calendar event (safe)
+      const calendarId = process.env.GOOGLE_CALENDAR_ID;
+      if (!calendarId) {
+        throw new Error("Missing GOOGLE_CALENDAR_ID env variable");
       }
 
-      sessions.delete(from);
-      twiml.hangup();
+      const calendar = getCalendarClient();
 
+      // Simple timing: create event starting now+5min for 1 hour.
+      const start = new Date(Date.now() + 5 * 60 * 1000);
+      const end = new Date(start.getTime() + 60 * 60 * 1000);
+
+      await calendar.events.insert({
+        calendarId,
+        requestBody: {
+          summary: `${session.job} - ${session.name}`,
+          description: summary,
+          start: {
+            dateTime: start.toISOString(),
+            timeZone: process.env.TIMEZONE || "Australia/Sydney"
+          },
+          end: {
+            dateTime: end.toISOString(),
+            timeZone: process.env.TIMEZONE || "Australia/Sydney"
+          }
+        }
+      });
+
+      resetSession(callSid);
+      twiml.hangup();
       return res.type("text/xml").send(twiml.toString());
     }
 
+    // Fallback
+    session.step = "job";
+    session.lastPrompt = "What job do you need help with?";
+    ask(twiml, session.lastPrompt, "/voice");
+    return res.type("text/xml").send(twiml.toString());
   } catch (err) {
     console.error("VOICE ERROR:", err);
-    twiml.say("Sorry, system error.");
+
+    twiml.say("Sorry, there was a system error. Please try again.", {
+      voice: "Polly.Amy",
+      language: "en-AU"
+    });
+    twiml.hangup();
+
+    // Don't keep a broken session around
+    resetSession(callSid);
+
     return res.type("text/xml").send(twiml.toString());
   }
 });
 
-/* ================= HEALTH ================= */
-
+// Health check
 app.get("/", (req, res) => res.send("Voice bot running"));
 
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log("Server running on", PORT));
+app.listen(PORT, () => console.log("Server listening on", PORT));
