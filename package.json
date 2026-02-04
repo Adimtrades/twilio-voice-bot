@@ -1,19 +1,18 @@
 {
   "name": "twilio-voice-booking-bot",
   "version": "1.0.0",
-  "private": true,
+  "description": "Twilio voice booking bot with Google Calendar",
   "main": "server.js",
-  "type": "commonjs",
   "scripts": {
     "start": "node server.js"
   },
   "engines": {
     "node": ">=18"
   },
-"dependencies": {
-  "express": "^4.18.2",
-  "twilio": "^4.0.0",
-  "googleapis": "^133.0.0",
-  "dotenv": "^16.4.5"
+  "dependencies": {
+    "express": "^4.18.2",
+    "twilio": "^4.23.0",
+    "googleapis": "^133.0.0",
+    "dotenv": "^16.4.5"
+  }
 }
-
