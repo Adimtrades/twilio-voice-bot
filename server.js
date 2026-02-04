@@ -1,5 +1,3 @@
-require("dotenv").config();
-
 const express = require("express");
 const twilio = require("twilio");
 const { google } = require("googleapis");
@@ -14,10 +12,15 @@ const sessions = new Map();
 
 // ===== GOOGLE CALENDAR =====
 function getCalendarClient() {
+  if (!process.env.GOOGLE_SERVICE_JSON) {
+    throw new Error("Missing GOOGLE_SERVICE_JSON env variable");
+  }
+
   const auth = new google.auth.GoogleAuth({
     credentials: JSON.parse(process.env.GOOGLE_SERVICE_JSON),
     scopes: ["https://www.googleapis.com/auth/calendar"]
   });
+
   return google.calendar({ version: "v3", auth });
 }
 
@@ -27,7 +30,7 @@ function gatherSpeech(twiml, text, actionUrl) {
     input: "speech",
     action: actionUrl,
     method: "POST",
-    timeout: 4,
+    timeout: 5,
     speechTimeout: "auto",
     language: "en-AU"
   });
@@ -38,25 +41,22 @@ function gatherSpeech(twiml, text, actionUrl) {
 // ===== CLEAN SPEECH =====
 function cleanSpeech(text) {
   if (!text) return "";
-  return text
-    .toLowerCase()
-    .replace(/[^\w\s]/g, "")
-    .trim();
+  return text.toLowerCase().replace(/[^\w\s]/g, "").trim();
 }
 
 // ===== MAIN VOICE ROUTE =====
 app.post("/voice", async (req, res) => {
   const twiml = new VoiceResponse();
 
-  const from = req.body.From;
+  const from = req.body.From || "unknown";
   const speechRaw = req.body.SpeechResult || "";
   const confidence = Number(req.body.Confidence || 0);
 
   const speech = cleanSpeech(speechRaw);
 
+  console.log("CALL FROM:", from);
   console.log("Speech:", speech, "Confidence:", confidence);
 
-  // ===== GET SESSION =====
   let session = sessions.get(from) || {
     step: "job",
     job: "",
@@ -65,13 +65,11 @@ app.post("/voice", async (req, res) => {
     time: ""
   };
 
-  // ===== FILTER BAD INPUT =====
-  if (confidence < 0.5 && speech.split(" ").length <= 2) {
-    gatherSpeech(twiml, "Sorry, say that again.", "/voice");
+  // ===== LOW CONFIDENCE FILTER =====
+  if (confidence < 0.45 && speech.split(" ").length <= 2) {
+    gatherSpeech(twiml, "Sorry, could you repeat that?", "/voice");
     return res.type("text/xml").send(twiml.toString());
   }
-
-  // ===== STATE MACHINE =====
 
   try {
 
@@ -94,12 +92,7 @@ app.post("/voice", async (req, res) => {
     // ===== SUBURB =====
     if (session.step === "suburb") {
 
-      if (!speech) {
-        gatherSpeech(twiml, "Sorry, what suburb?", "/voice");
-        return res.type("text/xml").send(twiml.toString());
-      }
-
-      session.suburb = speech;
+      session.suburb = speech || session.suburb;
       session.step = "name";
       sessions.set(from, session);
 
@@ -110,12 +103,7 @@ app.post("/voice", async (req, res) => {
     // ===== NAME =====
     if (session.step === "name") {
 
-      if (!speech) {
-        gatherSpeech(twiml, "Sorry, what is your name?", "/voice");
-        return res.type("text/xml").send(twiml.toString());
-      }
-
-      session.name = speech;
+      session.name = speech || session.name;
       session.step = "time";
       sessions.set(from, session);
 
@@ -126,21 +114,15 @@ app.post("/voice", async (req, res) => {
     // ===== TIME =====
     if (session.step === "time") {
 
-      if (!speech) {
-        gatherSpeech(twiml, "What time suits you?", "/voice");
-        return res.type("text/xml").send(twiml.toString());
-      }
-
-      session.time = speech;
-      session.step = "confirm";
-      sessions.set(from, session);
+      session.time = speech || session.time;
 
       const summary =
         `${session.name} needs ${session.job} in ${session.suburb} at ${session.time}`;
 
+      console.log("BOOKING:", summary);
+
       twiml.say(`Booking confirmed. ${summary}`);
 
-      // ===== CREATE CALENDAR EVENT =====
       const calendar = getCalendarClient();
 
       await calendar.events.insert({
@@ -160,15 +142,15 @@ app.post("/voice", async (req, res) => {
     }
 
   } catch (err) {
-    console.error(err);
-    twiml.say("Sorry, system error.");
+    console.error("VOICE ERROR:", err);
+    twiml.say("Sorry, there was a system error.");
     return res.type("text/xml").send(twiml.toString());
   }
 
 });
 
-// ===== TEST ROUTE =====
+// ===== HEALTH CHECK =====
 app.get("/", (req, res) => res.send("Voice bot running"));
 
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log("Server running", PORT));
+app.listen(PORT, () => console.log("Server running on", PORT));
