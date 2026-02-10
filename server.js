@@ -11,6 +11,9 @@ const express = require("express");
 const twilio = require("twilio");
 const { google } = require("googleapis");
 
+// ✅ NEW: natural-language time parsing ("tomorrow 5pm", "Thursday 11am", etc.)
+const chrono = require("chrono-node");
+
 const app = express();
 
 // Twilio sends application/x-www-form-urlencoded
@@ -97,6 +100,24 @@ function shouldReject(step, speech, confidence) {
   return false;
 }
 
+// ✅ NEW: parse spoken times into a real Date (chrono-node)
+function parseSpokenDateTime(text) {
+  const cleaned = cleanSpeech(text);
+  if (!cleaned) return null;
+
+  // forwardDate: true pushes ambiguous refs to the future (e.g., "Monday" means next Monday)
+  const dt = chrono.parseDate(cleaned, new Date(), { forwardDate: true });
+  return dt || null;
+}
+
+function buildEventTimesFromSpeech(speechTime, durationMins = 60) {
+  const start = parseSpokenDateTime(speechTime);
+  if (!start) return null;
+
+  const end = new Date(start.getTime() + durationMins * 60 * 1000);
+  return { start, end };
+}
+
 // --------------------
 // Google Calendar client
 // --------------------
@@ -171,10 +192,11 @@ app.post("/voice", async (req, res) => {
       job: "What job do you need help with?",
       suburb: "What suburb are you in?",
       name: "What is your name?",
-      time: "What time would you like?"
+      time: "What time would you like? For example, tomorrow at 5 p.m."
     };
 
-    const prompt = session.lastPrompt || promptMap[session.step] || "Can you repeat that?";
+    const prompt =
+      session.lastPrompt || promptMap[session.step] || "Can you repeat that?";
     session.lastPrompt = prompt;
 
     ask(twiml, prompt, "/voice");
@@ -190,7 +212,7 @@ app.post("/voice", async (req, res) => {
       job: "Sorry — what job do you need help with?",
       suburb: "Sorry — what suburb are you in?",
       name: "Sorry — what is your name?",
-      time: "Sorry — what time would you like?"
+      time: "Sorry — what time would you like? For example, tomorrow at 5 p.m."
     };
 
     const reprompt = repromptMap[session.step] || "Sorry, can you repeat that?";
@@ -220,7 +242,7 @@ app.post("/voice", async (req, res) => {
     if (session.step === "name") {
       session.name = speech;
       session.step = "time";
-      session.lastPrompt = "What time would you like?";
+      session.lastPrompt = "What time would you like? For example, tomorrow at 5 p.m.";
       ask(twiml, session.lastPrompt, "/voice");
       return res.type("text/xml").send(twiml.toString());
     }
@@ -229,6 +251,16 @@ app.post("/voice", async (req, res) => {
       session.time = speech;
 
       const summary = `${session.name} needs ${session.job} in ${session.suburb} at ${session.time}.`;
+
+      // ✅ Parse time BEFORE confirming (so we can reprompt if parse fails)
+      const times = buildEventTimesFromSpeech(session.time, 60);
+      if (!times) {
+        session.step = "time";
+        session.lastPrompt =
+          "Sorry — what time would you like? Please say something like: tomorrow at 5 p.m.";
+        ask(twiml, session.lastPrompt, "/voice");
+        return res.type("text/xml").send(twiml.toString());
+      }
 
       twiml.say(`Booking confirmed. ${summary}`, {
         voice: "Polly.Amy",
@@ -243,9 +275,8 @@ app.post("/voice", async (req, res) => {
 
       const calendar = getCalendarClient();
 
-      // Simple timing: create event starting now+5min for 1 hour.
-      const start = new Date(Date.now() + 5 * 60 * 1000);
-      const end = new Date(start.getTime() + 60 * 60 * 1000);
+      const { start, end } = times;
+      const timeZone = process.env.TIMEZONE || "Australia/Sydney";
 
       await calendar.events.insert({
         calendarId,
@@ -254,11 +285,11 @@ app.post("/voice", async (req, res) => {
           description: summary,
           start: {
             dateTime: start.toISOString(),
-            timeZone: process.env.TIMEZONE || "Australia/Sydney"
+            timeZone
           },
           end: {
             dateTime: end.toISOString(),
-            timeZone: process.env.TIMEZONE || "Australia/Sydney"
+            timeZone
           }
         }
       });
@@ -294,3 +325,4 @@ app.get("/", (req, res) => res.send("Voice bot running"));
 
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log("Server listening on", PORT));
+
