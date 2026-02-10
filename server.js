@@ -21,6 +21,39 @@ app.use(express.urlencoded({ extended: false }));
 const VoiceResponse = twilio.twiml.VoiceResponse;
 
 // --------------------
+// SMS settings
+// --------------------
+const ADMIN_SMS_TO = "+61431778238"; // your number (AU 0431... => +61431...)
+
+// Build Twilio REST client ONLY if env vars exist (so it won’t crash)
+function getTwilioClient() {
+  const sid = process.env.TWILIO_ACCOUNT_SID;
+  const token = process.env.TWILIO_AUTH_TOKEN;
+  if (!sid || !token) return null;
+  return twilio(sid, token);
+}
+
+async function sendBookingSms(messageText) {
+  const from = process.env.TWILIO_SMS_FROM; // must be a Twilio number that can send SMS
+  const client = getTwilioClient();
+
+  if (!client) {
+    console.warn("SMS skipped: Missing TWILIO_ACCOUNT_SID or TWILIO_AUTH_TOKEN");
+    return;
+  }
+  if (!from) {
+    console.warn("SMS skipped: Missing TWILIO_SMS_FROM");
+    return;
+  }
+
+  await client.messages.create({
+    from,
+    to: ADMIN_SMS_TO,
+    body: messageText
+  });
+}
+
+// --------------------
 // Session store
 // Key by CallSid (better than From)
 // --------------------
@@ -31,7 +64,7 @@ function getSession(callSid) {
     sessions.set(callSid, {
       step: "job",
       job: "",
-      suburb: "",
+      address: "",
       name: "",
       time: "",
       lastPrompt: "",
@@ -53,17 +86,13 @@ function cleanSpeech(text) {
   return String(text).trim().replace(/\s+/g, " ");
 }
 
-// Better “hearing” settings:
-// - timeout: how long to wait for ANY speech to start (seconds)
-// - speechTimeout: how long of silence ends the capture ("auto" ends too aggressively sometimes)
-// - profanityFilter: avoid weird censoring artifacts (optional)
 function ask(twiml, prompt, actionUrl) {
   const gather = twiml.gather({
     input: "speech",
     action: actionUrl,
     method: "POST",
-    timeout: 12,          // was 5 — gives people time to start speaking
-    speechTimeout: 2,     // allows short pauses without cutting off (more stable than "auto")
+    timeout: 12,
+    speechTimeout: 2,
     language: "en-AU",
     profanityFilter: false
   });
@@ -74,27 +103,18 @@ function ask(twiml, prompt, actionUrl) {
   });
 }
 
-// Accept speech with step-specific tolerance.
-// Suburb/name/time often come back low confidence.
 function shouldReject(step, speech, confidence) {
   const s = speech.toLowerCase();
 
-  // literally nothing / noise
   if (!speech || speech.length < 2) return true;
 
-  // common garbage from STT
   const junk = new Set(["hello", "hi", "yeah", "yes", "yep", "nope", "okay", "ok"]);
   if (junk.has(s)) {
-    // allow greeting only on first step if job isn't set yet
-    return step !== "job" || !!speech && speech.length < 5;
+    return step !== "job" || speech.length < 5;
   }
 
-  // Tuned confidence:
-  // job: be more strict
-  // suburb/name/time: more forgiving
   const minConf = step === "job" ? 0.30 : 0.10;
 
-  // If confidence exists & is very low AND utterance is tiny -> reject
   if (typeof confidence === "number" && confidence > 0 && confidence < minConf) {
     if (speech.split(" ").length <= 2) return true;
   }
@@ -103,7 +123,7 @@ function shouldReject(step, speech, confidence) {
 }
 
 // --------------------
-// Time parsing + timezone-safe formatting (calendar accuracy fix)
+// Time parsing + timezone-safe formatting
 // --------------------
 function parseRequestedDateTime(naturalText, tz) {
   const ref = DateTime.now().setZone(tz).toJSDate();
@@ -161,17 +181,14 @@ app.post("/voice", async (req, res) => {
 
   const session = getSession(callSid);
 
-  console.log(
-    `CALLSID=${callSid} STEP=${session.step} Speech="${speech}" Confidence=${confidence}`
-  );
+  console.log(`CALLSID=${callSid} STEP=${session.step} Speech="${speech}" Confidence=${confidence}`);
 
-  // Handle no-speech hits (start of call / timeouts)
+  // Handle no-speech hits
   if (!speech) {
     session.tries += 1;
 
-    // was 3 — too aggressive. 6 gives a real chance without being annoying.
     if (session.tries >= 6) {
-      twiml.say("All good — take your time. If you still need to book, call again when ready.", {
+      twiml.say("No worries. Please call back when ready.", {
         voice: "Polly.Amy",
         language: "en-AU"
       });
@@ -181,35 +198,30 @@ app.post("/voice", async (req, res) => {
     }
 
     const promptMap = {
-      job: "What job do you need help with? You can speak in a full sentence.",
-      suburb: "What suburb are you in? Take your time.",
-      name: "What is your name? Say it clearly, like: Max Majerowski.",
-      time: "What time would you like? For example: tomorrow at 5 p.m."
+      job: "What job do you need help with?",
+      address: "What is the address?",
+      name: "What is your name?",
+      time: "What time would you like?"
     };
 
-    const prompt =
-      session.lastPrompt ||
-      promptMap[session.step] ||
-      "Sorry — can you repeat that? Take your time.";
-
+    const prompt = session.lastPrompt || promptMap[session.step] || "Can you repeat that?";
     session.lastPrompt = prompt;
 
     ask(twiml, prompt, "/voice");
     return res.type("text/xml").send(twiml.toString());
   }
 
-  // We got speech → reset tries
   session.tries = 0;
 
   if (shouldReject(session.step, speech, confidence)) {
     const repromptMap = {
-      job: "Sorry — what job do you need help with? Say it like: I need help fixing a leaking sink.",
-      suburb: "Sorry — what suburb are you in? Please say just the suburb name.",
-      name: "Sorry — what is your name? Please say your first name.",
-      time: "Sorry — what time would you like? Say: tomorrow at 5 p.m."
+      job: "Sorry — what job do you need help with?",
+      address: "Sorry — what is the address?",
+      name: "Sorry — what is your name?",
+      time: "Sorry — what time would you like?"
     };
 
-    const reprompt = repromptMap[session.step] || "Sorry — can you repeat that? Take your time.";
+    const reprompt = repromptMap[session.step] || "Sorry, can you repeat that?";
     session.lastPrompt = reprompt;
 
     ask(twiml, reprompt, "/voice");
@@ -219,14 +231,14 @@ app.post("/voice", async (req, res) => {
   try {
     if (session.step === "job") {
       session.job = speech;
-      session.step = "suburb";
-      session.lastPrompt = "What suburb are you in? Take your time.";
+      session.step = "address";
+      session.lastPrompt = "What is the address?";
       ask(twiml, session.lastPrompt, "/voice");
       return res.type("text/xml").send(twiml.toString());
     }
 
-    if (session.step === "suburb") {
-      session.suburb = speech;
+    if (session.step === "address") {
+      session.address = speech;
       session.step = "name";
       session.lastPrompt = "What is your name?";
       ask(twiml, session.lastPrompt, "/voice");
@@ -236,7 +248,7 @@ app.post("/voice", async (req, res) => {
     if (session.step === "name") {
       session.name = speech;
       session.step = "time";
-      session.lastPrompt = "What time would you like? For example: tomorrow at 5 p.m.";
+      session.lastPrompt = "What time would you like?";
       ask(twiml, session.lastPrompt, "/voice");
       return res.type("text/xml").send(twiml.toString());
     }
@@ -244,7 +256,7 @@ app.post("/voice", async (req, res) => {
     if (session.step === "time") {
       session.time = speech;
 
-      const summary = `${session.name} needs ${session.job} in ${session.suburb} at ${session.time}.`;
+      const summary = `${session.name} needs ${session.job} at ${session.address} at ${session.time}.`;
 
       twiml.say(`Booking confirmed. ${summary}`, {
         voice: "Polly.Amy",
@@ -259,15 +271,16 @@ app.post("/voice", async (req, res) => {
 
       const parsedStart = parseRequestedDateTime(session.time, tz);
 
-      // Fallback if parse fails: now+10 minutes (more realistic than +5)
       const start = parsedStart ? new Date(parsedStart) : new Date(Date.now() + 10 * 60 * 1000);
       const end = new Date(start.getTime() + 60 * 60 * 1000);
 
+      // Create calendar event
       await calendar.events.insert({
         calendarId,
         requestBody: {
           summary: `${session.job} - ${session.name}`,
           description: summary,
+          location: session.address,
           start: {
             dateTime: toGoogleDateTime(start, tz),
             timeZone: tz
@@ -278,6 +291,17 @@ app.post("/voice", async (req, res) => {
           }
         }
       });
+
+      // Send SMS to you
+      const smsText =
+        `NEW BOOKING\n` +
+        `Name: ${session.name}\n` +
+        `Job: ${session.job}\n` +
+        `Address: ${session.address}\n` +
+        `Time spoken: ${session.time}\n` +
+        `Booked: ${DateTime.fromJSDate(start, { zone: tz }).toFormat("ccc d LLL yyyy, h:mm a")} (${tz})`;
+
+      await sendBookingSms(smsText);
 
       resetSession(callSid);
       twiml.hangup();
