@@ -53,34 +53,48 @@ function cleanSpeech(text) {
   return String(text).trim().replace(/\s+/g, " ");
 }
 
+// Better “hearing” settings:
+// - timeout: how long to wait for ANY speech to start (seconds)
+// - speechTimeout: how long of silence ends the capture ("auto" ends too aggressively sometimes)
+// - profanityFilter: avoid weird censoring artifacts (optional)
 function ask(twiml, prompt, actionUrl) {
   const gather = twiml.gather({
     input: "speech",
     action: actionUrl,
     method: "POST",
-    timeout: 5,
-    speechTimeout: "auto",
-    language: "en-AU"
+    timeout: 12,          // was 5 — gives people time to start speaking
+    speechTimeout: 2,     // allows short pauses without cutting off (more stable than "auto")
+    language: "en-AU",
+    profanityFilter: false
   });
 
-  // Never pass empty text to say (prevents Twilio 13520)
   gather.say(prompt || "Sorry, can you repeat that?", {
     voice: "Polly.Amy",
     language: "en-AU"
   });
 }
 
+// Accept speech with step-specific tolerance.
+// Suburb/name/time often come back low confidence.
 function shouldReject(step, speech, confidence) {
   const s = speech.toLowerCase();
 
+  // literally nothing / noise
   if (!speech || speech.length < 2) return true;
 
-  if (s === "hello" || s === "hi" || s === "yeah" || s === "yes") {
-    return step !== "job";
+  // common garbage from STT
+  const junk = new Set(["hello", "hi", "yeah", "yes", "yep", "nope", "okay", "ok"]);
+  if (junk.has(s)) {
+    // allow greeting only on first step if job isn't set yet
+    return step !== "job" || !!speech && speech.length < 5;
   }
 
-  const minConf = step === "job" ? 0.35 : 0.15;
+  // Tuned confidence:
+  // job: be more strict
+  // suburb/name/time: more forgiving
+  const minConf = step === "job" ? 0.30 : 0.10;
 
+  // If confidence exists & is very low AND utterance is tiny -> reject
   if (typeof confidence === "number" && confidence > 0 && confidence < minConf) {
     if (speech.split(" ").length <= 2) return true;
   }
@@ -92,18 +106,13 @@ function shouldReject(step, speech, confidence) {
 // Time parsing + timezone-safe formatting (calendar accuracy fix)
 // --------------------
 function parseRequestedDateTime(naturalText, tz) {
-  // Use a reference date in the correct timezone
   const ref = DateTime.now().setZone(tz).toJSDate();
-
   const parsed = chrono.parseDate(naturalText, ref, { forwardDate: true });
   if (!parsed) return null;
-
-  // Treat parsed time as being in tz, then keep it as an absolute instant
   return DateTime.fromJSDate(parsed, { zone: tz }).toJSDate();
 }
 
 function toGoogleDateTime(dateObj, tz) {
-  // IMPORTANT: include offset (no "Z") so Calendar won’t shift it
   return DateTime.fromJSDate(dateObj, { zone: tz }).toISO({
     includeOffset: true,
     suppressMilliseconds: true
@@ -160,8 +169,9 @@ app.post("/voice", async (req, res) => {
   if (!speech) {
     session.tries += 1;
 
-    if (session.tries >= 3) {
-      twiml.say("No worries. Please call back when ready.", {
+    // was 3 — too aggressive. 6 gives a real chance without being annoying.
+    if (session.tries >= 6) {
+      twiml.say("All good — take your time. If you still need to book, call again when ready.", {
         voice: "Polly.Amy",
         language: "en-AU"
       });
@@ -171,31 +181,37 @@ app.post("/voice", async (req, res) => {
     }
 
     const promptMap = {
-      job: "What job do you need help with?",
-      suburb: "What suburb are you in?",
-      name: "What is your name?",
-      time: "What time would you like?"
+      job: "What job do you need help with? You can speak in a full sentence.",
+      suburb: "What suburb are you in? Take your time.",
+      name: "What is your name? Say it clearly, like: Max Majerowski.",
+      time: "What time would you like? For example: tomorrow at 5 p.m."
     };
 
-    const prompt = session.lastPrompt || promptMap[session.step] || "Can you repeat that?";
+    const prompt =
+      session.lastPrompt ||
+      promptMap[session.step] ||
+      "Sorry — can you repeat that? Take your time.";
+
     session.lastPrompt = prompt;
 
     ask(twiml, prompt, "/voice");
     return res.type("text/xml").send(twiml.toString());
   }
 
+  // We got speech → reset tries
   session.tries = 0;
 
   if (shouldReject(session.step, speech, confidence)) {
     const repromptMap = {
-      job: "Sorry — what job do you need help with?",
-      suburb: "Sorry — what suburb are you in?",
-      name: "Sorry — what is your name?",
-      time: "Sorry — what time would you like?"
+      job: "Sorry — what job do you need help with? Say it like: I need help fixing a leaking sink.",
+      suburb: "Sorry — what suburb are you in? Please say just the suburb name.",
+      name: "Sorry — what is your name? Please say your first name.",
+      time: "Sorry — what time would you like? Say: tomorrow at 5 p.m."
     };
 
-    const reprompt = repromptMap[session.step] || "Sorry, can you repeat that?";
+    const reprompt = repromptMap[session.step] || "Sorry — can you repeat that? Take your time.";
     session.lastPrompt = reprompt;
+
     ask(twiml, reprompt, "/voice");
     return res.type("text/xml").send(twiml.toString());
   }
@@ -204,7 +220,7 @@ app.post("/voice", async (req, res) => {
     if (session.step === "job") {
       session.job = speech;
       session.step = "suburb";
-      session.lastPrompt = "What suburb are you in?";
+      session.lastPrompt = "What suburb are you in? Take your time.";
       ask(twiml, session.lastPrompt, "/voice");
       return res.type("text/xml").send(twiml.toString());
     }
@@ -220,7 +236,7 @@ app.post("/voice", async (req, res) => {
     if (session.step === "name") {
       session.name = speech;
       session.step = "time";
-      session.lastPrompt = "What time would you like?";
+      session.lastPrompt = "What time would you like? For example: tomorrow at 5 p.m.";
       ask(twiml, session.lastPrompt, "/voice");
       return res.type("text/xml").send(twiml.toString());
     }
@@ -239,14 +255,12 @@ app.post("/voice", async (req, res) => {
       if (!calendarId) throw new Error("Missing GOOGLE_CALENDAR_ID env variable");
 
       const calendar = getCalendarClient();
-
       const tz = process.env.TIMEZONE || "Australia/Sydney";
 
-      // Parse their spoken time into a real datetime (in tz)
       const parsedStart = parseRequestedDateTime(session.time, tz);
 
-      // Fallback if parse fails: now+5 minutes
-      const start = parsedStart ? new Date(parsedStart) : new Date(Date.now() + 5 * 60 * 1000);
+      // Fallback if parse fails: now+10 minutes (more realistic than +5)
+      const start = parsedStart ? new Date(parsedStart) : new Date(Date.now() + 10 * 60 * 1000);
       const end = new Date(start.getTime() + 60 * 60 * 1000);
 
       await calendar.events.insert({
@@ -270,6 +284,7 @@ app.post("/voice", async (req, res) => {
       return res.type("text/xml").send(twiml.toString());
     }
 
+    // Fallback
     session.step = "job";
     session.lastPrompt = "What job do you need help with?";
     ask(twiml, session.lastPrompt, "/voice");
