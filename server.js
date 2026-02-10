@@ -11,6 +11,7 @@ const express = require("express");
 const twilio = require("twilio");
 const { google } = require("googleapis");
 const chrono = require("chrono-node");
+const { DateTime } = require("luxon");
 
 const app = express();
 
@@ -62,6 +63,7 @@ function ask(twiml, prompt, actionUrl) {
     language: "en-AU"
   });
 
+  // Never pass empty text to say (prevents Twilio 13520)
   gather.say(prompt || "Sorry, can you repeat that?", {
     voice: "Polly.Amy",
     language: "en-AU"
@@ -87,14 +89,25 @@ function shouldReject(step, speech, confidence) {
 }
 
 // --------------------
-// Time parsing (calendar accuracy)
+// Time parsing + timezone-safe formatting (calendar accuracy fix)
 // --------------------
-function parseRequestedDateTime(naturalText) {
-  // chrono uses server locale, but works well for AU-style phrases like:
-  // "5pm tomorrow", "Thursday 2pm", "next Monday at 11"
-  const ref = new Date();
-  const result = chrono.parseDate(naturalText, ref, { forwardDate: true });
-  return result || null;
+function parseRequestedDateTime(naturalText, tz) {
+  // Use a reference date in the correct timezone
+  const ref = DateTime.now().setZone(tz).toJSDate();
+
+  const parsed = chrono.parseDate(naturalText, ref, { forwardDate: true });
+  if (!parsed) return null;
+
+  // Treat parsed time as being in tz, then keep it as an absolute instant
+  return DateTime.fromJSDate(parsed, { zone: tz }).toJSDate();
+}
+
+function toGoogleDateTime(dateObj, tz) {
+  // IMPORTANT: include offset (no "Z") so Calendar won’t shift it
+  return DateTime.fromJSDate(dateObj, { zone: tz }).toISO({
+    includeOffset: true,
+    suppressMilliseconds: true
+  });
 }
 
 // --------------------
@@ -227,8 +240,10 @@ app.post("/voice", async (req, res) => {
 
       const calendar = getCalendarClient();
 
-      // Parse their spoken time into a real datetime
-      const parsedStart = parseRequestedDateTime(session.time);
+      const tz = process.env.TIMEZONE || "Australia/Sydney";
+
+      // Parse their spoken time into a real datetime (in tz)
+      const parsedStart = parseRequestedDateTime(session.time, tz);
 
       // Fallback if parse fails: now+5 minutes
       const start = parsedStart ? new Date(parsedStart) : new Date(Date.now() + 5 * 60 * 1000);
@@ -240,12 +255,12 @@ app.post("/voice", async (req, res) => {
           summary: `${session.job} - ${session.name}`,
           description: summary,
           start: {
-            dateTime: start.toISOString(),
-            timeZone: process.env.TIMEZONE || "Australia/Sydney"
+            dateTime: toGoogleDateTime(start, tz),
+            timeZone: tz
           },
           end: {
-            dateTime: end.toISOString(),
-            timeZone: process.env.TIMEZONE || "Australia/Sydney"
+            dateTime: toGoogleDateTime(end, tz),
+            timeZone: tz
           }
         }
       });
