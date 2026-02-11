@@ -1,4 +1,5 @@
 // server.js
+// Sell-ready: Multi-tenant, customer SMS, dupe detection, history, human fallback, calendar backup, inbound SMS Y/N
 
 try { require("dotenv").config(); } catch (e) {}
 
@@ -9,21 +10,24 @@ const chrono = require("chrono-node");
 const { DateTime } = require("luxon");
 
 const app = express();
+
+// Twilio sends form-encoded for Voice + SMS webhooks
 app.use(express.urlencoded({ extended: false }));
 
 const VoiceResponse = twilio.twiml.VoiceResponse;
+const MessagingResponse = twilio.twiml.MessagingResponse;
 
 /* ============================================================================
   MULTI-TRADIE CONFIG (multi-tenant) via ENV
 
-  ✅ Recommended: Set TRADIES_JSON to map the Twilio "To" number (your Twilio voice number)
+  TRADIES_JSON maps the Twilio Voice "To" number (the Twilio number the caller dialed)
   to that tradie's settings.
 
-  Example TRADIES_JSON:
+  Example:
   {
-    "+61280001234": {
+    "+61489272876": {
       "ownerSmsTo": "+61431778238",
-      "smsFrom": "+61280001234",
+      "smsFrom": "+61489272876",
       "timezone": "Australia/Sydney",
       "businessStartHour": 7,
       "businessEndHour": 17,
@@ -32,10 +36,12 @@ const VoiceResponse = twilio.twiml.VoiceResponse;
     }
   }
 
-  Fallbacks still supported via env:
+  Fallback envs:
     OWNER_SMS_TO, TWILIO_SMS_FROM, TIMEZONE, BUSINESS_START_HOUR, BUSINESS_END_HOUR, BUSINESS_DAYS, GOOGLE_CALENDAR_ID
+    GOOGLE_SERVICE_JSON (or per-tradie googleServiceJson)
 
-  Optional: if you want per-tradie google credentials, add "googleServiceJson" inside each tradie config.
+  SECURITY (recommended for selling):
+    TWILIO_WEBHOOK_AUTH=true + TWILIO_AUTH_TOKEN to validate signatures.
 ============================================================================ */
 
 function parseTradiesJson() {
@@ -44,15 +50,20 @@ function parseTradiesJson() {
   try {
     return JSON.parse(raw);
   } catch (e) {
-    // tolerate accidental newline formatting
-    try { return JSON.parse(raw.replace(/\r?\n/g, "")); } catch { return {}; }
+    try {
+      return JSON.parse(raw.replace(/\r?\n/g, ""));
+    } catch {
+      console.warn("TRADIES_JSON parse failed. Check JSON formatting.");
+      return {};
+    }
   }
 }
 
 const TRADIES = parseTradiesJson();
 
 function getTradieKey(req) {
-  // Twilio sends To = your Twilio voice number that was dialed
+  // Voice: req.body.To is your Twilio number (the number dialed)
+  // SMS: req.body.To is also your Twilio number
   return req.body.To || req.query.tid || "default";
 }
 
@@ -71,13 +82,12 @@ function getTradieConfig(req) {
   return {
     key,
     ownerSmsTo: t.ownerSmsTo || process.env.OWNER_SMS_TO || "+61431778238",
-    smsFrom: t.smsFrom || process.env.TWILIO_SMS_FROM, // Twilio SMS-capable number
+    smsFrom: t.smsFrom || process.env.TWILIO_SMS_FROM, // must be SMS-capable Twilio number
     timezone: t.timezone || process.env.TIMEZONE || "Australia/Sydney",
     businessStartHour: Number(t.businessStartHour ?? process.env.BUSINESS_START_HOUR ?? 7),
     businessEndHour: Number(t.businessEndHour ?? process.env.BUSINESS_END_HOUR ?? 17),
     businessDays,
-    calendarId: t.calendarId || process.env.GOOGLE_CALENDAR_ID,
-    // Optional per-tradie creds
+    calendarId: t.calendarId || process.env.GOOGLE_CALENDAR_ID || "",
     googleServiceJson: t.googleServiceJson || process.env.GOOGLE_SERVICE_JSON || ""
   };
 }
@@ -98,8 +108,12 @@ const MAX_REJECTS_TIME = Number(process.env.MAX_REJECTS_TIME || 2);
 // Duplicate window days
 const DUP_WINDOW_DAYS = Number(process.env.DUP_WINDOW_DAYS || 14);
 
+// Optional: Twilio signature validation (recommended)
+const REQUIRE_TWILIO_SIG = String(process.env.TWILIO_WEBHOOK_AUTH || "false").toLowerCase() === "true";
+const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN || "";
+
 /* ============================================================================
-  Twilio SMS helpers (per-tradie "from")
+  Twilio helpers
 ============================================================================ */
 function getTwilioClient() {
   const sid = process.env.TWILIO_ACCOUNT_SID;
@@ -122,7 +136,6 @@ async function sendSms({ from, to, body }) {
     console.warn("SMS skipped: missing 'to'");
     return;
   }
-
   await client.messages.create({ from, to, body });
 }
 
@@ -135,7 +148,7 @@ async function sendCustomerSms(tradie, toCustomer, body) {
 }
 
 /* ============================================================================
-  Session store
+  Session store (calls)
 ============================================================================ */
 const sessions = new Map();
 
@@ -152,10 +165,9 @@ function getSession(callSid, fromNumber = "") {
       tries: 0,
       from: fromNumber || "",
       rejects: { address: 0, time: 0 },
-      // calendar memory
-      lastAtAddress: null,     // { whenText, summary }
-      duplicateEvent: null,    // { id, whenText, summary }
-      confirmMode: "new"       // "new" | "update"
+      lastAtAddress: null,   // { whenText, summary }
+      duplicateEvent: null,  // { id, whenText, summary }
+      confirmMode: "new"     // "new" | "update"
     });
   } else {
     const s = sessions.get(callSid);
@@ -166,6 +178,27 @@ function getSession(callSid, fromNumber = "") {
 
 function resetSession(callSid) {
   sessions.delete(callSid);
+}
+
+/* ============================================================================
+  Inbound SMS “Y/N” tracking (sell-ready baseline)
+  NOTE: In-memory is OK for MVP. For real SaaS, store this in DB.
+============================================================================ */
+const pendingConfirmations = new Map(); // key: customerPhone, value: booking summary
+
+function setPendingConfirmation(customerPhone, payload) {
+  if (!customerPhone) return;
+  pendingConfirmations.set(customerPhone, { ...payload, createdAt: Date.now() });
+}
+
+function getPendingConfirmation(customerPhone) {
+  if (!customerPhone) return null;
+  return pendingConfirmations.get(customerPhone) || null;
+}
+
+function clearPendingConfirmation(customerPhone) {
+  if (!customerPhone) return;
+  pendingConfirmations.delete(customerPhone);
 }
 
 /* ============================================================================
@@ -188,12 +221,7 @@ function ask(twiml, prompt, actionUrl) {
     profanityFilter: false
   });
 
-  gather.say(prompt || "Sorry, can you repeat that?", {
-    voice: "Polly.Amy",
-    language: "en-AU"
-  });
-
-  // keep TwiML open a touch
+  gather.say(prompt || "Sorry, can you repeat that?", { voice: "Polly.Amy", language: "en-AU" });
   twiml.pause({ length: 1 });
 }
 
@@ -211,6 +239,10 @@ function shouldReject(step, speech, confidence) {
   return false;
 }
 
+function normStr(s) {
+  return String(s || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+}
+
 /* ============================================================================
   Time parsing (timezone-safe)
 ============================================================================ */
@@ -225,8 +257,6 @@ function normalizeTimeText(text, tz) {
   t = t.replace(/\s+/g, " ");
 
   const now = DateTime.now().setZone(tz);
-
-  // tonight/today/tomorrow -> explicit date
   if (t.includes("tomorrow")) {
     const d = now.plus({ days: 1 }).toFormat("cccc d LLL yyyy");
     t = t.replace(/\btomorrow\b/g, d);
@@ -263,7 +293,6 @@ function parseRequestedDateTime(naturalText, tz) {
     { year, month, day, hour, minute, second: 0, millisecond: 0 },
     { zone: tz }
   );
-
   return dt.isValid ? dt : null;
 }
 
@@ -271,7 +300,7 @@ function extractTimeIfPresent(text, tz) {
   return parseRequestedDateTime(text, tz);
 }
 
-// Google wants RFC3339 + timeZone; include offset to prevent 4am shifts
+// Google wants RFC3339 + timeZone. includeOffset prevents the “4am shift”.
 function toGoogleDateTime(dt) {
   return dt.toISO({ includeOffset: true, suppressMilliseconds: true });
 }
@@ -316,7 +345,7 @@ function nextBusinessOpenSlot(tradie) {
 }
 
 /* ============================================================================
-  Google Calendar client + reads for memory/dupe
+  Google Calendar
 ============================================================================ */
 function parseGoogleServiceJson(raw) {
   if (!raw) throw new Error("Missing GOOGLE_SERVICE_JSON env/config");
@@ -357,39 +386,40 @@ async function insertCalendarEventWithRetry(calendar, calendarId, requestBody) {
   throw lastErr;
 }
 
-function normStr(s) {
-  return String(s || "")
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, " ")
-    .trim();
-}
-
-// Customer history: last event at same address (in last 365 days)
+// Customer history: last event at same address (last 365 days)
 async function getLastBookingAtAddress(calendar, calendarId, tz, address) {
-  const q = address;
   const timeMin = DateTime.now().setZone(tz).minus({ days: 365 }).toISO();
   const timeMax = DateTime.now().setZone(tz).toISO();
 
   const resp = await calendar.events.list({
     calendarId,
-    q,
+    q: address,
     timeMin,
     timeMax,
     singleEvents: true,
     orderBy: "startTime",
-    maxResults: 20
+    maxResults: 30
   });
 
   const items = resp?.data?.items || [];
   if (!items.length) return null;
 
-  // Pick the most recent with matching address-ish
   const addrN = normStr(address);
-  const candidates = items
-    .filter((ev) => normStr(ev.location).includes(addrN) || normStr(ev.summary).includes(addrN) || normStr(ev.description).includes(addrN))
-    .sort((a, b) => String(a.start?.dateTime || a.start?.date).localeCompare(String(b.start?.dateTime || b.start?.date)));
+  const candidates = items.filter((ev) => {
+    const locN = normStr(ev.location);
+    const sumN = normStr(ev.summary);
+    const descN = normStr(ev.description);
+    return locN.includes(addrN) || sumN.includes(addrN) || descN.includes(addrN);
+  });
 
-  const last = candidates[candidates.length - 1] || items[items.length - 1];
+  const last = (candidates.length ? candidates : items).sort((a, b) => {
+    const aISO = a.start?.dateTime || a.start?.date || "";
+    const bISO = b.start?.dateTime || b.start?.date || "";
+    return String(aISO).localeCompare(String(bISO));
+  }).pop();
+
+  if (!last) return null;
+
   const whenISO = last.start?.dateTime || last.start?.date;
   const when = whenISO ? DateTime.fromISO(whenISO, { setZone: true }).setZone(tz) : null;
 
@@ -399,14 +429,14 @@ async function getLastBookingAtAddress(calendar, calendarId, tz, address) {
   };
 }
 
-// Duplicate check: same name+address within ±14 days of chosen start
+// Duplicate check: same name+address within ±DUP_WINDOW_DAYS
 async function findDuplicate(calendar, calendarId, tz, name, address, startDt) {
   const t0 = startDt.minus({ days: DUP_WINDOW_DAYS });
   const t1 = startDt.plus({ days: DUP_WINDOW_DAYS });
 
   const resp = await calendar.events.list({
     calendarId,
-    q: address, // cheap filter
+    q: address,
     timeMin: t0.toISO(),
     timeMax: t1.toISO(),
     singleEvents: true,
@@ -438,7 +468,6 @@ async function findDuplicate(calendar, calendarId, tz, name, address, startDt) {
       };
     }
   }
-
   return null;
 }
 
@@ -452,19 +481,8 @@ async function deleteEventSafe(calendar, calendarId, eventId) {
 }
 
 /* ============================================================================
-  Optional Preferences DB (Supabase) - no extra deps (uses fetch)
-
-  Setup (optional):
-    SUPABASE_URL=https://xxxxx.supabase.co
-    SUPABASE_SERVICE_KEY=xxxx (service role key)
-    SUPABASE_TABLE=customer_prefs
-
-  Table columns (suggested):
-    phone text primary key
-    preferred_note text
-    updated_at timestamp
-
-  This is OPTIONAL and safe if not configured.
+  OPTIONAL: Preferences DB (Supabase) - safe if not configured.
+  NOTE: Node 18+ has global fetch. If not, add dependency node-fetch.
 ============================================================================ */
 const SUPABASE_URL = process.env.SUPABASE_URL || "";
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY || "";
@@ -472,7 +490,6 @@ const SUPABASE_TABLE = process.env.SUPABASE_TABLE || "customer_prefs";
 
 async function upsertCustomerPref(phone, note) {
   if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY || !phone) return;
-
   const url = `${SUPABASE_URL}/rest/v1/${SUPABASE_TABLE}`;
   const payload = [{ phone, preferred_note: note, updated_at: new Date().toISOString() }];
 
@@ -488,31 +505,14 @@ async function upsertCustomerPref(phone, note) {
   }).catch(() => {});
 }
 
-async function getCustomerPref(phone) {
-  if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY || !phone) return null;
-
-  const url = `${SUPABASE_URL}/rest/v1/${SUPABASE_TABLE}?phone=eq.${encodeURIComponent(phone)}&select=preferred_note&limit=1`;
-  try {
-    const r = await fetch(url, {
-      headers: {
-        apikey: SUPABASE_SERVICE_KEY,
-        Authorization: `Bearer ${SUPABASE_SERVICE_KEY}`
-      }
-    });
-    const data = await r.json();
-    return Array.isArray(data) && data[0]?.preferred_note ? String(data[0].preferred_note) : null;
-  } catch {
-    return null;
-  }
-}
-
 /* ============================================================================
-  Human handoff helpers
+  Human handoff
 ============================================================================ */
 async function humanHandoff(tradie, session, reason) {
   const body =
     `HUMAN HANDOFF NEEDED\n` +
     `Reason: ${reason}\n` +
+    `TradieKey: ${tradie.key}\n` +
     `Caller: ${session.from || "Unknown"}\n` +
     `Name: ${session.name || "-"}\n` +
     `Job: ${session.job || "-"}\n` +
@@ -523,9 +523,28 @@ async function humanHandoff(tradie, session, reason) {
 }
 
 /* ============================================================================
-  Voice route
+  Webhook signature check (recommended for selling)
+============================================================================ */
+function validateTwilioSignature(req) {
+  if (!REQUIRE_TWILIO_SIG) return true;
+  if (!TWILIO_AUTH_TOKEN) return false;
+  const signature = req.headers["x-twilio-signature"];
+  if (!signature) return false;
+
+  // Build full URL Twilio requested (Render behind proxy needs host/proto)
+  const proto = (req.headers["x-forwarded-proto"] || "https").split(",")[0].trim();
+  const host = (req.headers["x-forwarded-host"] || req.headers["host"] || "").split(",")[0].trim();
+  const url = `${proto}://${host}${req.originalUrl}`;
+
+  return twilio.validateRequest(TWILIO_AUTH_TOKEN, signature, url, req.body);
+}
+
+/* ============================================================================
+  VOICE ROUTE
 ============================================================================ */
 app.post("/voice", async (req, res) => {
+  if (!validateTwilioSignature(req)) return res.status(403).send("Forbidden");
+
   const tradie = getTradieConfig(req);
   const twiml = new VoiceResponse();
 
@@ -628,14 +647,11 @@ app.post("/voice", async (req, res) => {
     if (session.step === "address") {
       session.address = speech;
 
-      // If calendar is configured, pull last booking at this address (memory)
       if (tradie.calendarId && tradie.googleServiceJson) {
         try {
           const calendar = getCalendarClient(tradie);
           session.lastAtAddress = await getLastBookingAtAddress(calendar, tradie.calendarId, tz, session.address);
-        } catch (e) {
-          // ignore history errors
-        }
+        } catch {}
       }
 
       session.step = "name";
@@ -659,7 +675,6 @@ app.post("/voice", async (req, res) => {
 
       let dt = null;
       if (!looksLikeAsap(session.time)) dt = parseRequestedDateTime(session.time, tz);
-
       if (!dt && isAfterHoursNow(tradie)) dt = nextBusinessOpenSlot(tradie);
       if (!dt) dt = DateTime.now().setZone(tz).plus({ minutes: 10 }).startOf("minute");
 
@@ -667,20 +682,16 @@ app.post("/voice", async (req, res) => {
       session.duplicateEvent = null;
       session.confirmMode = "new";
 
-      // Duplicate check before confirm (if calendar configured)
       if (tradie.calendarId && tradie.googleServiceJson) {
         try {
           const calendar = getCalendarClient(tradie);
           const dup = await findDuplicate(calendar, tradie.calendarId, tz, session.name, session.address, dt);
           if (dup) session.duplicateEvent = dup;
-        } catch (e) {
-          // ignore dupe errors
-        }
+        } catch {}
       }
 
       const whenForVoice = formatForVoice(dt);
 
-      // Confirm prompt with duplicate info
       if (session.duplicateEvent) {
         session.step = "confirm";
         session.lastPrompt =
@@ -707,7 +718,6 @@ app.post("/voice", async (req, res) => {
       const isNo = s.includes("no") || s.includes("nope") || s.includes("wrong") || s.includes("change");
       const isUpdate = s.includes("update") || s.includes("replace");
 
-      // If they said "No, Thursday 5pm" capture the new time immediately
       if (isNo) {
         const maybe = extractTimeIfPresent(speech, tz);
         if (maybe) {
@@ -726,11 +736,9 @@ app.post("/voice", async (req, res) => {
         return res.type("text/xml").send(twiml.toString());
       }
 
-      // If dupe exists and they say "update"
       if (session.duplicateEvent && isUpdate) {
         session.confirmMode = "update";
       } else if (!isYes && !isUpdate) {
-        // not understood
         session.lastPrompt = session.duplicateEvent
           ? "Sorry — say yes to keep both, update to replace the old booking, or no to change the time."
           : "Sorry — just say yes to confirm, or no to change the time.";
@@ -752,9 +760,21 @@ app.post("/voice", async (req, res) => {
           `Job: ${session.job}\n` +
           `Address: ${session.address}\n` +
           `When: ${displayWhen}\n` +
-          `We'll confirm shortly.\n` +
-          `Reply Y to confirm / N to reschedule (coming soon).`;
+          `We’ll confirm shortly.\n` +
+          `Reply Y to confirm / N to reschedule.`;
         sendCustomerSms(tradie, session.from, customerTxt).catch(() => {});
+
+        // Track pending confirmation (MVP)
+        setPendingConfirmation(session.from, {
+          tradieKey: tradie.key,
+          ownerSmsTo: tradie.ownerSmsTo,
+          smsFrom: tradie.smsFrom,
+          name: session.name,
+          job: session.job,
+          address: session.address,
+          when: displayWhen,
+          timezone: tz
+        });
       }
 
       // Owner SMS (include history)
@@ -767,7 +787,6 @@ app.post("/voice", async (req, res) => {
         const calendar = getCalendarClient(tradie);
 
         try {
-          // If "update", delete the duplicate event first
           if (session.confirmMode === "update" && session.duplicateEvent?.id) {
             await deleteEventSafe(calendar, tradie.calendarId, session.duplicateEvent.id);
           }
@@ -780,7 +799,7 @@ app.post("/voice", async (req, res) => {
             end: { dateTime: toGoogleDateTime(end), timeZone: tz }
           });
         } catch (calErr) {
-          // Backup channel when calendar fails: send manual follow-up SMS with full details
+          // Backup channel when calendar fails: manual follow-up SMS
           await sendOwnerSms(
             tradie,
             `MANUAL FOLLOW-UP NEEDED (Calendar failed)\n` +
@@ -793,6 +812,15 @@ app.post("/voice", async (req, res) => {
               `Reason: ${calErr?.message || calErr}`
           );
 
+          // Customer reassurance
+          if (session.from) {
+            sendCustomerSms(
+              tradie,
+              session.from,
+              `Thanks — we received your request ✅\nWe’ll confirm the time shortly.`
+            ).catch(() => {});
+          }
+
           twiml.say("Thanks. We received your booking request and will confirm shortly.", {
             voice: "Polly.Amy",
             language: "en-AU"
@@ -803,8 +831,7 @@ app.post("/voice", async (req, res) => {
         }
       }
 
-      // Optional: store simple preference note (example: store job as last preference)
-      // Replace this with a real preference capture later ("Any gate code or parking note?")
+      // Optional preferences (MVP placeholder)
       upsertCustomerPref(session.from, `Last job: ${session.job}`).catch(() => {});
 
       await sendOwnerSms(
@@ -837,21 +864,77 @@ app.post("/voice", async (req, res) => {
   } catch (err) {
     console.error("VOICE ERROR:", err);
 
-    const tradie = getTradieConfig(req);
-    const callSid = req.body.CallSid || req.body.CallSID || "unknown";
-    const s = sessions.get(callSid);
-
+    const s = sessions.get(req.body.CallSid || req.body.CallSID || "unknown");
     sendOwnerSms(
-      tradie,
-      `SYSTEM ERROR\nFrom: ${s?.from || "Unknown"}\nStep: ${s?.step || "?"}\nError:s: ${err?.message || err}`
+      getTradieConfig(req),
+      `SYSTEM ERROR\nTradieKey: ${getTradieKey(req)}\nFrom: ${s?.from || "Unknown"}\nStep: ${s?.step || "?"}\nError: ${err?.message || err}`
     ).catch(() => {});
 
     twiml.say("Sorry, there was a system error. Please try again.", { voice: "Polly.Amy", language: "en-AU" });
     twiml.hangup();
 
-    resetSession(callSid);
+    resetSession(req.body.CallSid || req.body.CallSID || "unknown");
     return res.type("text/xml").send(twiml.toString());
   }
+});
+
+/* ============================================================================
+  SMS ROUTE (customer replies Y/N)
+  Twilio Messaging webhook -> POST /sms
+
+  MVP behavior:
+    Y: notify owner "customer confirmed"
+    N: notify owner "customer wants reschedule"
+============================================================================ */
+app.post("/sms", async (req, res) => {
+  if (!validateTwilioSignature(req)) return res.status(403).send("Forbidden");
+
+  const tradie = getTradieConfig(req);
+  const from = (req.body.From || "").trim();
+  const body = (req.body.Body || "").trim().toLowerCase();
+
+  const twiml = new MessagingResponse();
+
+  const pending = getPendingConfirmation(from);
+
+  if (!pending) {
+    twiml.message("Thanks — we received your message. If you need help, reply with your address or call us back.");
+    return res.type("text/xml").send(twiml.toString());
+  }
+
+  if (body === "y" || body.startsWith("y ")) {
+    await sendOwnerSms(
+      tradie,
+      `CUSTOMER CONFIRMED ✅\n` +
+        `Caller: ${from}\n` +
+        `Name: ${pending.name}\n` +
+        `Job: ${pending.job}\n` +
+        `Address: ${pending.address}\n` +
+        `When: ${pending.when} (${pending.timezone})`
+    ).catch(() => {});
+    twiml.message("Confirmed ✅ Thanks — see you then.");
+    clearPendingConfirmation(from);
+    return res.type("text/xml").send(twiml.toString());
+  }
+
+  if (body === "n" || body.startsWith("n ")) {
+    await sendOwnerSms(
+      tradie,
+      `CUSTOMER RESCHEDULE REQUEST ❗\n` +
+        `Caller: ${from}\n` +
+        `Name: ${pending.name}\n` +
+        `Job: ${pending.job}\n` +
+        `Address: ${pending.address}\n` +
+        `Original: ${pending.when} (${pending.timezone})\n` +
+        `Action: Please call/text to reschedule.`
+    ).catch(() => {});
+    twiml.message("No worries — we’ll contact you shortly to reschedule.");
+    clearPendingConfirmation(from);
+    return res.type("text/xml").send(twiml.toString());
+  }
+
+  twiml.message("Reply Y to confirm or N to reschedule.");
+  return res.type("text/xml").send(twiml.toString());
 });
 
 // Health check
