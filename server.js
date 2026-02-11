@@ -30,8 +30,15 @@ const BUSINESS_DAYS = (process.env.BUSINESS_DAYS || "1,2,3,4,5")
   .filter(Boolean);
 
 const MISSED_CALL_ALERT_TRIES = Number(process.env.MISSED_CALL_ALERT_TRIES || 2);
-const MAX_SILENCE_TRIES = Number(process.env.MAX_SILENCE_TRIES || 6);
+
+// ✅ give more tolerance before hangup
+const MAX_SILENCE_TRIES = Number(process.env.MAX_SILENCE_TRIES || 10);
+
 const CAL_RETRY_ATTEMPTS = Number(process.env.CAL_RETRY_ATTEMPTS || 3);
+
+// ✅ Gather timing controls (tune these)
+const GATHER_START_TIMEOUT = Number(process.env.GATHER_START_TIMEOUT || 25); // seconds to START talking
+const GATHER_SPEECH_TIMEOUT = process.env.GATHER_SPEECH_TIMEOUT || "auto";  // "auto" handles pauses best
 
 // --------------------
 // Twilio SMS helpers
@@ -105,8 +112,16 @@ function ask(twiml, prompt, actionUrl) {
     input: "speech",
     action: actionUrl,
     method: "POST",
-    timeout: 15,
-    speechTimeout: "auto",
+
+    // ✅ BIG FIX: wait longer for the caller to start speaking
+    timeout: GATHER_START_TIMEOUT,
+
+    // ✅ best for natural pauses (don’t cut them off)
+    speechTimeout: GATHER_SPEECH_TIMEOUT,
+
+    // ✅ ensures Twilio posts back even if user says nothing
+    actionOnEmptyResult: true,
+
     language: "en-AU",
     profanityFilter: false
   });
@@ -115,6 +130,10 @@ function ask(twiml, prompt, actionUrl) {
     voice: "Polly.Amy",
     language: "en-AU"
   });
+
+  // ✅ Important: end the TwiML after Gather so Twilio actually waits
+  // (Not strictly required, but prevents some edge behaviours)
+  twiml.pause({ length: 1 });
 }
 
 function shouldReject(step, speech, confidence) {
@@ -138,14 +157,12 @@ function normalizeTimeText(text, tz) {
   if (!text) return "";
   let t = String(text).toLowerCase().trim();
 
-  // STT cleanup
   t = t.replace(/\b(\d{1,2})\s*:\s*(\d{2})\s*p\.?\s*m\.?\b/g, "$1:$2pm");
   t = t.replace(/\b(\d{1,2})\s*:\s*(\d{2})\s*a\.?\s*m\.?\b/g, "$1:$2am");
   t = t.replace(/\b(\d{1,2})\s*p\.?\s*m\.?\b/g, "$1pm");
   t = t.replace(/\b(\d{1,2})\s*a\.?\s*m\.?\b/g, "$1am");
   t = t.replace(/\s+/g, " ");
 
-  // Tonight/today/tomorrow -> explicit date in the right tz
   const now = DateTime.now().setZone(tz);
   if (t.includes("tomorrow")) {
     const d = now.plus({ days: 1 }).toFormat("cccc d LLL yyyy");
@@ -160,7 +177,6 @@ function normalizeTimeText(text, tz) {
   return t;
 }
 
-// Build a Luxon DateTime IN the target timezone using chrono's parsed components
 function parseRequestedDateTime(naturalText, tz) {
   const ref = DateTime.now().setZone(tz).toJSDate();
   const norm = normalizeTimeText(naturalText, tz);
@@ -192,7 +208,6 @@ function extractTimeIfPresent(text, tz) {
   return parseRequestedDateTime(text, tz);
 }
 
-// ✅ Send Google Calendar RFC3339 WITH OFFSET (prevents the 4am shift)
 function toGoogleDateTime(dt) {
   return dt.toISO({ includeOffset: true, suppressMilliseconds: true });
 }
@@ -384,12 +399,10 @@ app.post("/voice", async (req, res) => {
         dt = parseRequestedDateTime(session.time, tz);
       }
 
-      // After-hours fallback
       if (!dt && isAfterHoursNow(tz)) {
         dt = nextBusinessOpenSlot(tz);
       }
 
-      // Last fallback
       if (!dt) {
         dt = DateTime.now().setZone(tz).plus({ minutes: 10 }).startOf("minute");
       }
@@ -434,7 +447,6 @@ app.post("/voice", async (req, res) => {
         return res.type("text/xml").send(twiml.toString());
       }
 
-      // YES -> create calendar event
       const calendarId = process.env.GOOGLE_CALENDAR_ID;
       if (!calendarId) throw new Error("Missing GOOGLE_CALENDAR_ID env variable");
 
@@ -450,14 +462,8 @@ app.post("/voice", async (req, res) => {
         summary: `${session.job} - ${session.name}`,
         description: `${summaryText}\nCaller: ${session.from || "Unknown"}\nSpoken time: ${session.time}`,
         location: session.address,
-        start: {
-          dateTime: toGoogleDateTime(start),
-          timeZone: tz
-        },
-        end: {
-          dateTime: toGoogleDateTime(end),
-          timeZone: tz
-        }
+        start: { dateTime: toGoogleDateTime(start), timeZone: tz },
+        end: { dateTime: toGoogleDateTime(end), timeZone: tz }
       });
 
       await sendOwnerSms(
@@ -480,7 +486,6 @@ app.post("/voice", async (req, res) => {
       return res.type("text/xml").send(twiml.toString());
     }
 
-    // fallback
     session.step = "job";
     session.lastPrompt = "What job do you need help with?";
     ask(twiml, session.lastPrompt, "/voice");
@@ -489,9 +494,9 @@ app.post("/voice", async (req, res) => {
     console.error("VOICE ERROR:", err);
 
     sendOwnerSms(
-      `SYSTEM ERROR\nFrom: ${sessions.get(callSid)?.from || "Unknown"}\nStep: ${sessions.get(callSid)?.step || "?"}\nError: ${
-        err?.message || err
-      }`
+      `SYSTEM ERROR\nFrom: ${sessions.get(callSid)?.from || "Unknown"}\nStep: ${
+        sessions.get(callSid)?.step || "?"
+      }\nError: ${err?.message || err}`
     ).catch(() => {});
 
     twiml.say("Sorry, there was a system error. Please try again.", {
@@ -505,7 +510,6 @@ app.post("/voice", async (req, res) => {
   }
 });
 
-// Health check
 app.get("/", (req, res) => res.send("Voice bot running"));
 
 const PORT = process.env.PORT || 10000;
