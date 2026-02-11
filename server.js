@@ -1,11 +1,8 @@
 // server.js
 
-// Safe dotenv: works locally, won't crash if missing in prod
 try {
   require("dotenv").config();
-} catch (e) {
-  // ignore in Render if not needed
-}
+} catch (e) {}
 
 const express = require("express");
 const twilio = require("twilio");
@@ -14,34 +11,26 @@ const chrono = require("chrono-node");
 const { DateTime } = require("luxon");
 
 const app = express();
-
-// Twilio sends application/x-www-form-urlencoded
 app.use(express.urlencoded({ extended: false }));
 
 const VoiceResponse = twilio.twiml.VoiceResponse;
 
 // --------------------
-// SETTINGS (edit if you want)
+// SETTINGS
 // --------------------
-const ADMIN_SMS_TO = "+61431778238"; // owner (0431... => +61431...)
+const ADMIN_SMS_TO = "+61431778238";
 const DEFAULT_TZ = process.env.TIMEZONE || "Australia/Sydney";
 
-// Business hours for after-hours auto booking
-const BUSINESS_START_HOUR = Number(process.env.BUSINESS_START_HOUR || 7); // 7am
-const BUSINESS_END_HOUR = Number(process.env.BUSINESS_END_HOUR || 17); // 5pm
-// 1=Mon ... 7=Sun (Luxon)
+const BUSINESS_START_HOUR = Number(process.env.BUSINESS_START_HOUR || 7);
+const BUSINESS_END_HOUR = Number(process.env.BUSINESS_END_HOUR || 17);
+
 const BUSINESS_DAYS = (process.env.BUSINESS_DAYS || "1,2,3,4,5")
   .split(",")
   .map((x) => Number(x.trim()))
   .filter(Boolean);
 
-// If caller stays silent this many times, alert owner as "missed call"
 const MISSED_CALL_ALERT_TRIES = Number(process.env.MISSED_CALL_ALERT_TRIES || 2);
-
-// Max no-speech tries before we end call
 const MAX_SILENCE_TRIES = Number(process.env.MAX_SILENCE_TRIES || 6);
-
-// Calendar insert retry attempts
 const CAL_RETRY_ATTEMPTS = Number(process.env.CAL_RETRY_ATTEMPTS || 3);
 
 // --------------------
@@ -55,7 +44,7 @@ function getTwilioClient() {
 }
 
 async function sendSms(to, messageText) {
-  const from = process.env.TWILIO_SMS_FROM; // Twilio SMS-capable number
+  const from = process.env.TWILIO_SMS_FROM;
   const client = getTwilioClient();
 
   if (!client) {
@@ -67,11 +56,7 @@ async function sendSms(to, messageText) {
     return;
   }
 
-  await client.messages.create({
-    from,
-    to,
-    body: messageText
-  });
+  await client.messages.create({ from, to, body: messageText });
 }
 
 async function sendOwnerSms(messageText) {
@@ -80,7 +65,6 @@ async function sendOwnerSms(messageText) {
 
 // --------------------
 // Session store
-// Key by CallSid (better than From)
 // --------------------
 const sessions = new Map();
 
@@ -92,7 +76,6 @@ function getSession(callSid, fromNumber = "") {
       address: "",
       name: "",
       time: "",
-      // store chosen booking time as milliseconds (timezone-safe)
       bookedStartMs: null,
       lastPrompt: "",
       tries: 0,
@@ -122,8 +105,8 @@ function ask(twiml, prompt, actionUrl) {
     input: "speech",
     action: actionUrl,
     method: "POST",
-    timeout: 15, // give them longer to start talking
-    speechTimeout: "auto", // better for natural pauses
+    timeout: 15,
+    speechTimeout: "auto",
     language: "en-AU",
     profanityFilter: false
   });
@@ -136,97 +119,104 @@ function ask(twiml, prompt, actionUrl) {
 
 function shouldReject(step, speech, confidence) {
   const s = speech.toLowerCase();
-
   if (!speech || speech.length < 2) return true;
 
   const junk = new Set(["hello", "hi", "yeah", "yep", "okay", "ok"]);
-  // Allow "yes/no" for confirm step
   if (junk.has(s)) return step !== "job";
 
   const minConf = step === "job" ? 0.30 : 0.10;
-
   if (typeof confidence === "number" && confidence > 0 && confidence < minConf) {
     if (speech.split(" ").length <= 2) return true;
   }
-
   return false;
 }
 
 // --------------------
-// Time parsing + timezone-safe formatting (FIXED for "tomorrow 5pm")
+// ✅ TIMEZONE + GOOGLE FIX
 // --------------------
 function normalizeTimeText(text, tz) {
   if (!text) return "";
   let t = String(text).toLowerCase().trim();
 
-  // common STT variants -> chrono-friendly
+  // STT cleanup
   t = t.replace(/\b(\d{1,2})\s*:\s*(\d{2})\s*p\.?\s*m\.?\b/g, "$1:$2pm");
   t = t.replace(/\b(\d{1,2})\s*:\s*(\d{2})\s*a\.?\s*m\.?\b/g, "$1:$2am");
   t = t.replace(/\b(\d{1,2})\s*p\.?\s*m\.?\b/g, "$1pm");
   t = t.replace(/\b(\d{1,2})\s*a\.?\s*m\.?\b/g, "$1am");
-  t = t.replace(/\b(\d)\s*p\s*m\b/g, "$1pm");
-  t = t.replace(/\b(\d)\s*a\s*m\b/g, "$1am");
   t = t.replace(/\s+/g, " ");
 
-  // Convert "tomorrow" -> explicit date in the correct timezone
+  // Tonight/today/tomorrow -> explicit date in the right tz
+  const now = DateTime.now().setZone(tz);
   if (t.includes("tomorrow")) {
-    const tomorrow = DateTime.now().setZone(tz).plus({ days: 1 });
-    const explicit = tomorrow.toFormat("cccc d LLL"); // e.g. "Thursday 12 Feb"
-    t = t.replace(/\btomorrow\b/g, explicit);
+    const d = now.plus({ days: 1 }).toFormat("cccc d LLL yyyy");
+    t = t.replace(/\btomorrow\b/g, d);
+  }
+  if (t.includes("tonight") || t.includes("today")) {
+    const d = now.toFormat("cccc d LLL yyyy");
+    t = t.replace(/\btonight\b/g, d);
+    t = t.replace(/\btoday\b/g, d);
   }
 
   return t;
 }
 
+// Build a Luxon DateTime IN the target timezone using chrono's parsed components
 function parseRequestedDateTime(naturalText, tz) {
   const ref = DateTime.now().setZone(tz).toJSDate();
   const norm = normalizeTimeText(naturalText, tz);
 
-  const parsed = chrono.parseDate(norm, ref, { forwardDate: true });
-  if (!parsed) return null;
+  const results = chrono.parse(norm, ref, { forwardDate: true });
+  if (!results || results.length === 0) return null;
 
-  // Parsed is a JS Date (absolute instant). We treat it as intended for tz via ref normalization.
-  return parsed;
+  const r = results[0];
+  const s = r.start;
+  if (!s) return null;
+
+  const year = s.get("year");
+  const month = s.get("month");
+  const day = s.get("day");
+  const hour = s.get("hour");
+  const minute = s.get("minute") ?? 0;
+
+  if (!year || !month || !day || hour == null) return null;
+
+  const dt = DateTime.fromObject(
+    { year, month, day, hour, minute, second: 0, millisecond: 0 },
+    { zone: tz }
+  );
+
+  return dt.isValid ? dt : null;
 }
 
-// If user says: "No, Thursday 5pm" during confirm, grab the time immediately.
 function extractTimeIfPresent(text, tz) {
-  const ref = DateTime.now().setZone(tz).toJSDate();
-  const norm = normalizeTimeText(text, tz);
-  const parsed = chrono.parseDate(norm, ref, { forwardDate: true });
-  return parsed || null;
+  return parseRequestedDateTime(text, tz);
 }
 
-// ✅ FIX: Send Google Calendar a LOCAL datetime string (NO offset / NO Z) + timeZone
-function toGoogleLocalDateTime(dateObj, tz) {
-  return DateTime.fromJSDate(dateObj, { zone: tz }).toFormat("yyyy-LL-dd'T'HH:mm:ss");
+// ✅ Send Google Calendar RFC3339 WITH OFFSET (prevents the 4am shift)
+function toGoogleDateTime(dt) {
+  return dt.toISO({ includeOffset: true, suppressMilliseconds: true });
 }
 
 function isAfterHoursNow(tz) {
   const now = DateTime.now().setZone(tz);
-  const hour = now.hour;
   const isBizDay = BUSINESS_DAYS.includes(now.weekday);
-  const isBizHours = hour >= BUSINESS_START_HOUR && hour < BUSINESS_END_HOUR;
+  const isBizHours = now.hour >= BUSINESS_START_HOUR && now.hour < BUSINESS_END_HOUR;
   return !(isBizDay && isBizHours);
 }
 
 function nextBusinessOpenSlot(tz) {
   let dt = DateTime.now().setZone(tz);
 
-  // If still within business hours today, use +10 mins
   const isBizDay = BUSINESS_DAYS.includes(dt.weekday);
   const isBizHours = dt.hour >= BUSINESS_START_HOUR && dt.hour < BUSINESS_END_HOUR;
   if (isBizDay && isBizHours) {
-    return dt.plus({ minutes: 10 }).startOf("minute").toJSDate();
+    return dt.plus({ minutes: 10 }).startOf("minute");
   }
 
-  // Otherwise move forward day-by-day to next business day
   dt = dt.plus({ days: 1 }).startOf("day");
-  while (!BUSINESS_DAYS.includes(dt.weekday)) {
-    dt = dt.plus({ days: 1 }).startOf("day");
-  }
-  dt = dt.set({ hour: BUSINESS_START_HOUR, minute: 0, second: 0, millisecond: 0 });
-  return dt.toJSDate();
+  while (!BUSINESS_DAYS.includes(dt.weekday)) dt = dt.plus({ days: 1 }).startOf("day");
+
+  return dt.set({ hour: BUSINESS_START_HOUR, minute: 0, second: 0, millisecond: 0 });
 }
 
 function looksLikeAsap(text) {
@@ -235,16 +225,16 @@ function looksLikeAsap(text) {
     t.includes("asap") ||
     t.includes("anytime") ||
     t.includes("whenever") ||
-    t.includes("don’t care") ||
     t.includes("dont care") ||
+    t.includes("don’t care") ||
     t.includes("no preference") ||
     t.includes("soon as possible") ||
     t === "soon"
   );
 }
 
-function formatForVoice(dateObj, tz) {
-  return DateTime.fromJSDate(dateObj, { zone: tz }).toFormat("ccc d LLL, h:mm a");
+function formatForVoice(dt) {
+  return dt.toFormat("ccc d LLL, h:mm a");
 }
 
 // --------------------
@@ -267,12 +257,10 @@ function parseGoogleServiceJson() {
 
 function getCalendarClient() {
   const credentials = parseGoogleServiceJson();
-
   const auth = new google.auth.GoogleAuth({
     credentials,
     scopes: ["https://www.googleapis.com/auth/calendar"]
   });
-
   return google.calendar({ version: "v3", auth });
 }
 
@@ -288,14 +276,13 @@ async function insertCalendarEventWithRetry(calendar, calendarId, requestBody) {
       return await calendar.events.insert({ calendarId, requestBody });
     } catch (err) {
       lastErr = err;
-      console.error(`Calendar insert failed (attempt ${attempt}/${CAL_RETRY_ATTEMPTS})`, err?.message || err);
-
-      if (attempt < CAL_RETRY_ATTEMPTS) {
-        await sleep(attempt === 1 ? 200 : 800);
-      }
+      console.error(
+        `Calendar insert failed (attempt ${attempt}/${CAL_RETRY_ATTEMPTS})`,
+        err?.message || err
+      );
+      if (attempt < CAL_RETRY_ATTEMPTS) await sleep(attempt === 1 ? 200 : 800);
     }
   }
-
   throw lastErr;
 }
 
@@ -312,21 +299,20 @@ app.post("/voice", async (req, res) => {
   const speech = cleanSpeech(speechRaw);
 
   const session = getSession(callSid, fromNumber);
+  console.log(
+    `CALLSID=${callSid} FROM=${fromNumber} STEP=${session.step} Speech="${speech}" Confidence=${confidence}`
+  );
 
-  console.log(`CALLSID=${callSid} FROM=${fromNumber} STEP=${session.step} Speech="${speech}" Confidence=${confidence}`);
-
-  // Handle no-speech hits (start of call / timeouts)
   if (!speech) {
     session.tries += 1;
 
-    // Missed call capture alert (early)
     if (session.tries === MISSED_CALL_ALERT_TRIES) {
       const txt =
         `MISSED/QUIET CALL ALERT\n` +
         `From: ${session.from || "Unknown"}\n` +
         `Progress: step=${session.step}\n` +
         `Time: ${DateTime.now().setZone(DEFAULT_TZ).toFormat("ccc d LLL yyyy, h:mm a")}`;
-      sendOwnerSms(txt).catch((e) => console.error("Owner SMS failed:", e?.message || e));
+      sendOwnerSms(txt).catch(() => {});
     }
 
     if (session.tries >= MAX_SILENCE_TRIES) {
@@ -354,26 +340,17 @@ app.post("/voice", async (req, res) => {
     return res.type("text/xml").send(twiml.toString());
   }
 
-  // We got speech → reset tries
   session.tries = 0;
 
-  // Confirm step is special: accept yes/no even if confidence low
   if (session.step !== "confirm" && shouldReject(session.step, speech, confidence)) {
-    const repromptMap = {
-      job: "Sorry — what job do you need help with?",
-      address: "Sorry — what is the address?",
-      name: "Sorry — what is your name?",
-      time: "Sorry — what time would you like?"
-    };
-
-    const reprompt = repromptMap[session.step] || "Sorry, can you repeat that?";
-    session.lastPrompt = reprompt;
-
-    ask(twiml, reprompt, "/voice");
+    session.lastPrompt = "Sorry, can you repeat that?";
+    ask(twiml, session.lastPrompt, "/voice");
     return res.type("text/xml").send(twiml.toString());
   }
 
   try {
+    const tz = DEFAULT_TZ;
+
     if (session.step === "job") {
       session.job = speech;
       session.step = "address";
@@ -401,27 +378,27 @@ app.post("/voice", async (req, res) => {
     if (session.step === "time") {
       session.time = speech;
 
-      const tz = DEFAULT_TZ;
+      let dt = null;
 
-      let parsedStart = null;
       if (!looksLikeAsap(session.time)) {
-        parsedStart = parseRequestedDateTime(session.time, tz);
+        dt = parseRequestedDateTime(session.time, tz);
       }
 
-      if (!parsedStart && isAfterHoursNow(tz)) {
-        parsedStart = nextBusinessOpenSlot(tz);
+      // After-hours fallback
+      if (!dt && isAfterHoursNow(tz)) {
+        dt = nextBusinessOpenSlot(tz);
       }
 
-      const start = parsedStart ? new Date(parsedStart) : new Date(Date.now() + 10 * 60 * 1000);
+      // Last fallback
+      if (!dt) {
+        dt = DateTime.now().setZone(tz).plus({ minutes: 10 }).startOf("minute");
+      }
 
-      // store as milliseconds (safe)
-      session.bookedStartMs = start.getTime();
-
-      const whenForVoice = formatForVoice(start, tz);
+      session.bookedStartMs = dt.toMillis();
 
       session.step = "confirm";
       session.lastPrompt =
-        `Alright. I heard: ${session.job}, at ${session.address}, for ${session.name}, on ${whenForVoice}. ` +
+        `Alright. I heard: ${session.job}, at ${session.address}, for ${session.name}, on ${formatForVoice(dt)}. ` +
         `Is that correct? Say yes to confirm, or no to change the time.`;
 
       ask(twiml, session.lastPrompt, "/voice");
@@ -430,9 +407,7 @@ app.post("/voice", async (req, res) => {
 
     if (session.step === "confirm") {
       const s = speech.toLowerCase();
-
-      const isYes =
-        s.includes("yes") || s.includes("yeah") || s.includes("yep") || s.includes("correct") || s.includes("that is");
+      const isYes = s.includes("yes") || s.includes("yeah") || s.includes("yep") || s.includes("correct");
       const isNo = s.includes("no") || s.includes("nope") || s.includes("wrong") || s.includes("change");
 
       if (!isYes && !isNo) {
@@ -442,20 +417,11 @@ app.post("/voice", async (req, res) => {
       }
 
       if (isNo) {
-        // If they say "No, Thursday 5pm" capture the new time immediately
-        const tz = DEFAULT_TZ;
-        const maybeNewTime = extractTimeIfPresent(speech, tz);
-
-        if (maybeNewTime) {
-          const start = new Date(maybeNewTime);
+        const maybe = extractTimeIfPresent(speech, tz);
+        if (maybe) {
           session.time = speech;
-          session.bookedStartMs = start.getTime();
-
-          const whenForVoice = formatForVoice(start, tz);
-          session.step = "confirm";
-          session.lastPrompt =
-            `Got it. Updated time: ${whenForVoice}. Is that correct? Say yes to confirm, or no to change the time.`;
-
+          session.bookedStartMs = maybe.toMillis();
+          session.lastPrompt = `Got it. Updated time: ${formatForVoice(maybe)}. Say yes to confirm, or no to change.`;
           ask(twiml, session.lastPrompt, "/voice");
           return res.type("text/xml").send(twiml.toString());
         }
@@ -468,67 +434,43 @@ app.post("/voice", async (req, res) => {
         return res.type("text/xml").send(twiml.toString());
       }
 
-      // YES -> proceed to booking
+      // YES -> create calendar event
       const calendarId = process.env.GOOGLE_CALENDAR_ID;
       if (!calendarId) throw new Error("Missing GOOGLE_CALENDAR_ID env variable");
 
       const calendar = getCalendarClient();
-      const tz = DEFAULT_TZ;
 
-      const start = new Date(session.bookedStartMs || Date.now());
-      const end = new Date(start.getTime() + 60 * 60 * 1000);
+      const start = DateTime.fromMillis(session.bookedStartMs || Date.now(), { zone: tz });
+      const end = start.plus({ hours: 1 });
 
       const summaryText = `${session.name} needs ${session.job} at ${session.address}.`;
-      const displayWhen = DateTime.fromJSDate(start, { zone: tz }).toFormat("ccc d LLL yyyy, h:mm a");
+      const displayWhen = start.toFormat("ccc d LLL yyyy, h:mm a");
 
-      // ✅ Calendar insert (timezone-safe local datetime)
-      try {
-        await insertCalendarEventWithRetry(calendar, calendarId, {
-          summary: `${session.job} - ${session.name}`,
-          description: `${summaryText}\nCaller: ${session.from || "Unknown"}\nSpoken time: ${session.time}`,
-          location: session.address,
-          start: {
-            dateTime: toGoogleLocalDateTime(start, tz),
-            timeZone: tz
-          },
-          end: {
-            dateTime: toGoogleLocalDateTime(end, tz),
-            timeZone: tz
-          }
-        });
-      } catch (calErr) {
-        const failTxt =
-          `BOOKING FAILED (Calendar)\n` +
+      await insertCalendarEventWithRetry(calendar, calendarId, {
+        summary: `${session.job} - ${session.name}`,
+        description: `${summaryText}\nCaller: ${session.from || "Unknown"}\nSpoken time: ${session.time}`,
+        location: session.address,
+        start: {
+          dateTime: toGoogleDateTime(start),
+          timeZone: tz
+        },
+        end: {
+          dateTime: toGoogleDateTime(end),
+          timeZone: tz
+        }
+      });
+
+      await sendOwnerSms(
+        `NEW BOOKING ✅\n` +
           `Name: ${session.name}\n` +
           `Job: ${session.job}\n` +
           `Address: ${session.address}\n` +
-          `Spoken time: ${session.time}\n` +
           `Caller: ${session.from || "Unknown"}\n` +
-          `Reason: ${calErr?.message || calErr}`;
-        await sendOwnerSms(failTxt);
+          `Spoken: ${session.time}\n` +
+          `Booked: ${displayWhen} (${tz})`
+      );
 
-        twiml.say("Sorry, booking failed on our side. We'll call you back shortly.", {
-          voice: "Polly.Amy",
-          language: "en-AU"
-        });
-        twiml.hangup();
-        resetSession(callSid);
-        return res.type("text/xml").send(twiml.toString());
-      }
-
-      // Owner SMS on success
-      const smsText =
-        `NEW BOOKING ✅\n` +
-        `Name: ${session.name}\n` +
-        `Job: ${session.job}\n` +
-        `Address: ${session.address}\n` +
-        `Caller: ${session.from || "Unknown"}\n` +
-        `Spoken: ${session.time}\n` +
-        `Booked: ${displayWhen} (${tz})`;
-
-      await sendOwnerSms(smsText);
-
-      twiml.say(`Booked. Thanks ${session.name}. See you ${formatForVoice(start, tz)}.`, {
+      twiml.say(`Booked. Thanks ${session.name}. See you ${formatForVoice(start)}.`, {
         voice: "Polly.Amy",
         language: "en-AU"
       });
@@ -538,7 +480,7 @@ app.post("/voice", async (req, res) => {
       return res.type("text/xml").send(twiml.toString());
     }
 
-    // Fallback
+    // fallback
     session.step = "job";
     session.lastPrompt = "What job do you need help with?";
     ask(twiml, session.lastPrompt, "/voice");
@@ -546,12 +488,11 @@ app.post("/voice", async (req, res) => {
   } catch (err) {
     console.error("VOICE ERROR:", err);
 
-    const errTxt =
-      `SYSTEM ERROR\n` +
-      `From: ${session.from || "Unknown"}\n` +
-      `Step: ${session.step}\n` +
-      `Error: ${err?.message || err}`;
-    sendOwnerSms(errTxt).catch(() => {});
+    sendOwnerSms(
+      `SYSTEM ERROR\nFrom: ${sessions.get(callSid)?.from || "Unknown"}\nStep: ${sessions.get(callSid)?.step || "?"}\nError: ${
+        err?.message || err
+      }`
+    ).catch(() => {});
 
     twiml.say("Sorry, there was a system error. Please try again.", {
       voice: "Polly.Amy",
