@@ -153,13 +153,47 @@ function shouldReject(step, speech, confidence) {
 }
 
 // --------------------
-// Time parsing + timezone-safe formatting
+// Time parsing + timezone-safe formatting (FIXED for "tomorrow 5pm")
 // --------------------
+function normalizeTimeText(text, tz) {
+  if (!text) return "";
+  let t = String(text).toLowerCase().trim();
+
+  // common STT variants -> chrono-friendly
+  t = t.replace(/\b(\d{1,2})\s*:\s*(\d{2})\s*p\.?\s*m\.?\b/g, "$1:$2pm");
+  t = t.replace(/\b(\d{1,2})\s*:\s*(\d{2})\s*a\.?\s*m\.?\b/g, "$1:$2am");
+  t = t.replace(/\b(\d{1,2})\s*p\.?\s*m\.?\b/g, "$1pm");
+  t = t.replace(/\b(\d{1,2})\s*a\.?\s*m\.?\b/g, "$1am");
+  t = t.replace(/\b5 p m\b/g, "5pm");
+  t = t.replace(/\s+/g, " ");
+
+  // Convert "tomorrow" -> explicit date in the correct timezone
+  // This prevents chrono guessing wrong.
+  if (t.includes("tomorrow")) {
+    const tomorrow = DateTime.now().setZone(tz).plus({ days: 1 });
+    const explicit = tomorrow.toFormat("cccc d LLL"); // e.g. "Thursday 12 Feb"
+    t = t.replace(/\btomorrow\b/g, explicit);
+  }
+
+  return t;
+}
+
 function parseRequestedDateTime(naturalText, tz) {
   const ref = DateTime.now().setZone(tz).toJSDate();
-  const parsed = chrono.parseDate(naturalText, ref, { forwardDate: true });
+  const norm = normalizeTimeText(naturalText, tz);
+
+  const parsed = chrono.parseDate(norm, ref, { forwardDate: true });
   if (!parsed) return null;
+
   return DateTime.fromJSDate(parsed, { zone: tz }).toJSDate();
+}
+
+// If user says: "No, Thursday 5pm" during confirm, grab the time immediately.
+function extractTimeIfPresent(text, tz) {
+  const ref = DateTime.now().setZone(tz).toJSDate();
+  const norm = normalizeTimeText(text, tz);
+  const parsed = chrono.parseDate(norm, ref, { forwardDate: true });
+  return parsed ? new Date(parsed) : null;
 }
 
 function toGoogleDateTime(dateObj, tz) {
@@ -417,7 +451,25 @@ app.post("/voice", async (req, res) => {
       }
 
       if (isNo) {
-        // Simple: only redo time (fast + robust)
+        // ✅ FIX: If they say "No, Thursday 5pm" we capture the new time immediately
+        const tz = DEFAULT_TZ;
+        const maybeNewTime = extractTimeIfPresent(speech, tz);
+
+        if (maybeNewTime) {
+          // update the proposed booking time and re-confirm
+          session.time = speech; // keep raw utterance
+          session.bookedStartISO = toGoogleDateTime(maybeNewTime, tz);
+
+          const whenForVoice = formatForVoice(maybeNewTime, tz);
+          session.step = "confirm";
+          session.lastPrompt =
+            `Got it. Updated time: ${whenForVoice}. Is that correct? Say yes to confirm, or no to change the time.`;
+
+          ask(twiml, session.lastPrompt, "/voice");
+          return res.type("text/xml").send(twiml.toString());
+        }
+
+        // Otherwise redo time normally
         session.step = "time";
         session.time = "";
         session.bookedStartISO = "";
