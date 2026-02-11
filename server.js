@@ -27,8 +27,8 @@ const ADMIN_SMS_TO = "+61431778238"; // owner (0431... => +61431...)
 const DEFAULT_TZ = process.env.TIMEZONE || "Australia/Sydney";
 
 // Business hours for after-hours auto booking
-const BUSINESS_START_HOUR = Number(process.env.BUSINESS_START_HOUR || 7);  // 7am
-const BUSINESS_END_HOUR = Number(process.env.BUSINESS_END_HOUR || 17);     // 5pm
+const BUSINESS_START_HOUR = Number(process.env.BUSINESS_START_HOUR || 7); // 7am
+const BUSINESS_END_HOUR = Number(process.env.BUSINESS_END_HOUR || 17); // 5pm
 // 1=Mon ... 7=Sun (Luxon)
 const BUSINESS_DAYS = (process.env.BUSINESS_DAYS || "1,2,3,4,5")
   .split(",")
@@ -92,8 +92,8 @@ function getSession(callSid, fromNumber = "") {
       address: "",
       name: "",
       time: "",
-      // computed after time parse:
-      bookedStartISO: "",
+      // store chosen booking time as milliseconds (timezone-safe)
+      bookedStartMs: null,
       lastPrompt: "",
       tries: 0,
       from: fromNumber || ""
@@ -122,8 +122,8 @@ function ask(twiml, prompt, actionUrl) {
     input: "speech",
     action: actionUrl,
     method: "POST",
-    timeout: 15,            // give them a bit longer to start talking
-    speechTimeout: "auto",  // better for natural pauses
+    timeout: 15, // give them longer to start talking
+    speechTimeout: "auto", // better for natural pauses
     language: "en-AU",
     profanityFilter: false
   });
@@ -164,11 +164,11 @@ function normalizeTimeText(text, tz) {
   t = t.replace(/\b(\d{1,2})\s*:\s*(\d{2})\s*a\.?\s*m\.?\b/g, "$1:$2am");
   t = t.replace(/\b(\d{1,2})\s*p\.?\s*m\.?\b/g, "$1pm");
   t = t.replace(/\b(\d{1,2})\s*a\.?\s*m\.?\b/g, "$1am");
-  t = t.replace(/\b5 p m\b/g, "5pm");
+  t = t.replace(/\b(\d)\s*p\s*m\b/g, "$1pm");
+  t = t.replace(/\b(\d)\s*a\s*m\b/g, "$1am");
   t = t.replace(/\s+/g, " ");
 
   // Convert "tomorrow" -> explicit date in the correct timezone
-  // This prevents chrono guessing wrong.
   if (t.includes("tomorrow")) {
     const tomorrow = DateTime.now().setZone(tz).plus({ days: 1 });
     const explicit = tomorrow.toFormat("cccc d LLL"); // e.g. "Thursday 12 Feb"
@@ -185,7 +185,8 @@ function parseRequestedDateTime(naturalText, tz) {
   const parsed = chrono.parseDate(norm, ref, { forwardDate: true });
   if (!parsed) return null;
 
-  return DateTime.fromJSDate(parsed, { zone: tz }).toJSDate();
+  // Parsed is a JS Date (absolute instant). We treat it as intended for tz via ref normalization.
+  return parsed;
 }
 
 // If user says: "No, Thursday 5pm" during confirm, grab the time immediately.
@@ -193,15 +194,12 @@ function extractTimeIfPresent(text, tz) {
   const ref = DateTime.now().setZone(tz).toJSDate();
   const norm = normalizeTimeText(text, tz);
   const parsed = chrono.parseDate(norm, ref, { forwardDate: true });
-  return parsed ? new Date(parsed) : null;
+  return parsed || null;
 }
 
-function toGoogleDateTime(dateObj, tz) {
-  // IMPORTANT: include offset (no "Z") so Calendar won’t shift it
-  return DateTime.fromJSDate(dateObj, { zone: tz }).toISO({
-    includeOffset: true,
-    suppressMilliseconds: true
-  });
+// ✅ FIX: Send Google Calendar a LOCAL datetime string (NO offset / NO Z) + timeZone
+function toGoogleLocalDateTime(dateObj, tz) {
+  return DateTime.fromJSDate(dateObj, { zone: tz }).toFormat("yyyy-LL-dd'T'HH:mm:ss");
 }
 
 function isAfterHoursNow(tz) {
@@ -213,7 +211,6 @@ function isAfterHoursNow(tz) {
 }
 
 function nextBusinessOpenSlot(tz) {
-  // Next business day at BUSINESS_START_HOUR:00
   let dt = DateTime.now().setZone(tz);
 
   // If still within business hours today, use +10 mins
@@ -293,7 +290,6 @@ async function insertCalendarEventWithRetry(calendar, calendarId, requestBody) {
       lastErr = err;
       console.error(`Calendar insert failed (attempt ${attempt}/${CAL_RETRY_ATTEMPTS})`, err?.message || err);
 
-      // small backoff
       if (attempt < CAL_RETRY_ATTEMPTS) {
         await sleep(attempt === 1 ? 200 : 800);
       }
@@ -378,7 +374,6 @@ app.post("/voice", async (req, res) => {
   }
 
   try {
-    // Step machine
     if (session.step === "job") {
       session.job = speech;
       session.step = "address";
@@ -408,8 +403,6 @@ app.post("/voice", async (req, res) => {
 
       const tz = DEFAULT_TZ;
 
-      // After-hours auto booking logic:
-      // - If they say ASAP/anytime/etc, or parsing fails after hours -> next business open slot
       let parsedStart = null;
       if (!looksLikeAsap(session.time)) {
         parsedStart = parseRequestedDateTime(session.time, tz);
@@ -419,14 +412,13 @@ app.post("/voice", async (req, res) => {
         parsedStart = nextBusinessOpenSlot(tz);
       }
 
-      // If still nothing, fallback to now+10 mins
       const start = parsedStart ? new Date(parsedStart) : new Date(Date.now() + 10 * 60 * 1000);
 
-      session.bookedStartISO = toGoogleDateTime(start, tz);
+      // store as milliseconds (safe)
+      session.bookedStartMs = start.getTime();
 
       const whenForVoice = formatForVoice(start, tz);
 
-      // Booking confirmation read-back (YES/NO)
       session.step = "confirm";
       session.lastPrompt =
         `Alright. I heard: ${session.job}, at ${session.address}, for ${session.name}, on ${whenForVoice}. ` +
@@ -441,8 +433,7 @@ app.post("/voice", async (req, res) => {
 
       const isYes =
         s.includes("yes") || s.includes("yeah") || s.includes("yep") || s.includes("correct") || s.includes("that is");
-      const isNo =
-        s.includes("no") || s.includes("nope") || s.includes("wrong") || s.includes("change");
+      const isNo = s.includes("no") || s.includes("nope") || s.includes("wrong") || s.includes("change");
 
       if (!isYes && !isNo) {
         session.lastPrompt = "Sorry — just say yes to confirm, or no to change the time.";
@@ -451,16 +442,16 @@ app.post("/voice", async (req, res) => {
       }
 
       if (isNo) {
-        // ✅ FIX: If they say "No, Thursday 5pm" we capture the new time immediately
+        // If they say "No, Thursday 5pm" capture the new time immediately
         const tz = DEFAULT_TZ;
         const maybeNewTime = extractTimeIfPresent(speech, tz);
 
         if (maybeNewTime) {
-          // update the proposed booking time and re-confirm
-          session.time = speech; // keep raw utterance
-          session.bookedStartISO = toGoogleDateTime(maybeNewTime, tz);
+          const start = new Date(maybeNewTime);
+          session.time = speech;
+          session.bookedStartMs = start.getTime();
 
-          const whenForVoice = formatForVoice(maybeNewTime, tz);
+          const whenForVoice = formatForVoice(start, tz);
           session.step = "confirm";
           session.lastPrompt =
             `Got it. Updated time: ${whenForVoice}. Is that correct? Say yes to confirm, or no to change the time.`;
@@ -469,10 +460,9 @@ app.post("/voice", async (req, res) => {
           return res.type("text/xml").send(twiml.toString());
         }
 
-        // Otherwise redo time normally
         session.step = "time";
         session.time = "";
-        session.bookedStartISO = "";
+        session.bookedStartMs = null;
         session.lastPrompt = "No problem. What time would you like instead?";
         ask(twiml, session.lastPrompt, "/voice");
         return res.type("text/xml").send(twiml.toString());
@@ -485,29 +475,28 @@ app.post("/voice", async (req, res) => {
       const calendar = getCalendarClient();
       const tz = DEFAULT_TZ;
 
-      const start = DateTime.fromISO(session.bookedStartISO, { setZone: true }).toJSDate();
+      const start = new Date(session.bookedStartMs || Date.now());
       const end = new Date(start.getTime() + 60 * 60 * 1000);
 
       const summaryText = `${session.name} needs ${session.job} at ${session.address}.`;
       const displayWhen = DateTime.fromJSDate(start, { zone: tz }).toFormat("ccc d LLL yyyy, h:mm a");
 
-      // Create event (with retry)
+      // ✅ Calendar insert (timezone-safe local datetime)
       try {
         await insertCalendarEventWithRetry(calendar, calendarId, {
           summary: `${session.job} - ${session.name}`,
           description: `${summaryText}\nCaller: ${session.from || "Unknown"}\nSpoken time: ${session.time}`,
           location: session.address,
           start: {
-            dateTime: toGoogleDateTime(start, tz),
+            dateTime: toGoogleLocalDateTime(start, tz),
             timeZone: tz
           },
           end: {
-            dateTime: toGoogleDateTime(end, tz),
+            dateTime: toGoogleLocalDateTime(end, tz),
             timeZone: tz
           }
         });
       } catch (calErr) {
-        // Owner alert if calendar failed even after retries
         const failTxt =
           `BOOKING FAILED (Calendar)\n` +
           `Name: ${session.name}\n` +
@@ -557,7 +546,6 @@ app.post("/voice", async (req, res) => {
   } catch (err) {
     console.error("VOICE ERROR:", err);
 
-    // Also alert owner
     const errTxt =
       `SYSTEM ERROR\n` +
       `From: ${session.from || "Unknown"}\n` +
