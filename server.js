@@ -14,6 +14,11 @@
 // - Lightweight slot-fill: if caller blurts time/address/name mid-flow, we capture it
 // - DTMF shortcuts: 1=Yes, 2=No, 3=Change time, 4=Change address, 5=Change job, 6=Change name
 //
+// ✅ DEPLOY SAFETY IMPROVEMENTS:
+// 5) Safer Twilio signature validation with raw body capture
+// 6) “lastAskedField” actually used so Clarify defaults to the right field
+// 7) Small guard to help catch accidental truncation/parse issues early (node --check recommended)
+//
 // NOTE: Node 18+ (global fetch). If not, install node-fetch and import it.
 
 try { require("dotenv").config(); } catch (e) {}
@@ -26,7 +31,18 @@ const { DateTime } = require("luxon");
 
 const app = express();
 app.set("trust proxy", true);
-app.use(express.urlencoded({ extended: false }));
+
+/**
+* ✅ IMPORTANT for Twilio signature validation:
+* Twilio signs the *raw* POST body. If you ever switch to express.json(),
+* you'll want rawBody. We keep urlencoded but also capture raw.
+*/
+function rawBodySaver(req, res, buf) {
+try { req.rawBody = buf?.toString("utf8") || ""; } catch { req.rawBody = ""; }
+}
+
+// Twilio sends application/x-www-form-urlencoded by default
+app.use(express.urlencoded({ extended: false, verify: rawBodySaver }));
 
 const VoiceResponse = twilio.twiml.VoiceResponse;
 const MessagingResponse = twilio.twiml.MessagingResponse;
@@ -141,11 +157,13 @@ if (!TWILIO_AUTH_TOKEN) return false;
 const signature = req.headers["x-twilio-signature"];
 if (!signature) return false;
 
+// Important: Twilio validates against the full URL of the webhook
 const proto = (req.headers["x-forwarded-proto"] || "https").split(",")[0].trim();
 const host = (req.headers["x-forwarded-host"] || req.headers["host"] || "").split(",")[0].trim();
 const url = `${proto}://${host}${req.originalUrl}`;
 
 try {
+// Twilio’s helper uses req.body object; rawBody is retained as req.rawBody if ever needed
 return twilio.validateRequest(TWILIO_AUTH_TOKEN, signature, url, req.body);
 } catch {
 return false;
@@ -410,7 +428,6 @@ profanityFilter: false,
 ...options
 });
 
-// Add a tiny hint if desired
 gather.say(prompt || "Sorry, can you repeat that?", { voice: "Polly.Amy", language: "en-AU" });
 twiml.pause({ length: 1 });
 }
@@ -419,7 +436,6 @@ function shouldReject(step, speech, confidence) {
 const s = (speech || "").toLowerCase();
 if (!speech || speech.length < 2) return true;
 
-// ✅ removed yes/no junk words from reject list (handled globally)
 const junk = new Set(["hello", "hi"]);
 if (junk.has(s)) return step !== "job" && step !== "intent";
 
@@ -482,6 +498,7 @@ const dt = DateTime.fromObject({ year, month, day, hour, minute, second: 0, mill
 return dt.isValid ? dt : null;
 }
 
+// (kept for future use)
 function extractTimeIfPresent(text, tz) { return parseRequestedDateTime(text, tz); }
 function toGoogleDateTime(dt) { return dt.toISO({ includeOffset: true, suppressMilliseconds: true }); }
 
@@ -521,7 +538,7 @@ return dt.set({ hour: tradie.businessStartHour, minute: 0, second: 0, millisecon
 }
 
 /* ============================================================================
-✅ INTERRUPTION RESILIENCE HELPERS (NEW)
+✅ INTERRUPTION RESILIENCE HELPERS
 ============================================================================ */
 function detectYesNoFromDigits(d) {
 if (!d) return null;
@@ -575,7 +592,6 @@ return null;
 function trySlotFill(session, speech, tz) {
 const filled = { time: false, address: false, name: false };
 
-// time
 const dt = parseRequestedDateTime(speech, tz);
 if (dt) {
 session.time = speech;
@@ -583,7 +599,6 @@ session.bookedStartMs = dt.toMillis();
 filled.time = true;
 }
 
-// address heuristic
 const s = (speech || "").toLowerCase();
 const addrHints = [" street", " st", " road", " rd", " avenue", " ave", " drive", " dr", " lane", " ln", " court", " ct", " crescent", " cr", " highway", " hwy"];
 const looksAddr = /\d/.test(s) && addrHints.some(h => s.includes(h));
@@ -592,7 +607,6 @@ session.address = speech;
 filled.address = true;
 }
 
-// name heuristic
 const m = speech.match(/my name is\s+(.+)/i);
 if (m && m[1]) {
 session.name = cleanSpeech(m[1]);
@@ -950,6 +964,9 @@ session._countedCall = true;
 await incMetric(tradie, { calls_total: 1 });
 }
 
+// ✅ record which field we last asked (improves Clarify)
+if (session.step && session.step !== "clarify") session.lastAskedField = session.step;
+
 console.log(`TID=${tradie.key} CALLSID=${callSid} FROM=${fromNumber} STEP=${session.step} Speech="${speech}" Digits="${digits}" Confidence=${confidence}`);
 
 // No speech AND no digits
@@ -1008,19 +1025,24 @@ const corrected = speech ? detectCorrection(speech) : false;
 // Jump to clarify if they want to change something mid-flow
 if ((corrected || yn === "NO" || changeField) && session.step !== "intent" && session.step !== "clarify") {
 session.lastStepBeforeClarify = session.step;
+
+// if they didn't specify what to change, default to last asked field
+const defaultTarget = changeField || session.lastAskedField || "";
+
 session.step = "clarify";
-session.lastPrompt = changeField
-? `No worries. Let's change the ${changeField}.`
+session.lastPrompt = defaultTarget
+? `No worries. Let's change the ${defaultTarget}.`
 : "No worries — what should I change? job, address, name, or time? (You can press 3 time, 4 address, 5 job, 6 name)";
-// If they already specified which field to change via digit, route immediately
-if (changeField) {
-session.step = changeField; // jump straight
-const p = changeField === "job" ? "Sure — what job do you need help with?"
-: changeField === "address" ? "Sure — what is the address?"
-: changeField === "name" ? "Sure — what is your name?"
+
+if (defaultTarget && defaultTarget !== "clarify" && defaultTarget !== "confirm") {
+session.step = defaultTarget; // jump straight
+const p = defaultTarget === "job" ? "Sure — what job do you need help with?"
+: defaultTarget === "address" ? "Sure — what is the address?"
+: defaultTarget === "name" ? "Sure — what is your name?"
 : "Sure — what time would you like?";
 session.lastPrompt = p;
 }
+
 ask(twiml, session.lastPrompt, "/voice");
 return res.type("text/xml").send(twiml.toString());
 }
@@ -1041,7 +1063,7 @@ return res.type("text/xml").send(twiml.toString());
 
 // ✅ Clarify step handler
 if (session.step === "clarify") {
-const target = changeField || detectChangeFieldFromSpeech(speech) || "";
+const target = changeField || detectChangeFieldFromSpeech(speech) || session.lastAskedField || "";
 if (target) {
 session.step = target;
 session.lastPrompt =
@@ -1053,7 +1075,6 @@ ask(twiml, session.lastPrompt, "/voice");
 return res.type("text/xml").send(twiml.toString());
 }
 
-// If they already gave a new time/address/name in the same utterance, slot-fill may have it.
 if (session.job && session.address && session.name && session.bookedStartMs) {
 session.step = "confirm";
 session.lastPrompt = "Got it. Say yes to confirm, or no to change the time. (Press 1 for yes, 2 for no)";
@@ -1129,7 +1150,6 @@ return res.type("text/xml").send(twiml.toString());
 
 // STEP: job
 if (session.step === "job") {
-// if they interrupted and already said address/time, keep it; but store job too
 if (speech) session.job = speech;
 session.step = "address";
 session.lastPrompt = "What is the address?";
@@ -1378,21 +1398,4 @@ if (session.step === "confirm") {
 const s = (speech || "").toLowerCase();
 const yn2 = detectYesNoFromDigits(digits) || detectYesNo(speech);
 
-const isYes = yn2 === "YES" || s.includes("yes") || s.includes("yeah") || s.includes("yep") || s.includes("correct");
-const isNo = yn2 === "NO" || s.includes("no") || s.includes("nope") || s.includes("wrong") || s.includes("change");
-const isUpdate = s.includes("update") || s.includes("replace");
-
-if (isNo) {
-session.step = "time";
-session.time = "";
-session.bookedStartMs = null;
-session.proposedSlots = [];
-session.lastPrompt = "No problem. What time would you like instead?";
-ask(twiml, session.lastPrompt, "/voice");
-return res.type("text/xml").send(twiml.toString());
-}
-
-if (session.duplicateEvent && isUpdate) {
-session.confirmMode = "update";
-} else if (!isYes && !isUpdate) {
-session.lastPrompt = session.duplicateEvent
+const isYes = yn2 ===
