@@ -1,6 +1,7 @@
 // server.js
-// Sell-ready: Multi-tenant, customer SMS, dupe detection, history, human fallback,
-// calendar backup, inbound SMS Y/N (DB-backed via Supabase optional)
+// Sell-ready: Multi-tenant, intent detection, customer SMS, dupe detection, history,
+// human fallback, calendar backup, inbound SMS Y/N (DB-backed via Supabase optional),
+// missed revenue alerts, customer memory notes, revenue analytics + admin endpoint
 
 try { require("dotenv").config(); } catch (e) {}
 
@@ -11,47 +12,22 @@ const chrono = require("chrono-node");
 const { DateTime } = require("luxon");
 
 const app = express();
-
-// IMPORTANT for Render / proxies (Twilio signature + correct URL building)
 app.set("trust proxy", true);
-
-// Twilio sends form-encoded for Voice + SMS webhooks
 app.use(express.urlencoded({ extended: false }));
 
 const VoiceResponse = twilio.twiml.VoiceResponse;
 const MessagingResponse = twilio.twiml.MessagingResponse;
 
 /* ============================================================================
-MULTI-TRADIE CONFIG (multi-tenant) via ENV
-
-TRADIES_JSON maps the Twilio "To" number (your Twilio number) to settings.
-
-Example:
-{
-"+61489272876": {
-"ownerSmsTo": "+61431778238",
-"smsFrom": "+61489272876",
-"timezone": "Australia/Sydney",
-"businessStartHour": 7,
-"businessEndHour": 17,
-"businessDays": [1,2,3,4,5],
-"calendarId": "your_calendar_id@group.calendar.google.com",
-"googleServiceJson": "{...optional override...}"
-},
-"default": { ...fallback... }
-}
+MULTI-TRADIE CONFIG
 ============================================================================ */
-
 function parseTradiesJson() {
 const raw = process.env.TRADIES_JSON;
 if (!raw) return {};
-try {
-return JSON.parse(raw);
-} catch (e) {
-try {
-// tolerate accidental newlines / formatting
-return JSON.parse(raw.replace(/\r?\n/g, ""));
-} catch {
+try { return JSON.parse(raw); }
+catch {
+try { return JSON.parse(raw.replace(/\r?\n/g, "")); }
+catch {
 console.warn("TRADIES_JSON parse failed. Check JSON formatting.");
 return {};
 }
@@ -61,8 +37,6 @@ return {};
 const TRADIES = parseTradiesJson();
 
 function getTradieKey(req) {
-// Voice: req.body.To is your Twilio number (dialed)
-// SMS: req.body.To is your Twilio number (received)
 return (req.body.To || req.query.tid || "default").trim();
 }
 
@@ -74,20 +48,24 @@ const businessDays =
 Array.isArray(t.businessDays) && t.businessDays.length
 ? t.businessDays
 : (process.env.BUSINESS_DAYS || "1,2,3,4,5")
-.split(",")
-.map((x) => Number(x.trim()))
-.filter(Boolean);
+.split(",").map((x) => Number(x.trim())).filter(Boolean);
+
+// optional pricing model per tradie for analytics
+const avgJobValue = Number(t.avgJobValue ?? process.env.AVG_JOB_VALUE ?? 250);
+const closeRate = Number(t.closeRate ?? process.env.CLOSE_RATE ?? 0.6); // 60% default
 
 return {
 key,
 ownerSmsTo: t.ownerSmsTo || process.env.OWNER_SMS_TO || "",
-smsFrom: t.smsFrom || process.env.TWILIO_SMS_FROM || "", // must be SMS-capable Twilio number
+smsFrom: t.smsFrom || process.env.TWILIO_SMS_FROM || "",
 timezone: t.timezone || process.env.TIMEZONE || "Australia/Sydney",
 businessStartHour: Number(t.businessStartHour ?? process.env.BUSINESS_START_HOUR ?? 7),
 businessEndHour: Number(t.businessEndHour ?? process.env.BUSINESS_END_HOUR ?? 17),
 businessDays,
 calendarId: t.calendarId || process.env.GOOGLE_CALENDAR_ID || "",
-googleServiceJson: t.googleServiceJson || process.env.GOOGLE_SERVICE_JSON || ""
+googleServiceJson: t.googleServiceJson || process.env.GOOGLE_SERVICE_JSON || "",
+avgJobValue,
+closeRate
 };
 }
 
@@ -95,21 +73,18 @@ googleServiceJson: t.googleServiceJson || process.env.GOOGLE_SERVICE_JSON || ""
 const MISSED_CALL_ALERT_TRIES = Number(process.env.MISSED_CALL_ALERT_TRIES || 2);
 const MAX_SILENCE_TRIES = Number(process.env.MAX_SILENCE_TRIES || 10);
 const CAL_RETRY_ATTEMPTS = Number(process.env.CAL_RETRY_ATTEMPTS || 3);
-
-// Gather timing (wait longer)
 const GATHER_START_TIMEOUT = Number(process.env.GATHER_START_TIMEOUT || 25);
 const GATHER_SPEECH_TIMEOUT = process.env.GATHER_SPEECH_TIMEOUT || "auto";
-
-// Human handoff thresholds
 const MAX_REJECTS_ADDRESS = Number(process.env.MAX_REJECTS_ADDRESS || 2);
 const MAX_REJECTS_TIME = Number(process.env.MAX_REJECTS_TIME || 2);
-
-// Duplicate window days
 const DUP_WINDOW_DAYS = Number(process.env.DUP_WINDOW_DAYS || 14);
 
-// Optional: Twilio signature validation (recommended)
+// Optional: Twilio signature validation
 const REQUIRE_TWILIO_SIG = String(process.env.TWILIO_WEBHOOK_AUTH || "false").toLowerCase() === "true";
 const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN || "";
+
+// Admin endpoint
+const ADMIN_DASH_PASSWORD = process.env.ADMIN_DASH_PASSWORD || ""; // set strong value
 
 /* ============================================================================
 Twilio helpers
@@ -123,7 +98,7 @@ return twilio(sid, token);
 
 async function sendSms({ from, to, body }) {
 const client = getTwilioClient();
-if (!client) return console.warn("SMS skipped: Missing TWILIO_ACCOUNT_SID or TWILIO_AUTH_TOKEN");
+if (!client) return console.warn("SMS skipped: Missing TWILIO creds");
 if (!from) return console.warn("SMS skipped: Missing smsFrom/TWILIO_SMS_FROM");
 if (!to) return console.warn("SMS skipped: missing 'to'");
 await client.messages.create({ from, to, body });
@@ -133,13 +108,12 @@ async function sendOwnerSms(tradie, body) {
 if (!tradie.ownerSmsTo) return;
 return sendSms({ from: tradie.smsFrom, to: tradie.ownerSmsTo, body });
 }
-
 async function sendCustomerSms(tradie, toCustomer, body) {
 return sendSms({ from: tradie.smsFrom, to: toCustomer, body });
 }
 
 /* ============================================================================
-Webhook signature check (recommended for selling)
+Webhook signature check
 ============================================================================ */
 function validateTwilioSignature(req) {
 if (!REQUIRE_TWILIO_SIG) return true;
@@ -148,7 +122,6 @@ if (!TWILIO_AUTH_TOKEN) return false;
 const signature = req.headers["x-twilio-signature"];
 if (!signature) return false;
 
-// Build full URL Twilio requested (Render behind proxy needs host/proto)
 const proto = (req.headers["x-forwarded-proto"] || "https").split(",")[0].trim();
 const host = (req.headers["x-forwarded-host"] || req.headers["host"] || "").split(",")[0].trim();
 const url = `${proto}://${host}${req.originalUrl}`;
@@ -161,49 +134,17 @@ return false;
 }
 
 /* ============================================================================
-Session store (calls)
-============================================================================ */
-const sessions = new Map();
-
-function getSession(callSid, fromNumber = "") {
-if (!sessions.has(callSid)) {
-sessions.set(callSid, {
-step: "job",
-job: "",
-address: "",
-name: "",
-time: "",
-bookedStartMs: null,
-lastPrompt: "",
-tries: 0,
-from: fromNumber || "",
-rejects: { address: 0, time: 0 },
-lastAtAddress: null, // { whenText, summary }
-duplicateEvent: null, // { id, whenText, summary }
-confirmMode: "new" // "new" | "update"
-});
-} else {
-const s = sessions.get(callSid);
-if (fromNumber && !s.from) s.from = fromNumber;
-}
-return sessions.get(callSid);
-}
-
-function resetSession(callSid) {
-sessions.delete(callSid);
-}
-
-/* ============================================================================
-OPTIONAL: Supabase (Adimtrades’s Project) — used for:
-1) customer_prefs (optional)
-2) pending_confirmations (recommended for selling so it survives restarts)
-
-Node 18+ has global fetch.
+Supabase (Adimtrades’s Project)
+Tables used:
+- customer_prefs (notes per customer per tradie)
+- pending_confirmations (Y/N)
+- metrics_daily (analytics counters)
 ============================================================================ */
 const SUPABASE_URL = process.env.SUPABASE_URL || "";
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY || "";
 const SUPABASE_PREFS_TABLE = process.env.SUPABASE_TABLE || "customer_prefs";
 const SUPABASE_PENDING_TABLE = process.env.SUPABASE_PENDING_TABLE || "pending_confirmations";
+const SUPABASE_METRICS_TABLE = process.env.SUPABASE_METRICS_TABLE || "metrics_daily";
 
 function supaHeaders() {
 return {
@@ -213,29 +154,18 @@ Authorization: `Bearer ${SUPABASE_SERVICE_KEY}`,
 };
 }
 
-async function upsertCustomerPref(phone, note) {
-if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY || !phone) return;
-const url = `${SUPABASE_URL}/rest/v1/${SUPABASE_PREFS_TABLE}`;
-const payload = [{ phone, preferred_note: note, updated_at: new Date().toISOString() }];
-
-await fetch(url, {
-method: "POST",
-headers: { ...supaHeaders(), Prefer: "resolution=merge-duplicates" },
-body: JSON.stringify(payload)
-}).catch(() => {});
+function supaReady() {
+return !!(SUPABASE_URL && SUPABASE_SERVICE_KEY);
 }
 
-// Pending confirmations in DB (recommended)
-async function upsertPendingConfirmation(key, payload) {
-if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY || !key) return false;
-const url = `${SUPABASE_URL}/rest/v1/${SUPABASE_PENDING_TABLE}`;
-const row = [{ key, ...payload, updated_at: new Date().toISOString() }];
-
+async function upsertRow(table, row, keyColumn = "key") {
+if (!supaReady()) return false;
+const url = `${SUPABASE_URL}/rest/v1/${table}`;
 try {
 await fetch(url, {
 method: "POST",
 headers: { ...supaHeaders(), Prefer: "resolution=merge-duplicates" },
-body: JSON.stringify(row)
+body: JSON.stringify([row])
 });
 return true;
 } catch {
@@ -243,12 +173,9 @@ return false;
 }
 }
 
-async function getPendingConfirmationFromDb(key) {
-if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY || !key) return null;
-const url = `${SUPABASE_URL}/rest/v1/${SUPABASE_PENDING_TABLE}?key=eq.${encodeURIComponent(
-key
-)}&select=*&limit=1`;
-
+async function getOne(table, query) {
+if (!supaReady()) return null;
+const url = `${SUPABASE_URL}/rest/v1/${table}?${query}&limit=1`;
 try {
 const r = await fetch(url, { headers: supaHeaders() });
 const data = await r.json();
@@ -258,9 +185,9 @@ return null;
 }
 }
 
-async function deletePendingConfirmationFromDb(key) {
-if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY || !key) return false;
-const url = `${SUPABASE_URL}/rest/v1/${SUPABASE_PENDING_TABLE}?key=eq.${encodeURIComponent(key)}`;
+async function delWhere(table, query) {
+if (!supaReady()) return false;
+const url = `${SUPABASE_URL}/rest/v1/${table}?${query}`;
 try {
 await fetch(url, { method: "DELETE", headers: supaHeaders() });
 return true;
@@ -270,29 +197,167 @@ return false;
 }
 
 /* ============================================================================
-Pending confirmation fallback (in-memory) if DB not configured
-Keyed by tradieKey + customerPhone to avoid multi-tenant collisions
+Customer memory notes (per tradie + phone)
 ============================================================================ */
-const pendingConfirmations = new Map();
+function makeCustomerKey(tradieKey, phone) {
+return `${tradieKey}::${phone || ""}`;
+}
 
+async function getCustomerNote(tradieKey, phone) {
+if (!phone) return null;
+
+// key column in customer_prefs should be "key"
+const key = makeCustomerKey(tradieKey, phone);
+const row = await getOne(SUPABASE_PREFS_TABLE, `key=eq.${encodeURIComponent(key)}&select=preferred_note`);
+return row?.preferred_note ? String(row.preferred_note) : null;
+}
+
+async function setCustomerNote(tradieKey, phone, note) {
+if (!phone) return false;
+const key = makeCustomerKey(tradieKey, phone);
+return upsertRow(SUPABASE_PREFS_TABLE, {
+key,
+tradie_key: tradieKey,
+phone,
+preferred_note: note,
+updated_at: new Date().toISOString()
+});
+}
+
+/* ============================================================================
+Pending confirmations (DB preferred)
+============================================================================ */
 function makePendingKey(tradieKey, customerPhone) {
 return `${tradieKey}::${customerPhone || ""}`;
 }
 
-function setPendingConfirmationMemory(key, payload) {
-pendingConfirmations.set(key, { ...payload, createdAt: Date.now() });
+async function upsertPendingConfirmationDb(key, payload) {
+return upsertRow(SUPABASE_PENDING_TABLE, { key, ...payload, updated_at: new Date().toISOString() });
+}
+async function getPendingConfirmationDb(key) {
+return getOne(SUPABASE_PENDING_TABLE, `key=eq.${encodeURIComponent(key)}&select=*`);
+}
+async function deletePendingConfirmationDb(key) {
+return delWhere(SUPABASE_PENDING_TABLE, `key=eq.${encodeURIComponent(key)}`);
 }
 
-function getPendingConfirmationMemory(key) {
-return pendingConfirmations.get(key) || null;
+// fallback in-memory
+const pendingConfirmations = new Map();
+function setPendingConfirmationMemory(key, payload) { pendingConfirmations.set(key, { ...payload, createdAt: Date.now() }); }
+function getPendingConfirmationMemory(key) { return pendingConfirmations.get(key) || null; }
+function clearPendingConfirmationMemory(key) { pendingConfirmations.delete(key); }
+
+/* ============================================================================
+Analytics (metrics_daily)
+We store per tradie per date:
+- calls_total
+- missed_calls_saved (handoff/missed leads)
+- bookings_created
+- est_revenue
+============================================================================ */
+function todayKey(tradieKey, tz) {
+const d = DateTime.now().setZone(tz).toFormat("yyyy-LL-dd");
+return `${tradieKey}::${d}`;
 }
 
-function clearPendingConfirmationMemory(key) {
-pendingConfirmations.delete(key);
+async function incMetric(tradie, fields) {
+// MVP: do a read then upsert (OK for low traffic)
+if (!supaReady()) return false;
+
+const key = todayKey(tradie.key, tradie.timezone);
+const existing = await getOne(SUPABASE_METRICS_TABLE, `key=eq.${encodeURIComponent(key)}&select=*`);
+
+const base = existing || {
+key,
+tradie_key: tradie.key,
+date: DateTime.now().setZone(tradie.timezone).toFormat("yyyy-LL-dd"),
+calls_total: 0,
+missed_calls_saved: 0,
+bookings_created: 0,
+est_revenue: 0,
+updated_at: new Date().toISOString()
+};
+
+const next = {
+...base,
+calls_total: base.calls_total + (fields.calls_total || 0),
+missed_calls_saved: base.missed_calls_saved + (fields.missed_calls_saved || 0),
+bookings_created: base.bookings_created + (fields.bookings_created || 0),
+est_revenue: Number(base.est_revenue) + Number(fields.est_revenue || 0),
+updated_at: new Date().toISOString()
+};
+
+return upsertRow(SUPABASE_METRICS_TABLE, next);
 }
 
 /* ============================================================================
-Helpers
+Intent detection
+============================================================================ */
+function detectIntent(text) {
+const t = (text || "").toLowerCase();
+
+const emergency = [
+"burst", "flood", "leak", "gas", "sparking", "no power", "smoke", "fire",
+"blocked", "sewage", "overflow", "urgent", "emergency", "asap", "now"
+];
+const quote = ["quote", "pricing", "how much", "estimate", "cost", "rate"];
+const existing = ["i booked", "already booked", "existing", "last time", "repeat", "returning"];
+const cancel = ["cancel", "reschedule", "change", "move", "postpone"];
+
+const has = (arr) => arr.some((w) => t.includes(w));
+
+if (has(cancel)) return "CANCEL_RESCHEDULE";
+if (has(emergency)) return "EMERGENCY";
+if (has(quote)) return "QUOTE";
+if (has(existing)) return "EXISTING_CUSTOMER";
+return "NEW_BOOKING";
+}
+
+function intentLabel(intent) {
+switch (intent) {
+case "EMERGENCY": return "Emergency";
+case "QUOTE": return "Quote request";
+case "EXISTING_CUSTOMER": return "Existing customer";
+case "CANCEL_RESCHEDULE": return "Cancel / reschedule";
+default: return "New booking";
+}
+}
+
+/* ============================================================================
+Session store (calls)
+============================================================================ */
+const sessions = new Map();
+
+function getSession(callSid, fromNumber = "") {
+if (!sessions.has(callSid)) {
+sessions.set(callSid, {
+step: "intent", // <-- NEW: start with intent
+intent: "NEW_BOOKING",
+job: "",
+address: "",
+name: "",
+time: "",
+bookedStartMs: null,
+lastPrompt: "",
+tries: 0,
+from: fromNumber || "",
+rejects: { address: 0, time: 0 },
+lastAtAddress: null,
+duplicateEvent: null,
+confirmMode: "new",
+customerNote: null,
+startedAt: Date.now()
+});
+} else {
+const s = sessions.get(callSid);
+if (fromNumber && !s.from) s.from = fromNumber;
+}
+return sessions.get(callSid);
+}
+function resetSession(callSid) { sessions.delete(callSid); }
+
+/* ============================================================================
+General helpers
 ============================================================================ */
 function cleanSpeech(text) {
 if (!text) return "";
@@ -310,7 +375,6 @@ actionOnEmptyResult: true,
 language: "en-AU",
 profanityFilter: false
 });
-
 gather.say(prompt || "Sorry, can you repeat that?", { voice: "Polly.Amy", language: "en-AU" });
 twiml.pause({ length: 1 });
 }
@@ -318,10 +382,8 @@ twiml.pause({ length: 1 });
 function shouldReject(step, speech, confidence) {
 const s = (speech || "").toLowerCase();
 if (!speech || speech.length < 2) return true;
-
 const junk = new Set(["hello", "hi", "yeah", "yep", "okay", "ok"]);
-if (junk.has(s)) return step !== "job";
-
+if (junk.has(s)) return step !== "job" && step !== "intent";
 const minConf = step === "job" ? 0.30 : 0.10;
 if (typeof confidence === "number" && confidence > 0 && confidence < minConf) {
 if (speech.split(" ").length <= 2) return true;
@@ -359,7 +421,6 @@ t = t.replace(/\btoday\b/g, d);
 return t;
 }
 
-// Build Luxon DateTime IN tz from chrono components (prevents drift)
 function parseRequestedDateTime(naturalText, tz) {
 const ref = DateTime.now().setZone(tz).toJSDate();
 const norm = normalizeTimeText(naturalText, tz);
@@ -378,21 +439,12 @@ const minute = s.get("minute") ?? 0;
 
 if (!year || !month || !day || hour == null) return null;
 
-const dt = DateTime.fromObject(
-{ year, month, day, hour, minute, second: 0, millisecond: 0 },
-{ zone: tz }
-);
+const dt = DateTime.fromObject({ year, month, day, hour, minute, second: 0, millisecond: 0 }, { zone: tz });
 return dt.isValid ? dt : null;
 }
 
-function extractTimeIfPresent(text, tz) {
-return parseRequestedDateTime(text, tz);
-}
-
-// Google wants RFC3339 + timeZone. includeOffset prevents the “4am shift”.
-function toGoogleDateTime(dt) {
-return dt.toISO({ includeOffset: true, suppressMilliseconds: true });
-}
+function extractTimeIfPresent(text, tz) { return parseRequestedDateTime(text, tz); }
+function toGoogleDateTime(dt) { return dt.toISO({ includeOffset: true, suppressMilliseconds: true }); }
 
 function looksLikeAsap(text) {
 const t = (text || "").toLowerCase();
@@ -408,9 +460,7 @@ t === "soon"
 );
 }
 
-function formatForVoice(dt) {
-return dt.toFormat("ccc d LLL, h:mm a");
-}
+function formatForVoice(dt) { return dt.toFormat("ccc d LLL, h:mm a"); }
 
 function isAfterHoursNow(tradie) {
 const now = DateTime.now().setZone(tradie.timezone);
@@ -418,7 +468,6 @@ const isBizDay = tradie.businessDays.includes(now.weekday);
 const isBizHours = now.hour >= tradie.businessStartHour && now.hour < tradie.businessEndHour;
 return !(isBizDay && isBizHours);
 }
-
 function nextBusinessOpenSlot(tradie) {
 const tz = tradie.timezone;
 let dt = DateTime.now().setZone(tz);
@@ -439,11 +488,8 @@ Google Calendar
 function parseGoogleServiceJson(raw) {
 if (!raw) throw new Error("Missing GOOGLE_SERVICE_JSON env/config");
 let parsed;
-try {
-parsed = JSON.parse(raw);
-} catch (e) {
-parsed = JSON.parse(raw.replace(/\r?\n/g, "\\n"));
-}
+try { parsed = JSON.parse(raw); }
+catch { parsed = JSON.parse(raw.replace(/\r?\n/g, "\\n")); }
 if (typeof parsed === "string") parsed = JSON.parse(parsed);
 return parsed;
 }
@@ -457,9 +503,7 @@ scopes: ["https://www.googleapis.com/auth/calendar"]
 return google.calendar({ version: "v3", auth });
 }
 
-function sleep(ms) {
-return new Promise((resolve) => setTimeout(resolve, ms));
-}
+function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
 
 async function insertCalendarEventWithRetry(calendar, calendarId, requestBody) {
 let lastErr = null;
@@ -475,7 +519,6 @@ if (attempt < CAL_RETRY_ATTEMPTS) await sleep(attempt === 1 ? 200 : 800);
 throw lastErr;
 }
 
-// Customer history: last event at same address (last 365 days)
 async function getLastBookingAtAddress(calendar, calendarId, tz, address) {
 const timeMin = DateTime.now().setZone(tz).minus({ days: 365 }).toISO();
 const timeMax = DateTime.now().setZone(tz).toISO();
@@ -520,7 +563,6 @@ whenText: when ? when.toFormat("ccc d LLL yyyy") : "Unknown date"
 };
 }
 
-// Duplicate check: same name+address within ±DUP_WINDOW_DAYS
 async function findDuplicate(calendar, calendarId, tz, name, address, startDt) {
 const t0 = startDt.minus({ days: DUP_WINDOW_DAYS });
 const t1 = startDt.plus({ days: DUP_WINDOW_DAYS });
@@ -564,29 +606,98 @@ return null;
 
 async function deleteEventSafe(calendar, calendarId, eventId) {
 if (!eventId) return;
-try {
-await calendar.events.delete({ calendarId, eventId });
-} catch (e) {
-console.warn("Delete failed:", e?.message || e);
-}
+try { await calendar.events.delete({ calendarId, eventId }); }
+catch (e) { console.warn("Delete failed:", e?.message || e); }
 }
 
 /* ============================================================================
-Human handoff
+Human handoff + missed revenue alerts
 ============================================================================ */
+function flowProgress(session) {
+const parts = [];
+if (session.intent) parts.push(`Intent=${intentLabel(session.intent)}`);
+if (session.name) parts.push(`Name=${session.name}`);
+if (session.job) parts.push(`Job=${session.job}`);
+if (session.address) parts.push(`Address=${session.address}`);
+if (session.time) parts.push(`Time=${session.time}`);
+return parts.join(" | ") || "No details captured";
+}
+
+async function missedRevenueAlert(tradie, session, reason) {
+// Analytics: missed calls saved (lead salvage)
+await incMetric(tradie, {
+missed_calls_saved: 1,
+// Estimated revenue from a saved lead:
+est_revenue: tradie.avgJobValue * tradie.closeRate
+});
+
+const body =
+`MISSED LEAD ALERT 💸\n` +
+`Reason: ${reason}\n` +
+`TradieKey: ${tradie.key}\n` +
+`Caller: ${session.from || "Unknown"}\n` +
+`${flowProgress(session)}\n` +
+`Action: Call/text back ASAP.`;
+
+await sendOwnerSms(tradie, body).catch(() => {});
+}
+
 async function humanHandoff(tradie, session, reason) {
 const body =
 `HUMAN HANDOFF NEEDED\n` +
 `Reason: ${reason}\n` +
 `TradieKey: ${tradie.key}\n` +
 `Caller: ${session.from || "Unknown"}\n` +
-`Name: ${session.name || "-"}\n` +
-`Job: ${session.job || "-"}\n` +
-`Address: ${session.address || "-"}\n` +
-`Time said: ${session.time || "-"}`;
+`${flowProgress(session)}`;
 
 await sendOwnerSms(tradie, body).catch(() => {});
 }
+
+/* ============================================================================
+ADMIN DASH (simple JSON) - password protected
+GET /admin/metrics?tid=+614...&pw=...
+============================================================================ */
+app.get("/admin/metrics", async (req, res) => {
+const pw = String(req.query.pw || "");
+if (!ADMIN_DASH_PASSWORD || pw !== ADMIN_DASH_PASSWORD) return res.status(403).json({ error: "Forbidden" });
+
+const tid = String(req.query.tid || "default");
+const tradie = getTradieConfig({ body: { To: tid }, query: {} });
+
+if (!supaReady()) return res.json({ ok: false, error: "Supabase not configured" });
+
+// last 30 days metrics for that tradie
+const end = DateTime.now().setZone(tradie.timezone);
+const start = end.minus({ days: 30 }).toFormat("yyyy-LL-dd");
+const endStr = end.toFormat("yyyy-LL-dd");
+
+const url = `${SUPABASE_URL}/rest/v1/${SUPABASE_METRICS_TABLE}?tradie_key=eq.${encodeURIComponent(tradie.key)}&date=gte.${start}&date=lte.${endStr}&select=*`;
+try {
+const r = await fetch(url, { headers: supaHeaders() });
+const rows = await r.json();
+
+const totals = (Array.isArray(rows) ? rows : []).reduce(
+(acc, x) => {
+acc.calls_total += Number(x.calls_total || 0);
+acc.missed_calls_saved += Number(x.missed_calls_saved || 0);
+acc.bookings_created += Number(x.bookings_created || 0);
+acc.est_revenue += Number(x.est_revenue || 0);
+return acc;
+},
+{ calls_total: 0, missed_calls_saved: 0, bookings_created: 0, est_revenue: 0 }
+);
+
+return res.json({
+ok: true,
+tradie_key: tradie.key,
+window: { start, end: endStr },
+totals,
+rows
+});
+} catch (e) {
+return res.json({ ok: false, error: String(e?.message || e) });
+}
+});
 
 /* ============================================================================
 VOICE ROUTE
@@ -605,10 +716,15 @@ const speech = cleanSpeech(speechRaw);
 
 const session = getSession(callSid, fromNumber);
 
-console.log(
-`TID=${tradie.key} CALLSID=${callSid} FROM=${fromNumber} STEP=${session.step} Speech="${speech}" Confidence=${confidence}`
-);
+// Analytics: count calls once (first webhook hit)
+if (!session._countedCall) {
+session._countedCall = true;
+await incMetric(tradie, { calls_total: 1 });
+}
 
+console.log(`TID=${tradie.key} CALLSID=${callSid} FROM=${fromNumber} STEP=${session.step} Speech="${speech}" Confidence=${confidence}`);
+
+// No speech
 if (!speech) {
 session.tries += 1;
 
@@ -623,14 +739,16 @@ sendOwnerSms(tradie, txt).catch(() => {});
 }
 
 if (session.tries >= MAX_SILENCE_TRIES) {
+// missed revenue alert (hang/silent)
+await missedRevenueAlert(tradie, session, "Silent timeout");
 twiml.say("No worries. We'll call you back shortly.", { voice: "Polly.Amy", language: "en-AU" });
-await humanHandoff(tradie, session, "Caller silent / timeout");
 twiml.hangup();
 resetSession(callSid);
 return res.type("text/xml").send(twiml.toString());
 }
 
 const promptMap = {
+intent: "How can we help today? You can say emergency, quote, reschedule, or new booking.",
 job: "What job do you need help with?",
 address: "What is the address?",
 name: "What is your name?",
@@ -640,7 +758,6 @@ confirm: "Just say yes to confirm, or no to change the time."
 
 const prompt = session.lastPrompt || promptMap[session.step] || "Can you repeat that?";
 session.lastPrompt = prompt;
-
 ask(twiml, prompt, "/voice");
 return res.type("text/xml").send(twiml.toString());
 }
@@ -652,22 +769,16 @@ if (session.step === "address") session.rejects.address += 1;
 if (session.step === "time") session.rejects.time += 1;
 
 if (session.rejects.address >= MAX_REJECTS_ADDRESS) {
-twiml.say("No worries. I'll have the team call you back to confirm the address.", {
-voice: "Polly.Amy",
-language: "en-AU"
-});
-await humanHandoff(tradie, session, "Address capture failed");
+await missedRevenueAlert(tradie, session, "Address capture failed (auto-callback)");
+twiml.say("No worries. We'll call you back shortly to confirm the address.", { voice: "Polly.Amy", language: "en-AU" });
 twiml.hangup();
 resetSession(callSid);
 return res.type("text/xml").send(twiml.toString());
 }
 
 if (session.rejects.time >= MAX_REJECTS_TIME) {
-twiml.say("No worries. I'll have the team call you back to confirm the time.", {
-voice: "Polly.Amy",
-language: "en-AU"
-});
-await humanHandoff(tradie, session, "Time capture failed");
+await missedRevenueAlert(tradie, session, "Time capture failed (auto-callback)");
+twiml.say("No worries. We'll call you back shortly to confirm the time.", { voice: "Polly.Amy", language: "en-AU" });
 twiml.hangup();
 resetSession(callSid);
 return res.type("text/xml").send(twiml.toString());
@@ -681,6 +792,47 @@ return res.type("text/xml").send(twiml.toString());
 try {
 const tz = tradie.timezone;
 
+// STEP: intent (new)
+if (session.step === "intent") {
+session.intent = detectIntent(speech);
+
+// Pull customer note early (memory)
+if (session.from) {
+session.customerNote = await getCustomerNote(tradie.key, session.from);
+}
+
+// Route by intent
+if (session.intent === "CANCEL_RESCHEDULE") {
+// Quick capture minimal info then handoff
+session.step = "name";
+session.lastPrompt = "No worries. What is your name so we can reschedule you?";
+ask(twiml, session.lastPrompt, "/voice");
+return res.type("text/xml").send(twiml.toString());
+}
+
+if (session.intent === "QUOTE") {
+session.step = "job";
+session.lastPrompt = "Sure. What do you need a quote for?";
+ask(twiml, session.lastPrompt, "/voice");
+return res.type("text/xml").send(twiml.toString());
+}
+
+if (session.intent === "EMERGENCY") {
+// Emergency: capture address fast + alert owner immediately
+session.step = "address";
+session.lastPrompt = "Understood. What is the address right now?";
+ask(twiml, session.lastPrompt, "/voice");
+return res.type("text/xml").send(twiml.toString());
+}
+
+// existing/new booking goes into normal booking flow
+session.step = "job";
+session.lastPrompt = "What job do you need help with?";
+ask(twiml, session.lastPrompt, "/voice");
+return res.type("text/xml").send(twiml.toString());
+}
+
+// STEP: job
 if (session.step === "job") {
 session.job = speech;
 session.step = "address";
@@ -689,9 +841,19 @@ ask(twiml, session.lastPrompt, "/voice");
 return res.type("text/xml").send(twiml.toString());
 }
 
+// STEP: address
 if (session.step === "address") {
 session.address = speech;
 
+// Emergency alert immediately once address captured
+if (session.intent === "EMERGENCY") {
+await sendOwnerSms(
+tradie,
+`EMERGENCY LEAD 🚨\nCaller: ${session.from || "Unknown"}\nAddress: ${session.address}\nNote: Call back immediately.`
+).catch(() => {});
+}
+
+// Calendar history at address
 if (tradie.calendarId && tradie.googleServiceJson) {
 try {
 const calendar = getCalendarClient(tradie);
@@ -705,14 +867,26 @@ ask(twiml, session.lastPrompt, "/voice");
 return res.type("text/xml").send(twiml.toString());
 }
 
+// STEP: name
 if (session.step === "name") {
 session.name = speech;
+
+// If cancel/reschedule intent -> immediate handoff after name
+if (session.intent === "CANCEL_RESCHEDULE") {
+await missedRevenueAlert(tradie, session, "Cancel/reschedule request");
+twiml.say("No worries. We'll contact you shortly to reschedule.", { voice: "Polly.Amy", language: "en-AU" });
+twiml.hangup();
+resetSession(callSid);
+return res.type("text/xml").send(twiml.toString());
+}
+
 session.step = "time";
 session.lastPrompt = "What time would you like?";
 ask(twiml, session.lastPrompt, "/voice");
 return res.type("text/xml").send(twiml.toString());
 }
 
+// STEP: time
 if (session.step === "time") {
 session.time = speech;
 
@@ -735,10 +909,13 @@ if (dup) session.duplicateEvent = dup;
 
 const whenForVoice = formatForVoice(dt);
 
+// Mention customer note (memory) briefly (owner sees it too via SMS)
+const noteLine = session.customerNote ? ` I have a note on your account: ${session.customerNote}.` : "";
+
 if (session.duplicateEvent) {
 session.step = "confirm";
 session.lastPrompt =
-`I heard: ${session.job}, at ${session.address}, for ${session.name}, on ${whenForVoice}. ` +
+`I heard: ${session.job}, at ${session.address}, for ${session.name}, on ${whenForVoice}.${noteLine} ` +
 `I also found an existing booking around ${session.duplicateEvent.whenText}. ` +
 `Say yes to keep both bookings, say update to replace the old one, or say no to change the time.`;
 ask(twiml, session.lastPrompt, "/voice");
@@ -747,12 +924,13 @@ return res.type("text/xml").send(twiml.toString());
 
 session.step = "confirm";
 session.lastPrompt =
-`Alright. I heard: ${session.job}, at ${session.address}, for ${session.name}, on ${whenForVoice}. ` +
+`Alright. I heard: ${session.job}, at ${session.address}, for ${session.name}, on ${whenForVoice}.${noteLine} ` +
 `Is that correct? Say yes to confirm, or no to change the time.`;
 ask(twiml, session.lastPrompt, "/voice");
 return res.type("text/xml").send(twiml.toString());
 }
 
+// STEP: confirm
 if (session.step === "confirm") {
 const s = speech.toLowerCase();
 
@@ -794,10 +972,17 @@ const end = start.plus({ hours: 1 });
 const displayWhen = start.toFormat("ccc d LLL yyyy, h:mm a");
 const summaryText = `${session.name} needs ${session.job} at ${session.address}.`;
 
+// Analytics: booking created + est revenue
+await incMetric(tradie, {
+bookings_created: 1,
+est_revenue: tradie.avgJobValue * 1 // booking created (stronger than missed lead)
+});
+
 // Customer SMS receipt + pending confirmation (DB preferred)
 if (session.from) {
 const customerTxt =
 `Booking request received ✅\n` +
+`Type: ${intentLabel(session.intent)}\n` +
 `Job: ${session.job}\n` +
 `Address: ${session.address}\n` +
 `When: ${displayWhen}\n` +
@@ -807,7 +992,6 @@ const customerTxt =
 sendCustomerSms(tradie, session.from, customerTxt).catch(() => {});
 
 const pendingKey = makePendingKey(tradie.key, session.from);
-
 const payload = {
 key: pendingKey,
 tradie_key: tradie.key,
@@ -819,7 +1003,7 @@ when_text: displayWhen,
 timezone: tz
 };
 
-const wroteDb = await upsertPendingConfirmation(pendingKey, payload);
+const wroteDb = await upsertPendingConfirmationDb(pendingKey, payload);
 if (!wroteDb) setPendingConfirmationMemory(pendingKey, payload);
 }
 
@@ -827,7 +1011,9 @@ const historyLine = session.lastAtAddress
 ? `\nHistory: ${session.lastAtAddress.summary} on ${session.lastAtAddress.whenText}`
 : "";
 
-// Calendar insert if configured, else SMS-only
+const memoryLine = session.customerNote ? `\nCustomer note: ${session.customerNote}` : "";
+
+// Calendar insert if configured
 if (tradie.calendarId && tradie.googleServiceJson) {
 const calendar = getCalendarClient(tradie);
 
@@ -838,7 +1024,12 @@ await deleteEventSafe(calendar, tradie.calendarId, session.duplicateEvent.id);
 
 await insertCalendarEventWithRetry(calendar, tradie.calendarId, {
 summary: `${session.job} - ${session.name}`,
-description: `${summaryText}\nCaller: ${session.from || "Unknown"}\nSpoken time: ${session.time}`,
+description:
+`${summaryText}\n` +
+`Intent: ${intentLabel(session.intent)}\n` +
+`Caller: ${session.from || "Unknown"}\n` +
+`Spoken time: ${session.time}\n` +
+(session.customerNote ? `Customer note: ${session.customerNote}\n` : ""),
 location: session.address,
 start: { dateTime: toGoogleDateTime(start), timeZone: tz },
 end: { dateTime: toGoogleDateTime(end), timeZone: tz }
@@ -847,68 +1038,69 @@ end: { dateTime: toGoogleDateTime(end), timeZone: tz }
 await sendOwnerSms(
 tradie,
 `MANUAL FOLLOW-UP NEEDED (Calendar failed)\n` +
+`Intent: ${intentLabel(session.intent)}\n` +
 `Name: ${session.name}\n` +
 `Job: ${session.job}\n` +
 `Address: ${session.address}\n` +
 `Caller: ${session.from || "Unknown"}\n` +
 `Spoken: ${session.time}\n` +
-`Intended: ${displayWhen} (${tz})${historyLine}\n` +
+`Intended: ${displayWhen} (${tz})${historyLine}${memoryLine}\n` +
 `Reason: ${calErr?.message || calErr}`
 );
 
 if (session.from) {
-sendCustomerSms(tradie, session.from, `Thanks — we received your request ✅\nWe’ll confirm shortly.`).catch(
-() => {}
-);
+sendCustomerSms(tradie, session.from, `Thanks — we received your request ✅\nWe’ll confirm shortly.`)
+.catch(() => {});
 }
 
-twiml.say("Thanks. We received your booking request and will confirm shortly.", {
-voice: "Polly.Amy",
-language: "en-AU"
-});
+twiml.say("Thanks. We received your booking request and will confirm shortly.", { voice: "Polly.Amy", language: "en-AU" });
 twiml.hangup();
 resetSession(callSid);
 return res.type("text/xml").send(twiml.toString());
 }
 }
 
-// Optional prefs
-upsertCustomerPref(session.from, `Last job: ${session.job}`).catch(() => {});
+// Customer memory note auto-update (basic)
+// You can replace with a proper question later: "Any parking or gate code notes?"
+if (session.from) {
+const autoNote = `Last booking: ${session.job}.`;
+await setCustomerNote(tradie.key, session.from, autoNote);
+}
 
 await sendOwnerSms(
 tradie,
-`NEW BOOKING ✅\n` +
+`NEW ${intentLabel(session.intent).toUpperCase()} ✅\n` +
 `Name: ${session.name}\n` +
 `Job: ${session.job}\n` +
 `Address: ${session.address}\n` +
 `Caller: ${session.from || "Unknown"}\n` +
-`Spoken: ${session.time}\n` +
-`Booked: ${displayWhen} (${tz})${historyLine}` +
+`Booked: ${displayWhen} (${tz})${historyLine}${memoryLine}` +
 (session.duplicateEvent ? `\nDupFound: ${session.duplicateEvent.whenText} (${session.confirmMode})` : "")
 ).catch(() => {});
 
-twiml.say(`Booked. Thanks ${session.name}. We will see you ${formatForVoice(start)}.`, {
-voice: "Polly.Amy",
-language: "en-AU"
-});
+twiml.say(`Booked. Thanks ${session.name}. We will see you ${formatForVoice(start)}.`, { voice: "Polly.Amy", language: "en-AU" });
 
 resetSession(callSid);
 twiml.hangup();
 return res.type("text/xml").send(twiml.toString());
 }
 
-session.step = "job";
-session.lastPrompt = "What job do you need help with?";
+// fallback
+session.step = "intent";
+session.lastPrompt = "How can we help today? You can say emergency, quote, reschedule, or new booking.";
 ask(twiml, session.lastPrompt, "/voice");
 return res.type("text/xml").send(twiml.toString());
 } catch (err) {
 console.error("VOICE ERROR:", err);
 
 const s = sessions.get(req.body.CallSid || req.body.CallSID || "unknown");
-sendOwnerSms(
+await sendOwnerSms(
 getTradieConfig(req),
 `SYSTEM ERROR\nTradieKey: ${getTradieKey(req)}\nFrom: ${s?.from || "Unknown"}\nStep: ${s?.step || "?"}\nError: ${err?.message || err}`
 ).catch(() => {});
+
+// Missed revenue alert if it died mid-flow
+if (s?.from) await missedRevenueAlert(getTradieConfig(req), s, "System error mid-call");
 
 twiml.say("Sorry, there was a system error. Please try again.", { voice: "Polly.Amy", language: "en-AU" });
 twiml.hangup();
@@ -920,11 +1112,6 @@ return res.type("text/xml").send(twiml.toString());
 
 /* ============================================================================
 SMS ROUTE (customer replies Y/N)
-Twilio Messaging webhook -> POST /sms
-
-Behavior:
-Y: notify owner "customer confirmed"
-N: notify owner "customer wants reschedule"
 ============================================================================ */
 app.post("/sms", async (req, res) => {
 if (!validateTwilioSignature(req)) return res.status(403).send("Forbidden");
@@ -937,8 +1124,7 @@ const twiml = new MessagingResponse();
 
 const pendingKey = makePendingKey(tradie.key, from);
 
-// Prefer DB, fallback to memory
-let pending = await getPendingConfirmationFromDb(pendingKey);
+let pending = await getPendingConfirmationDb(pendingKey);
 if (!pending) pending = getPendingConfirmationMemory(pendingKey);
 
 if (!pending) {
@@ -957,18 +1143,16 @@ if (body === "y" || body === "yes" || body.startsWith("y ")) {
 await sendOwnerSms(tradie, `CUSTOMER CONFIRMED ✅\n${nice}`).catch(() => {});
 twiml.message("Confirmed ✅ Thanks — see you then.");
 
-await deletePendingConfirmationFromDb(pendingKey).catch(() => {});
+await deletePendingConfirmationDb(pendingKey).catch(() => {});
 clearPendingConfirmationMemory(pendingKey);
 return res.type("text/xml").send(twiml.toString());
 }
 
 if (body === "n" || body === "no" || body.startsWith("n ")) {
-await sendOwnerSms(tradie, `CUSTOMER RESCHEDULE REQUEST ❗\n${nice}\nAction: Please call/text to reschedule.`).catch(
-() => {}
-);
+await sendOwnerSms(tradie, `CUSTOMER RESCHEDULE REQUEST ❗\n${nice}\nAction: Please call/text to reschedule.`).catch(() => {});
 twiml.message("No worries — we’ll contact you shortly to reschedule.");
 
-await deletePendingConfirmationFromDb(pendingKey).catch(() => {});
+await deletePendingConfirmationDb(pendingKey).catch(() => {});
 clearPendingConfirmationMemory(pendingKey);
 return res.type("text/xml").send(twiml.toString());
 }
@@ -981,4 +1165,4 @@ return res.type("text/xml").send(twiml.toString());
 app.get("/", (req, res) => res.send("Voice bot running"));
 
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log("Server listening on", PORT))
+app.listen(PORT, () => console.log("Server listening on", PORT));
