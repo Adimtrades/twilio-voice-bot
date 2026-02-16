@@ -13,17 +13,22 @@
 // 1) Real scheduling: Google Free/Busy + “next 3 slots” + slot picking
 // 2) Customer memory notes: capture + store + show to owner + include in calendar
 // 3) Quote photo flow: QUOTE intent creates lead + SMS link to reply with photos (MMS supported)
-// 4) INTERRUPTION RESILIENCE:
-//    - Global YES/NO works at ANY step (speech or DTMF 1/2)
-//    - “Actually / wait / change” triggers Clarify mode instead of losing state
-//    - Lightweight slot-fill: capture time/address/name mid-flow
+// 4) INTERRUPTION RESILIENCE (upgraded):
+//    - Global YES/NO works at ANY step (speech or DTMF 1/2) BUT is context-aware (less aggressive)
+//    - “Actually / wait / change” uses Clarify/Edit flow instead of forcing time-change
+//    - Lightweight slot-fill: capture time/address/name/job/access mid-flow
 //    - DTMF shortcuts: 1=Yes, 2=No, 3=Change time, 4=Change address, 5=Change job, 6=Change name
 //
-// ✅ NEW: NATURAL CONVO / OFF-SCRIPT UNDERSTANDING (LLM-assisted, optional)
-//    - If caller rambles, asks questions, or mixes multiple details, bot extracts fields + keeps flow
-//    - Handles smalltalk briefly then returns to booking
-//    - Can ask intelligent follow-up if info is missing/contradictory
-//    - Maintains session "conversation memory" (last N turns) for coherence
+// ✅ UPGRADES ADDED (your list):
+// 1) LLM JSON failure hardening (no more “Unexpected end of JSON input” crashes)
+// 2) Confirm step can change ANY field (job/address/name/time/access notes)
+// 3) Global NO/change triggers are context-aware (don’t auto-time-change)
+// 4) Dedicated Access Notes edit state (append/replace supported)
+// 5) Off-script chatter handled: extraction + intelligent follow-ups (LLM optional + heuristics)
+// 6) Slot picking accepts: first/second/third OR a new requested time OR “repeat options”
+// 7) Profanity/abuse handling: de-escalate + redirect + optional human handoff
+// 9) Confidence/validation tightened per-field (address/time/name/job)
+// 0) Conversation memory buffer (rolling history already) + turn caps to prevent loops
 //
 // NOTE: Node 18+ (global fetch). Node 22 is fine.
 
@@ -133,8 +138,6 @@ const MAX_SILENCE_TRIES = Number(process.env.MAX_SILENCE_TRIES || 10);
 const CAL_RETRY_ATTEMPTS = Number(process.env.CAL_RETRY_ATTEMPTS || 3);
 const GATHER_START_TIMEOUT = Number(process.env.GATHER_START_TIMEOUT || 25);
 const GATHER_SPEECH_TIMEOUT = process.env.GATHER_SPEECH_TIMEOUT || "auto";
-const MAX_REJECTS_ADDRESS = Number(process.env.MAX_REJECTS_ADDRESS || 2);
-const MAX_REJECTS_TIME = Number(process.env.MAX_REJECTS_TIME || 2);
 const DUP_WINDOW_DAYS = Number(process.env.DUP_WINDOW_DAYS || 14);
 
 // Optional: Twilio signature validation
@@ -148,7 +151,10 @@ const ADMIN_DASH_PASSWORD = process.env.ADMIN_DASH_PASSWORD || "";
 LLM (optional) - Natural conversation brain
 ============================================================================ */
 const LLM_ENABLED = String(process.env.LLM_ENABLED || "false").toLowerCase() === "true";
+
+// If you use OpenAI Responses API:
 const LLM_BASE_URL = process.env.LLM_BASE_URL || "https://api.openai.com/v1/responses";
+// If you use Chat Completions instead, point LLM_BASE_URL to https://api.openai.com/v1/chat/completions
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 const LLM_MODEL = process.env.LLM_MODEL || "gpt-5-mini";
 const LLM_MAX_OUTPUT_TOKENS = Number(process.env.LLM_MAX_OUTPUT_TOKENS || 220);
@@ -158,20 +164,6 @@ const LLM_REQUIRE_FOR_OFFSCRIPT = String(process.env.LLM_REQUIRE_FOR_OFFSCRIPT |
 
 function llmReady() {
   return LLM_ENABLED && OPENAI_API_KEY && LLM_BASE_URL;
-}
-
-// When to treat speech as "off script" / needs LLM help
-function isOffScriptSpeech(speech) {
-  if (!speech) return false;
-  const s = String(speech).trim();
-  const wordCount = s.split(/\s+/).filter(Boolean).length;
-  if (wordCount >= 18) return true; // rambly
-  const qMarks = (s.match(/\?/g) || []).length;
-  if (qMarks > 0) return true; // caller asks questions
-  const hasMulti = /(and|also|plus|another thing|by the way|actually)/i.test(s);
-  if (hasMulti && wordCount >= 10) return true;
-  const hasStory = /(so|because|then|after|before|yesterday|last week)/i.test(s) && wordCount >= 14;
-  return hasStory;
 }
 
 function safeJsonParse(maybe) {
@@ -184,7 +176,19 @@ function trimHistory(history, maxItems = 12) {
   return arr.slice(arr.length - maxItems);
 }
 
-// Build an LLM prompt that returns STRICT JSON only
+// When to treat speech as "off script" / needs LLM help
+function isOffScriptSpeech(speech) {
+  if (!speech) return false;
+  const s = String(speech).trim();
+  const wordCount = s.split(/\s+/).filter(Boolean).length;
+  if (wordCount >= 18) return true;
+  if ((s.match(/\?/g) || []).length > 0) return true;
+  const hasMulti = /(and|also|plus|another thing|by the way|actually|one more)/i.test(s);
+  if (hasMulti && wordCount >= 10) return true;
+  const hasStory = /(so|because|then|after|before|yesterday|last week|last time)/i.test(s) && wordCount >= 14;
+  return hasStory;
+}
+
 function buildLlmSystemPrompt(tradie) {
   const biz = tradie.bizName ? `Business name: ${tradie.bizName}.` : "";
   const services = tradie.services ? `Services offered: ${tradie.services}.` : "";
@@ -197,7 +201,7 @@ You must:
 - Extract booking fields from the user's latest speech if present.
 - If the user goes off-script (rambling / asking questions), answer briefly and steer back to booking.
 - Keep the conversation moving: ask ONE best next question at a time.
-- Do NOT hallucinate details. If uncertain, ask.
+- Do NOT invent details. If uncertain, ask.
 
 Output MUST be STRICT JSON ONLY with this schema:
 {
@@ -210,7 +214,7 @@ Output MUST be STRICT JSON ONLY with this schema:
     "access_note": string|null
   },
   "smalltalk_reply": string|null,
-  "next_question": string,   // what assistant should ask next
+  "next_question": string,
   "suggested_step": "intent"|"job"|"address"|"name"|"access"|"time"|"pickSlot"|"confirm"
 }
 
@@ -223,6 +227,66 @@ Rules:
 - Keep smalltalk_reply short (max 1 sentence) and then proceed with next_question.
 ${tone}`
   );
+}
+
+/**
+ * ✅ Fix #1: No more “Unexpected end of JSON input”
+ * - Always read text first
+ * - Guard empty/partial bodies
+ * - Log non-200 responses safely
+ * - Retry once on transient failures
+ */
+async function fetchJsonWithGuards(url, options, { retryOnce = true } = {}) {
+  const attempt = async () => {
+    const r = await fetch(url, options);
+    const text = await r.text();
+    if (!text || !String(text).trim()) {
+      const err = new Error("Empty response body");
+      err.status = r.status;
+      err.body = "";
+      throw err;
+    }
+    const parsed = safeJsonParse(text);
+    if (!parsed) {
+      const err = new Error("Non-JSON response body");
+      err.status = r.status;
+      err.body = text.slice(0, 500);
+      throw err;
+    }
+    if (!r.ok) {
+      const err = new Error(`HTTP ${r.status}`);
+      err.status = r.status;
+      err.body = text.slice(0, 500);
+      throw err;
+    }
+    return parsed;
+  };
+
+  try {
+    return await attempt();
+  } catch (e) {
+    if (retryOnce) {
+      // small delay for transient cut-offs
+      await new Promise((r) => setTimeout(r, 150));
+      return attempt();
+    }
+    throw e;
+  }
+}
+
+function extractResponseTextFromOpenAI(data) {
+  // Responses API commonly provides output_text
+  if (data && typeof data.output_text === "string" && data.output_text.trim()) return data.output_text.trim();
+
+  // Fallback shapes (varies by SDK/changes)
+  const text1 = data?.output?.[0]?.content?.[0]?.text;
+  if (typeof text1 === "string" && text1.trim()) return text1.trim();
+
+  // Chat Completions shape fallback:
+  const text2 = data?.choices?.[0]?.message?.content;
+  if (typeof text2 === "string" && text2.trim()) return text2.trim();
+
+  return "";
 }
 
 async function callLlm(tradie, session, userSpeech) {
@@ -249,27 +313,23 @@ async function callLlm(tradie, session, userSpeech) {
   };
 
   try {
-    const r = await fetch(LLM_BASE_URL, {
+    const data = await fetchJsonWithGuards(LLM_BASE_URL, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         Authorization: `Bearer ${OPENAI_API_KEY}`
       },
       body: JSON.stringify(payload)
-    });
+    }, { retryOnce: true });
 
-    const data = await r.json();
-
-    // Responses API: output_text is the easiest text surface (common across SDKs/docs)
-    const text = (data && (data.output_text || data?.output?.[0]?.content?.[0]?.text)) ? (data.output_text || data.output?.[0]?.content?.[0]?.text) : "";
+    const text = extractResponseTextFromOpenAI(data);
     const parsed = safeJsonParse(String(text || "").trim());
     if (!parsed) return null;
 
-    // sanity
     if (!parsed.next_question || !parsed.suggested_step) return null;
     return parsed;
   } catch (e) {
-    console.warn("LLM call failed:", e?.message || e);
+    console.warn("LLM call failed (guarded):", e?.message || e, e?.status ? `status=${e.status}` : "", e?.body ? `body=${e.body}` : "");
     return null;
   }
 }
@@ -524,21 +584,21 @@ function getSession(callSid, fromNumber = "") {
       quoteKey: null,
 
       lastAskedField: "",
-      lastStepBeforeClarify: "",
-
       lastPrompt: "",
       tries: 0,
       from: fromNumber || "",
-      rejects: { address: 0, time: 0 },
       lastAtAddress: null,
       duplicateEvent: null,
-      confirmMode: "new",
       startedAt: Date.now(),
       _countedCall: false,
 
-      // ✅ NEW: conversational memory
+      // ✅ NEW: conversational memory + caps
       history: [],          // [{role:"assistant"|"user",content:"..."}]
-      llmTurns: 0           // prevent runaway AI loops
+      llmTurns: 0,
+      abuseStrikes: 0,
+
+      // ✅ NEW: edit/access mode
+      accessEditMode: "replace" // "replace" | "append"
     });
   } else {
     const s = sessions.get(callSid);
@@ -549,7 +609,7 @@ function getSession(callSid, fromNumber = "") {
 function resetSession(callSid) { sessions.delete(callSid); }
 
 /* ============================================================================
-General helpers
+General helpers + validation (Fix #9)
 ============================================================================ */
 function cleanSpeech(text) {
   if (!text) return "";
@@ -580,22 +640,76 @@ function ask(twiml, prompt, actionUrl, options = {}) {
   twiml.pause({ length: 1 });
 }
 
+function normStr(s) {
+  return String(s || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+}
+
+function looksLikePhoneOrJunkName(s) {
+  const t = String(s || "").trim();
+  if (!t) return true;
+  if (/\d{6,}/.test(t)) return true;
+  if (t.split(/\s+/).length > 5) return true;
+  return false;
+}
+
+function validateName(speech) {
+  const s = String(speech || "").trim();
+  if (!s || s.length < 2) return false;
+  if (looksLikePhoneOrJunkName(s)) return false;
+  if (/(tomorrow|today|am|pm|\d{1,2}:\d{2}|\d{1,2}\s?(am|pm))/i.test(s)) return false;
+  return true;
+}
+
+function validateAddress(speech) {
+  const s = String(speech || "").toLowerCase().trim();
+  if (!s || s.length < 6) return false;
+  const hasNum = /\d/.test(s);
+  const addrHints = [" street"," st"," road"," rd"," avenue"," ave"," drive"," dr"," lane"," ln"," court"," ct"," crescent"," cr"," highway"," hwy"," place"," pl"," parade"," pde"," close"," cl"," terrace"," tce"," circuit"," cct"," way"];
+  const hasHint = addrHints.some(h => s.includes(h));
+  // accept unit/lot formats
+  const hasUnit = /(unit|apt|apartment|lot|suite)\s*\d+/i.test(s);
+  return (hasNum && (hasHint || hasUnit)) || (hasHint && s.split(" ").length >= 3);
+}
+
+function validateJob(speech) {
+  const s = String(speech || "").trim();
+  if (!s || s.length < 3) return false;
+  if (s.split(/\s+/).length > 30) return true; // rambles allowed; we’ll extract
+  // reject obvious non-job
+  if (/^(yes|no|yeah|nope|correct|wrong)$/i.test(s)) return false;
+  return true;
+}
+
+function validateAccess(speech) {
+  const s = String(speech || "").trim();
+  if (!s) return true; // access is optional
+  if (/^(none|no|nope|nah)$/i.test(s)) return true;
+  return s.length >= 2;
+}
+
 function shouldReject(step, speech, confidence) {
   const s = (speech || "").toLowerCase();
   if (!speech || speech.length < 2) return true;
 
-  const junk = new Set(["hello","hi"]);
-  if (junk.has(s)) return step !== "job" && step !== "intent";
+  // step-specific confidence floors (tighter for address/time)
+  const minConf =
+    step === "address" ? 0.55 :
+    step === "time" ? 0.45 :
+    step === "name" ? 0.35 :
+    step === "job" ? 0.25 :
+    0.15;
 
-  const minConf = step === "job" ? 0.30 : 0.10;
   if (typeof confidence === "number" && confidence > 0 && confidence < minConf) {
-    if (speech.split(" ").length <= 2) return true;
+    // allow longer answers even if confidence is low
+    if (speech.split(" ").length <= 3) return true;
   }
-  return false;
-}
 
-function normStr(s) {
-  return String(s || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+  if (step === "address") return !validateAddress(speech);
+  if (step === "name") return !validateName(speech);
+  if (step === "job") return !validateJob(speech);
+  if (step === "access") return !validateAccess(speech);
+
+  return false;
 }
 
 /* ============================================================================
@@ -689,7 +803,7 @@ function nextBusinessOpenSlot(tradie) {
 }
 
 /* ============================================================================
-Interruption resilience
+Interruption + edits (Fix #2, #3, #4)
 ============================================================================ */
 function detectYesNoFromDigits(d) {
   if (!d) return null;
@@ -700,8 +814,8 @@ function detectYesNoFromDigits(d) {
 
 function detectYesNo(text) {
   const t = (text || "").toLowerCase().trim();
-  const yes = ["yes","yeah","yep","correct","that's right","that’s right","sounds good","ok","okay"];
-  const no = ["no","nope","nah","wrong","not that","change","actually no"];
+  const yes = ["yes","yeah","yep","correct","that's right","that’s right","sounds good","ok","okay","confirm"];
+  const no = ["no","nope","nah","wrong","not that"];
   if (yes.some(w => t === w || t.includes(w))) return "YES";
   if (no.some(w => t === w || t.includes(w))) return "NO";
   return null;
@@ -730,33 +844,74 @@ function detectChangeFieldFromDigits(d) {
 
 function detectChangeFieldFromSpeech(text) {
   const t = (text || "").toLowerCase();
+  if (t.includes("access") || t.includes("gate") || t.includes("parking") || t.includes("dog") || t.includes("code") || t.includes("notes")) return "access";
   if (t.includes("job")) return "job";
   if (t.includes("address")) return "address";
   if (t.includes("name")) return "name";
-  if (t.includes("time")) return "time";
-  if (t.includes("slot")) return "time";
+  if (t.includes("time") || t.includes("slot") || t.includes("date")) return "time";
   return null;
 }
 
-// Lightweight slot-fill: capture time/address/name mid-flow
+function wantsRepeatOptions(text) {
+  const t = (text || "").toLowerCase();
+  return t.includes("repeat") || t.includes("say that again") || t.includes("what were the options") || t.includes("options again");
+}
+
+function wantsHuman(text) {
+  const t = (text || "").toLowerCase();
+  return t.includes("human") || t.includes("person") || t.includes("owner") || t.includes("manager") || t.includes("someone real");
+}
+
+/* ============================================================================
+Profanity/abuse handling (Fix #7)
+============================================================================ */
+function detectAbuse(text) {
+  const t = (text || "").toLowerCase();
+  const abusive = [
+    "retard","retarded","idiot","stupid","moron","dumb",
+    "fuck you","f*** you","cunt","bitch","slut","kill yourself"
+  ];
+  return abusive.some(w => t.includes(w));
+}
+
+function abuseReply(strikes) {
+  if (strikes <= 1) return "I can help with that — let’s keep it respectful. ";
+  if (strikes === 2) return "I’m here to help, but I can’t continue with abusive language. ";
+  return "I’m going to end this call now. You can call back when you’re ready to book. ";
+}
+
+/* ============================================================================
+Lightweight slot-fill: capture fields mid-flow (Fix #5)
+============================================================================ */
 function trySlotFill(session, speech, tz) {
-  const dt = parseRequestedDateTime(speech, tz);
+  const raw = String(speech || "").trim();
+  if (!raw) return;
+
+  // time
+  const dt = parseRequestedDateTime(raw, tz);
   if (dt) {
-    session.time = speech;
+    session.time = raw;
     session.bookedStartMs = dt.toMillis();
   }
 
-  const s = (speech || "").toLowerCase();
-  const addrHints = [" street"," st"," road"," rd"," avenue"," ave"," drive"," dr"," lane"," ln"," court"," ct"," crescent"," cr"," highway"," hwy"];
-  const looksAddr = /\d/.test(s) && addrHints.some(h => s.includes(h));
-  if (looksAddr) session.address = speech;
+  // address
+  if (validateAddress(raw)) session.address = session.address || raw;
 
-  const m = speech.match(/my name is\s+(.+)/i);
-  if (m && m[1]) session.name = cleanSpeech(m[1]);
+  // name
+  const m = raw.match(/my name is\s+(.+)/i);
+  if (m && m[1]) {
+    const nm = cleanSpeech(m[1]);
+    if (validateName(nm)) session.name = session.name || nm;
+  }
 
-  // (Nice extra) if user says "it's a ..." and step is job-ish, keep as job
-  if (!session.job && /(leak|blocked|hot water|air con|heater|toilet|sink|tap|power|switch|smoke|fire)/i.test(speech)) {
-    session.job = speech;
+  // access hints
+  if (/gate|code|parking|dog|pet|call on arrival|buzz|intercom/i.test(raw)) {
+    session.accessNote = session.accessNote || raw;
+  }
+
+  // job hints (loose)
+  if (!session.job && /(leak|blocked|hot water|air con|heater|toilet|sink|tap|power|switch|deck|til(e|es)|fence|roof|gutter|drain)/i.test(raw)) {
+    session.job = raw;
   }
 }
 
@@ -880,12 +1035,6 @@ async function findDuplicate(calendar, calendarId, tz, name, address, startDt) {
     }
   }
   return null;
-}
-
-async function deleteEventSafe(calendar, calendarId, eventId) {
-  if (!eventId) return;
-  try { await calendar.events.delete({ calendarId, eventId }); }
-  catch (e) { console.warn("Delete failed:", e?.message || e); }
 }
 
 /* ============================================================================
@@ -1104,6 +1253,26 @@ app.post("/voice", async (req, res) => {
   // Record conversational history (user)
   if (speech) addToHistory(session, "user", speech);
 
+  // Abuse handling (Fix #7)
+  if (speech && detectAbuse(speech)) {
+    session.abuseStrikes += 1;
+    const prefix = abuseReply(session.abuseStrikes);
+
+    if (session.abuseStrikes >= 3) {
+      twiml.say(prefix, { voice: "Polly.Amy", language: "en-AU" });
+      twiml.hangup();
+      resetSession(callSid);
+      return res.type("text/xml").send(twiml.toString());
+    }
+
+    // de-escalate then continue with last prompt
+    const prompt = prefix + (session.lastPrompt || "How can we help today?");
+    session.lastPrompt = prompt;
+    addToHistory(session, "assistant", prompt);
+    ask(twiml, prompt, "/voice");
+    return res.type("text/xml").send(twiml.toString());
+  }
+
   // No speech AND no digits
   if (!speech && !digits) {
     session.tries += 1;
@@ -1124,8 +1293,8 @@ app.post("/voice", async (req, res) => {
       access: "Any access notes like gate code, parking, or pets? Say none if not.",
       time: "What time would you like?",
       pickSlot: "I’m booked then. Say first, second, or third, or say another time.",
-      confirm: "Say yes to confirm, or no to change. You can also press 1 for yes, 2 for no.",
-      clarify: "No worries — what should I change? job, address, name, or time."
+      confirm: "Say yes to confirm, or say what you want to change — job, address, name, time, or access notes.",
+      clarify: "No worries — what should I change? job, address, name, time, or access notes."
     };
 
     const prompt = session.lastPrompt || promptMap[session.step] || "Can you repeat that?";
@@ -1140,20 +1309,24 @@ app.post("/voice", async (req, res) => {
   try {
     const tz = tradie.timezone;
 
-    // Slot fill even if interrupted
+    // Slot fill even if interrupted (Fix #5)
     if (speech) trySlotFill(session, speech, tz);
 
-    // GLOBAL yes/no + correction handling
+    // Human request (optional)
+    if (speech && wantsHuman(speech)) {
+      await missedRevenueAlert(tradie, session, "Customer requested a human");
+      twiml.say("No worries — we’ll have someone contact you shortly.", { voice: "Polly.Amy", language: "en-AU" });
+      twiml.hangup();
+      resetSession(callSid);
+      return res.type("text/xml").send(twiml.toString());
+    }
+
+    // GLOBAL yes/no + correction handling (Fix #3)
     const yn = detectYesNoFromDigits(digits) || detectYesNo(speech);
     const changeField = detectChangeFieldFromDigits(digits) || detectChangeFieldFromSpeech(speech);
     const corrected = speech ? detectCorrection(speech) : false;
 
-    // ✅ LLM OFF-SCRIPT ASSIST (optional)
-    // If enabled, and caller is off-script OR you allow always, the LLM can:
-    // - set intent
-    // - extract fields
-    // - give a smalltalk reply
-    // - choose the next question and suggested step
+    // ✅ LLM OFF-SCRIPT ASSIST (optional) (Fix #5, #0)
     const shouldUseLlm =
       llmReady() &&
       session.llmTurns < LLM_MAX_TURNS &&
@@ -1164,14 +1337,12 @@ app.post("/voice", async (req, res) => {
 
       const llm = await callLlm(tradie, session, speech);
       if (llm) {
-        // Apply intent if meaningful
         if (llm.intent && llm.intent !== "UNKNOWN") session.intent = llm.intent;
 
-        // Apply extracted fields (only if present and not nonsense)
         const f = llm.fields || {};
         if (typeof f.job === "string" && f.job.trim().length >= 2) session.job = session.job || f.job.trim();
-        if (typeof f.address === "string" && f.address.trim().length >= 4) session.address = session.address || f.address.trim();
-        if (typeof f.name === "string" && f.name.trim().length >= 2) session.name = session.name || f.name.trim();
+        if (typeof f.address === "string" && f.address.trim().length >= 4 && validateAddress(f.address)) session.address = session.address || f.address.trim();
+        if (typeof f.name === "string" && f.name.trim().length >= 2 && validateName(f.name)) session.name = session.name || f.name.trim();
         if (typeof f.access_note === "string" && f.access_note.trim().length >= 2) session.accessNote = session.accessNote || f.access_note.trim();
         if (typeof f.time_text === "string" && f.time_text.trim().length >= 2) {
           session.time = session.time || f.time_text.trim();
@@ -1179,17 +1350,15 @@ app.post("/voice", async (req, res) => {
           if (dtGuess) session.bookedStartMs = session.bookedStartMs || dtGuess.toMillis();
         }
 
-        // Smalltalk reply (1 sentence) + next question
         const replyParts = [];
         if (llm.smalltalk_reply) replyParts.push(String(llm.smalltalk_reply).trim());
         if (llm.next_question) replyParts.push(String(llm.next_question).trim());
         const mergedPrompt = replyParts.filter(Boolean).join(" ");
 
-        // Set suggested step IF it helps (don’t skip confirm/pickSlot forcibly)
         const suggested = String(llm.suggested_step || "").trim();
         const allowedSteps = new Set(["intent","job","address","name","access","time","pickSlot","confirm"]);
         if (allowedSteps.has(suggested)) {
-          // Only move "forward" sensibly; don’t yank out of confirm/pickSlot
+          // Don’t yank out of confirm/pickSlot; only update if not locked
           if (!["confirm","pickSlot"].includes(session.step)) session.step = suggested;
         }
 
@@ -1198,46 +1367,40 @@ app.post("/voice", async (req, res) => {
         ask(twiml, session.lastPrompt, "/voice");
         return res.type("text/xml").send(twiml.toString());
       }
-      // If LLM fails, fall through to your deterministic flow
+      // If LLM fails, fall through to deterministic flow safely
     }
 
-    // Jump to clarify if they want to change something mid-flow
-    if ((corrected || yn === "NO" || changeField) && session.step !== "intent" && session.step !== "clarify") {
-      const defaultTarget = changeField || session.lastAskedField || "";
+    // ✅ Context-aware change request (Fix #3)
+    // IMPORTANT: do NOT auto-time-change from confirm/pickSlot; those have their own logic.
+    const canGlobalInterrupt = !["intent", "clarify", "confirm", "pickSlot"].includes(session.step);
 
-      if (defaultTarget && defaultTarget !== "clarify" && defaultTarget !== "confirm") {
-        session.step = defaultTarget;
-        session.lastPrompt =
-          defaultTarget === "job" ? "Sure — what job do you need help with?"
-          : defaultTarget === "address" ? "Sure — what is the address?"
-          : defaultTarget === "name" ? "Sure — what is your name?"
-          : "Sure — what time would you like?";
-      } else {
-        session.step = "clarify";
-        session.lastPrompt = "No worries — what should I change? job, address, name, or time? (Press 3 time, 4 address, 5 job, 6 name)";
-      }
+    if (canGlobalInterrupt && (corrected || changeField)) {
+      const target = changeField || session.lastAskedField || "clarify";
+      session.step = target === "clarify" ? "clarify" : target;
+
+      session.lastPrompt =
+        session.step === "job" ? "Sure — what job do you need help with?"
+        : session.step === "address" ? "Sure — what is the address?"
+        : session.step === "name" ? "Sure — what is your name?"
+        : session.step === "access" ? "Sure — what access notes should I add or update?"
+        : session.step === "time" ? "Sure — what time would you like?"
+        : "No worries — what should I change? job, address, name, time, or access notes?";
 
       addToHistory(session, "assistant", session.lastPrompt);
       ask(twiml, session.lastPrompt, "/voice");
       return res.type("text/xml").send(twiml.toString());
     }
 
-    // If YES is pressed at non-confirm steps, treat as "continue"
-    if (yn === "YES" && session.step !== "confirm" && session.step !== "intent" && session.step !== "pickSlot") {
-      const nextPromptByStep = {
-        job: "What job do you need help with?",
-        address: "What is the address?",
-        name: "What is your name?",
-        access: "Any access notes like gate code, parking, or pets? Say none if not.",
-        time: "What time would you like?"
-      };
-      session.lastPrompt = nextPromptByStep[session.step] || session.lastPrompt || "Can you repeat that?";
+    // If someone says a bare NO mid-flow (not confirm), treat as "clarify what to change"
+    if (canGlobalInterrupt && yn === "NO") {
+      session.step = "clarify";
+      session.lastPrompt = "No worries — what should I change? job, address, name, time, or access notes?";
       addToHistory(session, "assistant", session.lastPrompt);
       ask(twiml, session.lastPrompt, "/voice");
       return res.type("text/xml").send(twiml.toString());
     }
 
-    // Clarify step handler
+    // Clarify step handler (upgraded: includes access) (Fix #2/#4)
     if (session.step === "clarify") {
       const target = changeField || detectChangeFieldFromSpeech(speech) || session.lastAskedField || "";
       if (target) {
@@ -1246,21 +1409,27 @@ app.post("/voice", async (req, res) => {
           target === "job" ? "Sure — what job do you need help with?"
           : target === "address" ? "Sure — what is the address?"
           : target === "name" ? "Sure — what is your name?"
+          : target === "access" ? "Sure — what access notes should I add or update?"
           : "Sure — what time would you like?";
         addToHistory(session, "assistant", session.lastPrompt);
         ask(twiml, session.lastPrompt, "/voice");
         return res.type("text/xml").send(twiml.toString());
       }
 
-      session.lastPrompt = "Sorry — what should I change? job, address, name, or time? (Press 3 time, 4 address, 5 job, 6 name)";
+      session.lastPrompt = "Sorry — what should I change? job, address, name, time, or access notes?";
       addToHistory(session, "assistant", session.lastPrompt);
       ask(twiml, session.lastPrompt, "/voice");
       return res.type("text/xml").send(twiml.toString());
     }
 
     // Reject logic (speech-only)
-    if (!digits && session.step !== "confirm" && shouldReject(session.step, speech, confidence)) {
-      session.lastPrompt = "Sorry, can you repeat that?";
+    if (!digits && session.step !== "confirm" && session.step !== "pickSlot" && shouldReject(session.step, speech, confidence)) {
+      session.lastPrompt =
+        session.step === "address" ? "Sorry — can you say the full street address, like number and street name?"
+        : session.step === "name" ? "Sorry — what name should I put this under?"
+        : session.step === "job" ? "Sorry — what job do you need help with?"
+        : session.step === "access" ? "Sorry — any access notes like gate code, parking, or pets? Say none if not."
+        : "Sorry, can you repeat that?";
       addToHistory(session, "assistant", session.lastPrompt);
       ask(twiml, session.lastPrompt, "/voice");
       return res.type("text/xml").send(twiml.toString());
@@ -1349,10 +1518,23 @@ app.post("/voice", async (req, res) => {
       return res.type("text/xml").send(twiml.toString());
     }
 
-    // STEP: access
+    // STEP: access (Fix #4: edit/append support)
     if (session.step === "access") {
       const s = (speech || "").trim();
-      session.accessNote = (s && !["none","no","nope","nah"].includes(s.toLowerCase())) ? s : "";
+      const saidNone = s && ["none","no","nope","nah"].includes(s.toLowerCase());
+
+      // If caller explicitly says "add" or "also", append; otherwise replace
+      if (/add|also|another|plus|and also/i.test(s)) session.accessEditMode = "append";
+      else session.accessEditMode = "replace";
+
+      if (!saidNone && s) {
+        session.accessNote =
+          session.accessEditMode === "append" && session.accessNote
+            ? `${session.accessNote} | ${s}`
+            : s;
+      } else if (saidNone) {
+        session.accessNote = "";
+      }
 
       if (session.intent === "QUOTE") {
         if (session.from) {
@@ -1424,7 +1606,7 @@ app.post("/voice", async (req, res) => {
         if (deltaMin > 5) {
           session.proposedSlots = slots.map(x => x.toMillis());
           session.step = "pickSlot";
-          session.lastPrompt = `We’re booked at that time. I can do: ${slotsVoiceLine(slots, tz)} Say first, second, or third. (Or press 1, 2, or 3)`;
+          session.lastPrompt = `We’re booked at that time. I can do: ${slotsVoiceLine(slots, tz)} Say first, second, or third — or tell me another time. (Or press 1, 2, or 3)`;
           addToHistory(session, "assistant", session.lastPrompt);
           ask(twiml, session.lastPrompt, "/voice");
           return res.type("text/xml").send(twiml.toString());
@@ -1435,7 +1617,6 @@ app.post("/voice", async (req, res) => {
 
       session.bookedStartMs = dt.toMillis();
       session.duplicateEvent = null;
-      session.confirmMode = "new";
 
       if (tradie.calendarId && tradie.googleServiceJson) {
         try {
@@ -1450,19 +1631,42 @@ app.post("/voice", async (req, res) => {
       const accessLine = session.accessNote ? ` Access notes: ${session.accessNote}.` : "";
 
       session.step = "confirm";
-      session.lastPrompt = `Alright. I heard: ${session.job}, at ${session.address}, for ${session.name}, on ${whenForVoice}.${noteLine}${accessLine} Is that correct? Say yes to confirm, or no to change the time. (Press 1 yes, 2 no)`;
+      session.lastPrompt =
+        `Alright. I heard: ${session.job}, at ${session.address}, for ${session.name}, on ${whenForVoice}.` +
+        `${noteLine}${accessLine} ` +
+        `Is that correct? Say yes to confirm — or say what you want to change: job, address, name, time, or access notes. (Press 1 yes, 2 no)`;
       addToHistory(session, "assistant", session.lastPrompt);
       ask(twiml, session.lastPrompt, "/voice");
       return res.type("text/xml").send(twiml.toString());
     }
 
-    // STEP: pickSlot
+    // STEP: pickSlot (Fix #6)
     if (session.step === "pickSlot") {
+      if (speech && wantsRepeatOptions(speech)) {
+        const slots = (session.proposedSlots || []).map(ms => DateTime.fromMillis(ms, { zone: tz }));
+        session.lastPrompt = `No worries. Options are: ${slotsVoiceLine(slots, tz)} Say first, second, or third — or tell me another time.`;
+        addToHistory(session, "assistant", session.lastPrompt);
+        ask(twiml, session.lastPrompt, "/voice");
+        return res.type("text/xml").send(twiml.toString());
+      }
+
+      // If they say a NEW time instead of first/second/third, treat as time request
+      const dtTry = speech ? parseRequestedDateTime(speech, tz) : null;
+      if (dtTry) {
+        session.step = "time";
+        session.time = speech;
+        session.bookedStartMs = dtTry.toMillis();
+        session.lastPrompt = "Got it. Let me check that time.";
+        addToHistory(session, "assistant", session.lastPrompt);
+        ask(twiml, session.lastPrompt, "/voice");
+        return res.type("text/xml").send(twiml.toString());
+      }
+
       const idx = pickSlotFromSpeechOrDigits(speech, digits);
       const slots = (session.proposedSlots || []).map(ms => DateTime.fromMillis(ms, { zone: tz }));
 
       if (idx == null || !slots[idx]) {
-        session.lastPrompt = "Say first, second, or third. Or press 1, 2, or 3.";
+        session.lastPrompt = "Say first, second, or third. Or press 1, 2, or 3. Or tell me another time.";
         addToHistory(session, "assistant", session.lastPrompt);
         ask(twiml, session.lastPrompt, "/voice");
         return res.type("text/xml").send(twiml.toString());
@@ -1476,41 +1680,61 @@ app.post("/voice", async (req, res) => {
       const noteLine = session.customerNote ? ` I have a note on your account: ${session.customerNote}.` : "";
       const accessLine = session.accessNote ? ` Access notes: ${session.accessNote}.` : "";
 
-      session.lastPrompt = `Perfect. ${whenForVoice}.${noteLine}${accessLine} Is that correct? Say yes to confirm, or no to change the time. (Press 1 yes, 2 no)`;
+      session.lastPrompt =
+        `Perfect. ${whenForVoice}.` +
+        `${noteLine}${accessLine} ` +
+        `Is that correct? Say yes to confirm — or say what you want to change: job, address, name, time, or access notes.`;
       addToHistory(session, "assistant", session.lastPrompt);
       ask(twiml, session.lastPrompt, "/voice");
       return res.type("text/xml").send(twiml.toString());
     }
 
-    // STEP: confirm
+    // STEP: confirm (Fix #2)
     if (session.step === "confirm") {
-      const s = (speech || "").toLowerCase();
-      const yn2 = detectYesNoFromDigits(digits) || detectYesNo(speech);
+      const s = (speech || "").toLowerCase().trim();
 
-      const isYes = yn2 === "YES" || s.includes("yes") || s.includes("yeah") || s.includes("yep") || s.includes("correct");
-      const isNo = yn2 === "NO" || s.includes("no") || s.includes("nope") || s.includes("wrong") || s.includes("change");
+      // If caller says “don’t change the time / keep the time” treat it as YES (they are correcting the bot)
+      const keepTime = /(dont|don't)\s+change\s+the\s+time|keep\s+the\s+time|time\s+is\s+fine|leave\s+the\s+time/i.test(s);
+
+      const yn2 = detectYesNoFromDigits(digits) || detectYesNo(speech);
+      const changeField2 = detectChangeFieldFromSpeech(speech);
+
+      // If they mention a specific field to change, route there immediately
+      if (changeField2) {
+        session.step = changeField2;
+        session.lastPrompt =
+          changeField2 === "job" ? "Sure — what job should I put down instead?"
+          : changeField2 === "address" ? "Sure — what’s the correct address?"
+          : changeField2 === "name" ? "Sure — what name should I use?"
+          : changeField2 === "access" ? "Sure — what access notes should I add or update?"
+          : "Sure — what time would you like instead?";
+        addToHistory(session, "assistant", session.lastPrompt);
+        ask(twiml, session.lastPrompt, "/voice");
+        return res.type("text/xml").send(twiml.toString());
+      }
+
+      const isYes = keepTime || yn2 === "YES" || s.includes("yes") || s.includes("yeah") || s.includes("yep") || s.includes("correct") || s.includes("confirm");
+      const isNo = !keepTime && (yn2 === "NO" || s === "no" || s === "nope" || s.includes("wrong") || s.includes("not correct"));
 
       if (isNo) {
-        session.step = "time";
-        session.time = "";
-        session.bookedStartMs = null;
-        session.proposedSlots = [];
-        session.lastPrompt = "No problem. What time would you like instead?";
+        // Don’t assume “time” — ask what to change (Fix #2/#3)
+        session.step = "clarify";
+        session.lastPrompt = "No worries — what should I change? job, address, name, time, or access notes?";
         addToHistory(session, "assistant", session.lastPrompt);
         ask(twiml, session.lastPrompt, "/voice");
         return res.type("text/xml").send(twiml.toString());
       }
 
       if (!isYes) {
-        session.lastPrompt = "Sorry — just say yes to confirm, or no to change the time. (Press 1 yes, 2 no)";
+        session.lastPrompt = "Sorry — say yes to confirm, or tell me what you want to change: job, address, name, time, or access notes.";
         addToHistory(session, "assistant", session.lastPrompt);
         ask(twiml, session.lastPrompt, "/voice");
         return res.type("text/xml").send(twiml.toString());
       }
 
+      // ✅ Confirmed -> proceed
       const start = DateTime.fromMillis(session.bookedStartMs || Date.now(), { zone: tz });
       const end = start.plus({ minutes: tradie.slotMinutes });
-
       const displayWhen = start.toFormat("ccc d LLL yyyy, h:mm a");
       const summaryText = `${session.name} needs ${session.job} at ${session.address}.`;
 
@@ -1552,7 +1776,6 @@ app.post("/voice", async (req, res) => {
       const historyLine = session.lastAtAddress
         ? `\nHistory: ${session.lastAtAddress.summary} on ${session.lastAtAddress.whenText}`
         : "";
-
       const memoryLine = session.customerNote ? `\nCustomer note (existing): ${session.customerNote}` : "";
       const accessLine = session.accessNote ? `\nAccess note (new): ${session.accessNote}` : "";
 
