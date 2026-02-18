@@ -69,41 +69,43 @@ try { require("dotenv").config(); } catch (e) {}
 const express = require("express");
 const twilio = require("twilio");
 const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY || "");
-const { google } = require("googleapis");
-const chrono = require("chrono-node");
-const { DateTime } = require("luxon");
-@@ -47,30 +51,43 @@ app.set("trust proxy", true);
+
+const app = express();                 // ✅ MUST exist before app.set / app.use
+app.set("trust proxy", true);          // ✅ re-type this line manually in your editor
+
 /* ============================================================================
 Process-level safety (Render-friendly logs)
 ============================================================================ */
 process.on("unhandledRejection", (reason) => {
   console.error("UNHANDLED REJECTION:", reason);
 });
-process.on("unhandledRejection", (reason) => console.error("UNHANDLED REJECTION:", reason));
 process.on("uncaughtException", (err) => {
-console.error("UNCAUGHT EXCEPTION:", err);
-process.exit(1);
+  console.error("UNCAUGHT EXCEPTION:", err);
+  process.exit(1);
 });
 
-/**
- * ✅ IMPORTANT for Twilio signature validation:
- * Twilio signs the *raw* POST body. We keep urlencoded but also capture raw.
- */
 /* ============================================================================
-RAW BODY CAPTURE (Twilio) + standard parsing
+RAW BODY CAPTURE (Twilio) + parsing
+IMPORTANT:
+- Twilio signs raw POST body for signature validation
+- Stripe webhook MUST receive RAW JSON body (so we skip express.json on that route)
 ============================================================================ */
 function rawBodySaver(req, res, buf) {
-try { req.rawBody = buf?.toString("utf8") || ""; } catch { req.rawBody = ""; }
+  try { req.rawBody = buf?.toString("utf8") || ""; } catch { req.rawBody = ""; }
 }
 
-// Twilio sends application/x-www-form-urlencoded by default
 // Twilio default: x-www-form-urlencoded
 app.use(express.urlencoded({ extended: false, verify: rawBodySaver }));
-// For normal JSON endpoints (NOT Stripe webhook)
-app.use(express.json({ limit: "1mb" }));
+
+// ✅ DO NOT run express.json() on Stripe webhook route, or signature breaks
+app.use((req, res, next) => {
+  if (req.originalUrl === "/stripe/webhook") return next();
+  return express.json({ limit: "1mb" })(req, res, next);
+});
 
 const VoiceResponse = twilio.twiml.VoiceResponse;
 const MessagingResponse = twilio.twiml.MessagingResponse;
+
 
 /* ============================================================================
 MULTI-TRADIE CONFIG
