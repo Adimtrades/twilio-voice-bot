@@ -61,8 +61,12 @@ function rawBodySaver(req, res, buf) {
   try { req.rawBody = buf?.toString("utf8") || ""; } catch { req.rawBody = ""; }
 }
 
-// Twilio posts x-www-form-urlencoded for Voice/SMS
-app.use(express.urlencoded({ extended: false, verify: rawBodySaver }));
+// Twilio posts x-www-form-urlencoded for Voice/SMS (but DON'T touch Stripe webhook raw body)
+app.use((req, res, next) => {
+  if (req.originalUrl === "/stripe/webhook") return next();
+  return express.urlencoded({ extended: false, verify: rawBodySaver })(req, res, next);
+});
+
 
 // JSON for everything except Stripe webhook (must be raw)
 app.use((req, res, next) => {
