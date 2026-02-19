@@ -2203,3 +2203,65 @@ const PORT = Number(process.env.PORT || 10000);
 if (!PORT || Number.isNaN(PORT)) throw new Error("PORT missing/invalid");
 
 app.listen(PORT, () => console.log("Server listening on", PORT));
+// ============================
+// GOOGLE FORM SUBMIT ENDPOINT
+// ============================
+
+app.post("/form/submit", async (req, res) => {
+  try {
+    const secret = req.headers["x-form-secret"];
+
+    // 1️⃣ Verify secret
+    if (!secret || secret !== process.env.FORM_WEBHOOK_SECRET) {
+      console.log("Invalid form secret");
+      return res.status(401).json({ error: "Unauthorized" });
+    }
+
+    const { submitted_at, form_id, response_id, answers } = req.body;
+
+    console.log("Form received:", response_id);
+
+    // 2️⃣ Extract useful fields from form
+    const email = answers["Email"] || answers["Email Address"] || null;
+    const businessName = answers["Business Name"] || null;
+    const phone = answers["Phone"] || null;
+    const plan = answers["Plan"] || "unknown";
+
+    // 3️⃣ Save to Supabase (example: pending_confirmations table)
+
+    const { data, error } = await supabase
+      .from("pending_confirmations")
+      .insert([
+        {
+          email: email,
+          business_name: businessName,
+          phone: phone,
+          plan: plan,
+          response_id: response_id,
+          submitted_at: submitted_at,
+          raw_payload: answers
+        }
+      ]);
+
+    if (error) {
+      console.error("Supabase error:", error);
+      return res.status(500).json({ error: "DB insert failed" });
+    }
+
+    // 4️⃣ OPTIONAL: Send SMS to you via Twilio
+
+    if (process.env.OWNER_PHONE_NUMBER) {
+      await twilioClient.messages.create({
+        body: `New onboarding form submitted from ${businessName || email}`,
+        from: process.env.TWILIO_SMS_FROM,
+        to: process.env.OWNER_PHONE_NUMBER
+      });
+    }
+
+    res.status(200).json({ success: true });
+
+  } catch (err) {
+    console.error("Form submit error:", err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
