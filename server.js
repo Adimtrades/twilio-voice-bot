@@ -2265,3 +2265,92 @@ app.post("/form/submit", async (req, res) => {
     res.status(500).json({ error: "Server error" });
   }
 });
+// ---- Google Form → Server webhook ----
+app.post("/form/submit", express.json({ limit: "1mb" }), async (req, res) => {
+  try {
+    const expected = process.env.FORM_WEBHOOK_SECRET || "";
+    const got = (req.get("x-form-secret") || "").trim();
+
+    if (!expected) return res.status(500).send("Missing FORM_WEBHOOK_SECRET on server");
+    if (got !== expected) return res.status(401).send("Bad form secret");
+
+    const payload = req.body || {};
+    const answers = payload.answers || {}; // { "Question title": "answer", ... }
+
+    // Helpers to find values by possible question titles
+    const pick = (...keys) => {
+      for (const k of keys) {
+        if (answers[k] != null && String(answers[k]).trim() !== "") return String(answers[k]).trim();
+      }
+      return null;
+    };
+
+    const business_name = pick("Business Name", "business name", "Company Name");
+    const owner_mobile = pick("Owner Mobile Number", "Owner Mobile", "Owner Phone", "Mobile");
+    const business_phone = pick("Business Phone Number", "Business Phone", "Phone Number");
+    const service_offered = pick("Service Offered", "Service", "Trade");
+    const calendar_email = pick("Google Calendar Email", "Calendar Email", "Google calendar email");
+    const business_hours = pick("Business Hours", "Hours");
+    const timezone = pick("Time zone", "Timezone", "time zone");
+    const notes = pick("Anything else we should know", "Notes", "Anything else");
+
+    // Insert rows using Supabase service role key (server-only)
+    const { createClient } = require("@supabase/supabase-js");
+    const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
+
+    // 1) quote_leads (lead intake)
+    const leadRow = {
+      created_at: new Date().toISOString(),
+      business_name,
+      owner_mobile,
+      business_phone,
+      service_offered,
+      calendar_email,
+      business_hours,
+      timezone,
+      notes,
+      raw_answers: answers,           // keep everything for debugging
+      form_response_id: payload.response_id || null,
+      form_id: payload.form_id || null,
+      submitted_at: payload.submitted_at || null,
+      status: "new",
+    };
+
+    const leadIns = await supabase.from("quote_leads").insert([leadRow]).select().single();
+
+    // 2) pending_confirmations (optional “awaiting setup” queue)
+    const pendingRow = {
+      created_at: new Date().toISOString(),
+      status: "pending",
+      email: calendar_email,
+      owner_sms_to: owner_mobile,
+      business_name,
+      service_offered,
+      timezone,
+      raw_answers: answers,
+      lead_id: leadIns.data?.id ?? null,
+    };
+
+    const pendingIns = await supabase.from("pending_confirmations").insert([pendingRow]);
+
+    // Optional SMS to you
+    if (process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN && process.env.TWILIO_SMS_FROM && process.env.OWNER_SMS_TO) {
+      const twilio = require("twilio")(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
+      await twilio.messages.create({
+        from: process.env.TWILIO_SMS_FROM,
+        to: process.env.OWNER_SMS_TO,
+        body: `New onboarding form: ${business_name || "Unknown"} (${service_offered || "service"})`,
+      });
+    }
+
+    // IMPORTANT: return 200 fast so Apps Script marks success
+    return res.status(200).json({
+      ok: true,
+      lead_id: leadIns.data?.id ?? null,
+      pending_ok: !pendingIns.error,
+    });
+  } catch (err) {
+    console.error("POST /form/submit error:", err);
+    return res.status(500).send("Server error");
+  }
+});
