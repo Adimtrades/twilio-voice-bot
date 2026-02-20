@@ -38,7 +38,7 @@ const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY || "");
 const chrono = require("chrono-node");
 const { DateTime } = require("luxon");
 const { google } = require("googleapis");
-
+const { createClient } = require("@supabase/supabase-js");
 // ----------------------------------------------------------------------------
 // App bootstrap
 // ----------------------------------------------------------------------------
