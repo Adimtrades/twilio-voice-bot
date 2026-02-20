@@ -2197,58 +2197,70 @@ app.post("/sms", async (req, res) => {
 app.get("/", (req, res) => res.status(200).send("Voice bot running (SaaS)"));
 
 // ---- Google Form → Server webhook (single, safe endpoint) ----
-app.post("/form/submit", async (req, res) => {
-  try {
-    const expected = (process.env.FORM_WEBHOOK_SECRET || "").trim();
-    const got = (req.get("x-form-secret") || "").trim();
+app.post("/form/submit", express.json({ limit: "1mb" }), async (req, res) => {
+try {
+const expected = (process.env.FORM_WEBHOOK_SECRET || "").trim();
+const got = (req.get("x-form-secret") || "").trim();
 
-    if (!expected) return res.status(500).send("Missing FORM_WEBHOOK_SECRET on server");
-    if (got !== expected) return res.status(401).send("Bad form secret");
+if (!expected) return res.status(500).send("Missing FORM_WEBHOOK_SECRET on server");
+if (got !== expected) return res.status(401).send("Bad form secret");
 
-    if (!supaReady()) return res.status(500).send("Supabase not configured");
+const payload = req.body || {};
+const answers = payload.answers || {};
 
-    const payload = req.body || {};
-    const answers = payload.answers || {};
+const pick = (...keys) => {
+for (const k of keys) {
+const v = answers[k];
+if (v != null && String(v).trim() !== "") return String(v).trim();
+}
+return null;
+};
 
-    const pick = (...keys) => {
-      for (const k of keys) {
-        const v = answers[k];
-        if (v != null && String(v).trim() !== "") return String(v).trim();
-      }
-      return null;
-    };
+const business_name = pick("Business Name", "business name", "Company Name");
+const owner_mobile = pick("Owner Mobile Number", "Owner Mobile", "Owner Phone", "Mobile", "Phone");
+const plan = pick("Plan") || "unknown";
+const service_offered = pick("Service Offered", "Service", "Trade");
+const calendar_email = pick("Google Calendar Email", "Calendar Email", "Email", "Email Address");
+const business_hours = pick("Business Hours", "Hours");
+const timezone = pick("Time zone", "Timezone", "time zone") || "Australia/Sydney";
+const notes = pick("Anything else we should know", "Notes", "Anything else");
 
-    const email = pick("Email", "Email Address", "email");
-    const business_name = pick("Business Name", "business name", "Company Name");
-    const owner_mobile = pick("Owner Mobile Number", "Owner Mobile", "Owner Phone", "Mobile", "Phone");
-    const plan = pick("Plan", "plan") || "unknown";
-    const service_offered = pick("Service Offered", "Service", "Trade");
-    const calendar_email = pick("Google Calendar Email", "Calendar Email", "Google calendar email");
-    const business_hours = pick("Business Hours", "Hours");
-    const timezone = pick("Time zone", "Timezone", "time zone") || "Australia/Sydney";
-    const notes = pick("Anything else we should know", "Notes", "Anything else");
+const { createClient } = require("@supabase/supabase-js");
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 
-    // ✅ IMPORTANT: do NOT mix with pending_confirmations used for SMS Y/N booking confirmations.
-    // Use a dedicated table for onboarding form leads.
-    const row = {
-      created_at: new Date().toISOString(),
-      submitted_at: payload.submitted_at || null,
-      form_id: payload.form_id || null,
-      response_id: payload.response_id || null,
+const leadRow = {
+created_at: new Date().toISOString(),
+submitted_at: payload.submitted_at || new Date().toISOString(),
+form_id: payload.form_id || null,
+response_id: payload.response_id || null,
+sheet_id: payload.sheet_id || null,
 
-      email,
-      business_name,
-      owner_mobile,
-      plan,
-      service_offered,
-      calendar_email,
-      business_hours,
-      timezone,
-      notes,
+business_name,
+owner_mobile,
+plan,
+service_offered,
+calendar_email,
+business_hours,
+timezone,
+notes,
 
-      raw_answers: answers,
-      status: "new"
-    };
+raw_answers: answers,
+status: "new"
+};
+
+const ins = await supabase.from("onboarding_leads").insert([leadRow]).select().single();
+
+if (ins.error) {
+console.error("Supabase insert error:", ins.error);
+return res.status(500).json({ ok: false, error: ins.error.message });
+}
+
+return res.status(200).json({ ok: true, lead_id: ins.data?.id || null });
+} catch (err) {
+console.error("POST /form/submit error:", err);
+return res.status(500).send("Server error");
+}
+});
 
     await upsertRow("onboarding_leads", row);
 
