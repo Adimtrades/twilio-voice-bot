@@ -2207,7 +2207,9 @@ if (got !== expected) return res.status(401).send("Bad form secret");
 
 const payload = req.body || {};
 const answers = payload.answers || {};
-
+console.log("FORM HIT", new Date().toISOString());
+console.log("secret header:", req.get("x-form-secret"));
+console.log("body keys:", Object.keys(req.body || {}));
 const pick = (...keys) => {
 for (const k of keys) {
 const v = answers[k];
