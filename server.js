@@ -2261,25 +2261,6 @@ console.error("POST /form/submit error:", err);
 return res.status(500).send("Server error");
 }
 });
-
-    await upsertRow("onboarding_leads", row);
-
-    // Optional SMS notify you
-    if (process.env.OWNER_SMS_TO && process.env.TWILIO_SMS_FROM) {
-      await sendSms({
-        from: process.env.TWILIO_SMS_FROM,
-        to: process.env.OWNER_SMS_TO,
-        body: `New onboarding form: ${business_name || email || "Unknown"} (${service_offered || "service"})`
-      }).catch(() => {});
-    }
-
-    return res.status(200).json({ ok: true });
-  } catch (err) {
-    console.error("POST /form/submit error:", err);
-    return res.status(500).send("Server error");
-  }
-});
-
 // ----------------------------------------------------------------------------
 // Listen
 // ----------------------------------------------------------------------------
@@ -2287,4 +2268,3 @@ const PORT = Number(process.env.PORT || 10000);
 if (!PORT || Number.isNaN(PORT)) throw new Error("PORT missing/invalid");
 
 app.listen(PORT, () => console.log("Server listening on", PORT));
-
