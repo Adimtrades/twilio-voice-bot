@@ -1,22 +1,22 @@
 {
-  "name": "twilio-voice-bot",
-  "version": "1.0.0",
-  "main": "server.js",
-  "private": true,
-  "scripts": {
-    "start": "node --check server.js && node server.js"
-  },
-  "engines": {
-    "node": "22.x"
-  },
-  "dependencies": {
-    "chrono-node": "^2.7.6",
-    "dotenv": "^16.4.5",
-    "express": "^4.18.3",
-    "googleapis": "^140.0.0",
-    "luxon": "^3.5.0",
-    "stripe": "^16.9.0",
-    "twilio": "^5.3.0"
-    "@supabase/supabase-js": "^2.0.0"
-  }
+"name": "twilio-voice-bot",
+"version": "1.0.0",
+"main": "server.js",
+"private": true,
+"scripts": {
+"start": "node server.js"
+},
+"engines": {
+"node": "22.x"
+},
+"dependencies": {
+"@supabase/supabase-js": "^2.0.0",
+"chrono-node": "^2.7.6",
+"dotenv": "^16.4.5",
+"express": "^4.18.3",
+"googleapis": "^140.0.0",
+"luxon": "^3.5.0",
+"stripe": "^16.9.0",
+"twilio": "^5.3.0"
+}
 }
