@@ -2354,3 +2354,167 @@ app.post("/form/submit", express.json({ limit: "1mb" }), async (req, res) => {
     return res.status(500).send("Server error");
   }
 });
+// server.js (or wherever your routes are)
+
+const express = require("express");
+const { createClient } = require("@supabase/supabase-js");
+const twilio = require("twilio");
+
+const app = express();
+
+// IMPORTANT: keep Stripe webhook raw separate; form can be normal JSON
+app.use(express.json({ limit: "1mb" }));
+
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY // use Service Role on server only
+);
+
+// --- helpers ---
+function requireSecret(req) {
+  const got = req.get("x-form-secret");
+  const expected = process.env.FORM_WEBHOOK_SECRET;
+  if (!expected) throw new Error("Missing env FORM_WEBHOOK_SECRET");
+  if (!got || got !== expected) {
+    const err = new Error("Unauthorized: bad x-form-secret");
+    err.statusCode = 401;
+    throw err;
+  }
+}
+
+// TODO: adjust these to match your exact Google Form question titles
+function mapAnswers(answers = {}) {
+  return {
+    business_name: answers["Business Name"] || answers["Business name"] || null,
+    owner_mobile: answers["Owner Mobile Number"] || null,
+    business_phone: answers["Business Phone Number"] || null,
+    service_offered: answers["Service Offered"] || null,
+    email: answers["Google Calendar Email"] || answers["Email"] || null,
+    business_hours: answers["Business Hours"] || null,
+    timezone: answers["Time zone"] || answers["Time zone "] || answers["Time zone"] || null,
+    notes: answers["Anything else we should know"] || null,
+  };
+}
+
+async function tryProvisionByEmail(email) {
+  if (!email) return;
+
+  // Fetch account
+  const { data: acct, error } = await supabase
+    .from("tradie_accounts")
+    .select("*")
+    .eq("email", email)
+    .maybeSingle();
+
+  if (error) throw error;
+  if (!acct) return;
+
+  // We only provision when BOTH form + stripe are present
+  const hasForm =
+    acct.owner_mobile && acct.business_phone && acct.business_name && acct.timezone;
+  const hasStripe = acct.stripe_subscription_id && acct.stripe_customer_id;
+
+  if (!hasForm || !hasStripe) return; // still waiting for the other side
+
+  // Already provisioned?
+  if (acct.twilio_number && acct.status === "active") return;
+
+  // 1) Buy Twilio number if missing
+  let twilioNumber = acct.twilio_number;
+  if (!twilioNumber) {
+    const client = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
+
+    // AU example using your env vars
+    const country = process.env.TWILIO_BUY_COUNTRY || "AU";
+    const areaCode = process.env.TWILIO_BUY_AREA_CODE || "2";
+
+    const search = await client.availablePhoneNumbers(country).local.list({
+      areaCode,
+      smsEnabled: true,
+      voiceEnabled: true,
+      limit: 1,
+    });
+
+    if (!search.length) throw new Error(`No Twilio numbers available for ${country} area ${areaCode}`);
+
+    const purchased = await client.incomingPhoneNumbers.create({
+      phoneNumber: search[0].phoneNumber,
+      friendlyName: `MM AI Receptionist - ${email}`,
+    });
+
+    twilioNumber = purchased.phoneNumber;
+  }
+
+  // 2) Write tradie_config (example – adjust fields to your schema)
+  await supabase.from("tradie_config").upsert(
+    {
+      id: acct.tradie_key, // or another key depending on your schema
+      twilio_to: twilioNumber,
+      owner_sms_to: acct.owner_mobile,
+      sms_from: twilioNumber,
+      timezone: acct.timezone,
+    },
+    { onConflict: "id" }
+  );
+
+  // 3) Mark account active + save twilio number
+  await supabase
+    .from("tradie_accounts")
+    .update({ twilio_number: twilioNumber, status: "active" })
+    .eq("email", email);
+
+  // 4) Optional: SMS you that it’s done
+  if (process.env.OWNER_SMS_TO) {
+    const client = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
+    await client.messages.create({
+      to: process.env.OWNER_SMS_TO,
+      from: twilioNumber,
+      body: `✅ New MM AI Receptionist onboarded: ${acct.business_name} (${email})`,
+    });
+  }
+}
+
+// --- route ---
+app.post("/form/submit", async (req, res) => {
+  try {
+    requireSecret(req);
+
+    const payload = req.body || {};
+    const answers = payload.answers || {};
+    const mapped = mapAnswers(answers);
+
+    if (!mapped.email) {
+      return res.status(400).json({ ok: false, error: "Missing email in form answers" });
+    }
+
+    // Upsert into tradie_accounts (form side)
+    // IMPORTANT: ensure you have a unique constraint on email in tradie_accounts OR use .eq update flow
+    const { error: upsertErr } = await supabase.from("tradie_accounts").upsert(
+      {
+        email: mapped.email,
+        business_name: mapped.business_name,
+        owner_mobile: mapped.owner_mobile,
+        business_phone: mapped.business_phone,
+        status: "pending", // will become active after provision
+      },
+      { onConflict: "email" }
+    );
+
+    if (upsertErr) throw upsertErr;
+
+    // Also keep your queue record if you want
+    await supabase.from("pending_confirmations").insert({
+      email: mapped.email,
+      trade_key: mapped.business_phone, // or your own
+      plan: null, // plan comes from Stripe side
+    });
+
+    // Attempt provisioning now (only succeeds if Stripe side already landed)
+    await tryProvisionByEmail(mapped.email);
+
+    res.json({ ok: true });
+  } catch (e) {
+    const status = e.statusCode || 500;
+    res.status(status).json({ ok: false, error: e.message || "Server error" });
+  }
+});
