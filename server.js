@@ -100,6 +100,9 @@ const SUPABASE_PREFS_TABLE = process.env.SUPABASE_TABLE || "customer_prefs";
 const SUPABASE_PENDING_TABLE = process.env.SUPABASE_PENDING_TABLE || "pending_confirmations";
 const SUPABASE_METRICS_TABLE = process.env.SUPABASE_METRICS_TABLE || "metrics_daily";
 const SUPABASE_QUOTES_TABLE = process.env.SUPABASE_QUOTES_TABLE || "quote_leads";
+const supabase = (SUPABASE_URL && SUPABASE_SERVICE_KEY)
+  ? createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+  : null;
 
 function supaReady() {
   return !!(SUPABASE_URL && SUPABASE_SERVICE_KEY);
@@ -156,6 +159,35 @@ async function delWhere(table, query) {
   } catch {
     return false;
   }
+}
+
+async function updateTradieSubscriptionByCustomerId(customerId, updates = {}) {
+  if (!supabase || !customerId) return false;
+
+  const payload = { updated_at: new Date().toISOString() };
+  for (const [key, value] of Object.entries(updates)) {
+    if (value !== undefined) payload[key] = value;
+  }
+
+  const { error } = await supabase
+    .from(SUPABASE_TRADIES_TABLE)
+    .update(payload)
+    .eq("stripe_customer_id", customerId);
+
+  if (error) {
+    console.error("subscription status update error", error);
+    return false;
+  }
+
+  return true;
+}
+
+function mapSubscriptionStatusFromStripe(stripeStatus = "") {
+  const status = String(stripeStatus || "").toLowerCase();
+  if (["active", "trialing"].includes(status)) return "ACTIVE";
+  if (["past_due", "unpaid", "incomplete", "incomplete_expired"].includes(status)) return "PAST_DUE";
+  if (["canceled"].includes(status)) return "CANCELLED";
+  return "ACTIVE";
 }
 
 // ----------------------------------------------------------------------------
@@ -796,21 +828,39 @@ app.post("/stripe/webhook", express.raw({ type: "application/json" }), async (re
       }
     }
 
-    if (event.type === "customer.subscription.deleted") {
-      const sub = event.data.object;
-      const customerId = sub?.customer;
+    const stripeObj = event.data.object;
+    const customerId = String(stripeObj?.customer || "").trim();
 
-      if (customerId && supaReady()) {
-        const row = await getOne(SUPABASE_TRADIES_TABLE, `stripe_customer_id=eq.${encodeURIComponent(customerId)}&select=tradie_key`);
-        if (row?.tradie_key) {
-          await upsertRow(SUPABASE_TRADIES_TABLE, {
-            tradie_key: row.tradie_key,
-            status: "PAST_DUE_OR_CANCELLED",
-            updated_at: new Date().toISOString()
-          });
-          cacheSet(`tid:${row.tradie_key}`, { tradie_key: row.tradie_key, status: "PAST_DUE_OR_CANCELLED" });
-        }
-      }
+    if (customerId && event.type === "customer.subscription.created") {
+      await updateTradieSubscriptionByCustomerId(customerId, {
+        subscription_status: "ACTIVE",
+        stripe_subscription_id: String(stripeObj?.id || "").trim() || undefined,
+        status: "ACTIVE"
+      });
+    }
+
+    if (customerId && event.type === "customer.subscription.updated") {
+      await updateTradieSubscriptionByCustomerId(customerId, {
+        subscription_status: mapSubscriptionStatusFromStripe(stripeObj?.status),
+        stripe_subscription_id: String(stripeObj?.id || "").trim() || undefined,
+        status: mapSubscriptionStatusFromStripe(stripeObj?.status)
+      });
+    }
+
+    if (customerId && event.type === "customer.subscription.deleted") {
+      await updateTradieSubscriptionByCustomerId(customerId, {
+        subscription_status: "CANCELLED",
+        stripe_subscription_id: String(stripeObj?.id || "").trim() || undefined,
+        status: "CANCELLED"
+      });
+    }
+
+    if (customerId && event.type === "invoice.payment_failed") {
+      await updateTradieSubscriptionByCustomerId(customerId, {
+        subscription_status: "PAST_DUE",
+        stripe_subscription_id: String(stripeObj?.subscription || "").trim() || undefined,
+        status: "PAST_DUE"
+      });
     }
 
     return res.json({ received: true });
@@ -2227,8 +2277,7 @@ const business_hours = pick("Business Hours", "Hours");
 const timezone = pick("Time zone", "Timezone", "time zone") || "Australia/Sydney";
 const notes = pick("Anything else we should know", "Notes", "Anything else");
 
-const { createClient } = require("@supabase/supabase-js");
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
+if (!supabase) return res.status(500).send("Supabase not configured");
 
 const leadRow = {
 created_at: new Date().toISOString(),
