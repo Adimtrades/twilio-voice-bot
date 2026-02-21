@@ -196,6 +196,14 @@ function mapStripeStatusToLocalStatus(stripeStatus = "") {
   return mapSubscriptionStatusFromStripe(stripeStatus);
 }
 
+function mapWebhookStatus(stripeStatus = "") {
+  const status = String(stripeStatus || "").toLowerCase();
+  if (["active", "trialing"].includes(status)) return "active";
+  if (["past_due", "unpaid", "incomplete", "incomplete_expired"].includes(status)) return "past_due";
+  if (["canceled"].includes(status)) return "cancelled";
+  return "active";
+}
+
 // ----------------------------------------------------------------------------
 // Multi-tenant source of truth: Supabase tradies, fallback TRADIES_JSON
 // ----------------------------------------------------------------------------
@@ -227,6 +235,7 @@ function cacheSet(k, data) {
 
 async function loadTradieRow(req) {
   const tid = String(req.query?.tid || req.body?.tid || "").trim();
+  const tradieId = String(req.query?.tradie_id || req.body?.tradie_id || "").trim();
   const to = String(req.body?.To || req.query?.To || "").trim();
 
   if (supaReady()) {
@@ -242,13 +251,25 @@ async function loadTradieRow(req) {
       return row;
     }
 
+    if (tradieId) {
+      const k = `id:${tradieId}`;
+      const cached = cacheGet(k);
+      if (cached) return cached;
+      const row = await getOne(
+        SUPABASE_TRADIES_TABLE,
+        `id=eq.${encodeURIComponent(tradieId)}&select=*`
+      );
+      if (row) cacheSet(k, row);
+      return row;
+    }
+
     if (to) {
       const k = `to:${to}`;
       const cached = cacheGet(k);
       if (cached) return cached;
       const row = await getOne(
         SUPABASE_TRADIES_TABLE,
-        `twilio_number=eq.${encodeURIComponent(to)}&select=*`
+        `or=(twilio_number.eq.${encodeURIComponent(to)},twilio_phone_number.eq.${encodeURIComponent(to)})&select=*`
       );
       if (row) cacheSet(k, row);
       return row;
@@ -256,7 +277,7 @@ async function loadTradieRow(req) {
   }
 
   // Fallback
-  const key = (tid || to || "default").trim();
+  const key = (tid || tradieId || to || "default").trim();
   const fallback = TRADIES_FALLBACK[key] || TRADIES_FALLBACK.default || null;
   if (!fallback) return null;
   return { tradie_key: key, ...fallback, _fallback: true };
@@ -285,7 +306,7 @@ function normalizeTradieConfig(row) {
   const tone = String(t.tone || process.env.BOT_TONE || "friendly"); // friendly | direct
   const services = String(t.services || process.env.BOT_SERVICES || "");
 
-  const twilioNumber = String(t.twilio_number || t.twilioNumber || "");
+  const twilioNumber = String(t.twilio_phone_number || t.twilio_number || t.twilioNumber || "");
   const smsFrom = twilioNumber || String(t.smsFrom || process.env.TWILIO_SMS_FROM || "");
 
   return {
@@ -504,12 +525,41 @@ function getSmtpTransporter() {
 }
 
 async function sendTradieEmail(to, subject, text) {
-  const transporter = getSmtpTransporter();
   const from = String(process.env.FROM_EMAIL || "").trim();
-  if (!transporter || !from || !to) {
+  if (!from || !to) {
+    console.warn("Email skipped: sender/recipient missing", { to: to || "" });
+    return false;
+  }
+
+  const sendgridApiKey = String(process.env.SENDGRID_API_KEY || "").trim();
+  if (sendgridApiKey) {
+    const resp = await fetch("https://api.sendgrid.com/v3/mail/send", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${sendgridApiKey}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        personalizations: [{ to: [{ email: to }] }],
+        from: { email: from },
+        subject,
+        content: [{ type: "text/plain", value: text }]
+      })
+    });
+
+    if (!resp.ok) {
+      const errBody = await resp.text().catch(() => "");
+      throw new Error(`SendGrid send failed: ${resp.status} ${errBody}`);
+    }
+    return true;
+  }
+
+  const transporter = getSmtpTransporter();
+  if (!transporter) {
     console.warn("Email skipped: SMTP not configured", { to: to || "" });
     return false;
   }
+
   await transporter.sendMail({ from, to, subject, text });
   return true;
 }
@@ -531,6 +581,70 @@ async function sendCustomerSms(tradie, toCustomer, body) {
 
 const TWILIO_BUY_COUNTRY = (process.env.TWILIO_BUY_COUNTRY || "AU").trim();
 const TWILIO_BUY_AREA_CODE = String(process.env.TWILIO_BUY_AREA_CODE || "").trim();
+
+function planFromPriceId(priceId = "") {
+  if (priceId === STRIPE_PRICE_PRO) return "PRO";
+  if (priceId === STRIPE_PRICE_BASIC) return "BASIC";
+  return "UNKNOWN";
+}
+
+async function ensureTradieByStripeCustomer({ customerId, subscriptionId, plan, email }) {
+  if (!supaReady() || !supabase || !customerId) return null;
+
+  console.log("stripe provisioning step: lookup tradie", { customerId, subscriptionId: subscriptionId || "" });
+  let tradie = await getTradieByStripeRefs({ customerId, subscriptionId });
+  if (tradie?.id) return tradie;
+
+  const generatedKey = `t_${String(customerId).replace(/[^a-zA-Z0-9]/g, "").slice(-10)}`;
+  const payload = {
+    tradie_key: generatedKey,
+    email: email || "",
+    stripe_customer_id: customerId,
+    stripe_subscription_id: subscriptionId || null,
+    plan: plan || "UNKNOWN",
+    status: "active",
+    subscription_status: "active",
+    updated_at: new Date().toISOString()
+  };
+
+  console.log("stripe provisioning step: create tradie", { customerId, tradie_key: generatedKey });
+  const { data, error } = await supabase
+    .from(SUPABASE_TRADIES_TABLE)
+    .upsert(payload, { onConflict: "stripe_customer_id" })
+    .select("*")
+    .single();
+
+  if (error) {
+    console.error("stripe provisioning step: create tradie failed", error);
+    return null;
+  }
+  return data;
+}
+
+async function getOrCreateTradieForStripeEvent({ customerId, subscriptionId, plan, email }) {
+  const tradie = await ensureTradieByStripeCustomer({ customerId, subscriptionId, plan, email });
+  if (!tradie?.id) {
+    console.error("stripe provisioning step: tradie not found/created", { customerId, subscriptionId: subscriptionId || "" });
+    return null;
+  }
+  return tradie;
+}
+
+async function ensureTwilioNumberProvisionedForTradie(tradie, reqForBaseUrl) {
+  if (!tradie?.id) return null;
+  if (tradie.twilio_phone_number || tradie.twilio_number) {
+    console.log("stripe provisioning step: existing twilio number found", {
+      tradie_id: tradie.id,
+      phone: tradie.twilio_phone_number || tradie.twilio_number
+    });
+    return {
+      skipped: true,
+      phoneNumber: tradie.twilio_phone_number || tradie.twilio_number,
+      sid: tradie.twilio_phone_sid || tradie.twilio_incoming_sid || ""
+    };
+  }
+  return provisionTwilioNumberForTradie(tradie, reqForBaseUrl);
+}
 
 async function getTradieByStripeRefs({ customerId, subscriptionId } = {}) {
   if (!supaReady() || !supabase) return null;
@@ -572,13 +686,13 @@ async function provisionTwilioNumberForTradie(tradie, reqForBaseUrl) {
   if (!tradieId) throw new Error("Cannot provision: missing tradie id");
 
   const existingProvisioning = await getTradieProvisioningRecord(tradieId);
-  if (tradie?.twilio_number || existingProvisioning?.twilio_phone_number || existingProvisioning?.provisioning_status === "PROVISIONED") {
+  if (tradie?.twilio_phone_number || tradie?.twilio_number || existingProvisioning?.twilio_phone_number || existingProvisioning?.provisioning_status === "PROVISIONED") {
     console.log("twilio provisioning skipped: already provisioned", { tradie_id: tradieId, stripe_customer_id: tradie?.stripe_customer_id || "" });
     return {
       skipped: true,
-      phoneNumber: existingProvisioning.twilio_phone_number,
-      sid: existingProvisioning.twilio_incoming_sid,
-      subaccountSid: existingProvisioning.twilio_subaccount_sid || ""
+      phoneNumber: tradie?.twilio_phone_number || tradie?.twilio_number || existingProvisioning?.twilio_phone_number,
+      sid: tradie?.twilio_phone_sid || tradie?.twilio_incoming_sid || existingProvisioning?.twilio_incoming_sid || "",
+      subaccountSid: existingProvisioning?.twilio_subaccount_sid || ""
     };
   }
 
@@ -601,7 +715,8 @@ async function provisionTwilioNumberForTradie(tradie, reqForBaseUrl) {
   }
 
   const baseUrl = getBaseUrl(reqForBaseUrl || { headers: {} });
-  const voiceUrl = `${baseUrl}/twilio/voice`;
+  const voiceUrl = `${baseUrl}/voice/inbound?tradie_id=${encodeURIComponent(tradieId)}`;
+  const statusCallback = `${baseUrl}/twilio/status`;
   const smsRouteAvailable = true;
   const smsUrl = `${baseUrl}/twilio/sms`;
 
@@ -619,7 +734,9 @@ async function provisionTwilioNumberForTradie(tradie, reqForBaseUrl) {
   const buyParams = {
     phoneNumber: choice.phoneNumber,
     voiceUrl,
-    voiceMethod: "POST"
+    voiceMethod: "POST",
+    statusCallback,
+    statusCallbackMethod: "POST"
   };
   if (smsRouteAvailable) {
     buyParams.smsUrl = smsUrl;
@@ -641,6 +758,8 @@ async function provisionTwilioNumberForTradie(tradie, reqForBaseUrl) {
 
     await supabase.from(SUPABASE_TRADIES_TABLE)
       .update({
+        twilio_phone_number: purchased.phoneNumber,
+        twilio_phone_sid: purchased.sid,
         twilio_number: purchased.phoneNumber,
         twilio_incoming_sid: purchased.sid,
         updated_at: new Date().toISOString()
@@ -926,7 +1045,7 @@ async function ensureProvisioningForActiveSubscription({ customerId, subscriptio
   if (!tradie?.id) return;
 
   const existingProvisioning = await getTradieProvisioningRecord(tradie.id);
-  if (tradie?.twilio_number || existingProvisioning?.twilio_phone_number || existingProvisioning?.provisioning_status === "PROVISIONED") {
+  if (tradie?.twilio_phone_number || tradie?.twilio_number || existingProvisioning?.twilio_phone_number || existingProvisioning?.provisioning_status === "PROVISIONED") {
     console.log("twilio provisioning skipped", { tradie_id: tradie.id, stripe_customer_id: customerId || "" });
     return;
   }
@@ -935,22 +1054,24 @@ async function ensureProvisioningForActiveSubscription({ customerId, subscriptio
     const provisioned = await provisionTwilioNumberForTradie(tradie, reqForBaseUrl);
     if (provisioned?.skipped) return;
 
+    const baseUrl = getBaseUrl(reqForBaseUrl || { headers: {} });
+    const setupLink = `${baseUrl}/onboarding?tradie_id=${encodeURIComponent(tradie.id)}`;
     const successText =
 `Hi ${tradie.business_name || "there"},
 
-Great news — your subscription is now active and your AI Receptionist is live.
+Your AI receptionist is active.
 
-Your new phone number: ${provisioned.phoneNumber}
+Your new Twilio number: ${provisioned.phoneNumber}
 
 What happens next:
-• Calls to this number will now reach your AI receptionist.
-• Forward your existing business number to ${provisioned.phoneNumber} with your current telco.
-• Setup changes usually take effect within 5–30 minutes after forwarding is enabled.
-• Need help? Reply to this email and our support team will guide you.
+• Call ${provisioned.phoneNumber} from your mobile to run a quick live test.
+• Forward your current business line to this number with your telco.
+• Finish setup here: ${setupLink}
+• If anything looks off, reply to this email and we'll help.
 
 Thanks for choosing us.`;
 
-    await sendTradieEmail(tradie.email, "Your AI Receptionist is now active", successText).catch(() => {});
+    await sendTradieEmail(tradie.email, "Your AI receptionist is active", successText).catch(() => {});
   } catch (err) {
     await markProvisioningFailure(tradie, err?.message || err);
   }
@@ -958,6 +1079,56 @@ Thanks for choosing us.`;
 
 // Stripe webhook (RAW)
 // IMPORTANT: must be raw JSON or signature breaks
+async function syncActiveSubscriptionAndProvision({ customerId, subscriptionId, plan, email, reqForBaseUrl, sourceEvent }) {
+  if (!customerId) return;
+
+  console.log("stripe provisioning step: begin", { sourceEvent, customerId, subscriptionId: subscriptionId || "", plan: plan || "UNKNOWN" });
+  const tradie = await getOrCreateTradieForStripeEvent({ customerId, subscriptionId, plan, email });
+  if (!tradie?.id) return;
+
+  const finalPlan = plan || tradie.plan || "UNKNOWN";
+  await supabase
+    .from(SUPABASE_TRADIES_TABLE)
+    .update({
+      status: "active",
+      subscription_status: "active",
+      stripe_subscription_id: subscriptionId || tradie.stripe_subscription_id || null,
+      plan: finalPlan,
+      updated_at: new Date().toISOString()
+    })
+    .eq("id", tradie.id);
+  console.log("stripe provisioning step: tradie marked active", { tradie_id: tradie.id, plan: finalPlan });
+
+  const refreshedTradie = await getTradieByStripeRefs({ customerId, subscriptionId: subscriptionId || tradie.stripe_subscription_id || "" });
+  const provisioned = await ensureTwilioNumberProvisionedForTradie(refreshedTradie || tradie, reqForBaseUrl);
+  if (!provisioned) return;
+
+  if (provisioned.skipped) {
+    console.log("stripe provisioning step: number already exists, skipping buy", { tradie_id: tradie.id, phone: provisioned.phoneNumber || "" });
+    return;
+  }
+
+  console.log("stripe provisioning step: number provisioned", { tradie_id: tradie.id, phone: provisioned.phoneNumber });
+  const baseUrl = getBaseUrl(reqForBaseUrl || { headers: {} });
+  const setupLink = `${baseUrl}/onboarding?tradie_id=${encodeURIComponent(tradie.id)}`;
+  const text =
+`Hi ${tradie.business_name || "there"},
+
+Your AI receptionist is active.
+
+Your new Twilio number: ${provisioned.phoneNumber}
+
+What happens next:
+• Call ${provisioned.phoneNumber} from your mobile to run a quick live test.
+• Forward your current business line to this number with your telco.
+• Finish setup here: ${setupLink}
+• If anything looks off, reply to this email and we'll help.`;
+
+  await sendTradieEmail(tradie.email || email || "", "Your AI receptionist is active", text).catch((err) => {
+    console.error("stripe provisioning step: confirmation email failed", err?.message || err);
+  });
+}
+
 app.post("/stripe/webhook", express.raw({ type: "application/json" }), async (req, res) => {
   try {
     if (!stripeReady()) return res.status(500).send("Stripe not configured");
@@ -971,98 +1142,90 @@ app.post("/stripe/webhook", express.raw({ type: "application/json" }), async (re
       return res.status(400).send(`Webhook Error: ${err.message}`);
     }
 
+    console.log("stripe webhook received", { eventType: event.type, eventId: event.id });
+    const stripeObj = event.data.object || {};
+
     if (event.type === "checkout.session.completed") {
-      const sess = event.data.object;
-
-      if (sess?.mode === "subscription" && sess?.payment_status === "paid" && supaReady()) {
+      const sess = stripeObj;
+      if (sess?.mode === "subscription") {
+        console.log("stripe webhook step: checkout.session.completed subscription", { sessionId: sess.id, payment_status: sess.payment_status || "" });
         const expanded = await stripe.checkout.sessions.retrieve(sess.id, { expand: ["subscription", "customer"] });
-        const sub = expanded.subscription;
-        const customer = expanded.customer;
+        const subscriptionId = String(expanded?.subscription?.id || expanded?.subscription || "").trim();
+        const customerId = String(expanded?.customer?.id || expanded?.customer || "").trim();
+        const priceId = expanded?.subscription?.items?.data?.[0]?.price?.id || "";
+        const plan = planFromPriceId(priceId);
+        const email = expanded?.customer_details?.email || expanded?.customer_email || "";
 
-        const priceId = sub?.items?.data?.[0]?.price?.id || "";
-        const plan =
-          priceId === STRIPE_PRICE_PRO ? "PRO" :
-          priceId === STRIPE_PRICE_BASIC ? "BASIC" :
-          "UNKNOWN";
-
-        const tradieKey = `t_${String(customer?.id || expanded.customer || "").replace(/[^a-zA-Z0-9]/g, "").slice(-10)}`;
-
-        await upsertRow(SUPABASE_TRADIES_TABLE, {
-          tradie_key: tradieKey,
-          email: expanded.customer_details?.email || "",
+        await syncActiveSubscriptionAndProvision({
+          customerId,
+          subscriptionId,
           plan,
-          status: "PENDING_SETUP",
-          stripe_customer_id: customer?.id || String(expanded.customer || ""),
-          stripe_subscription_id: sub?.id || "",
-          updated_at: new Date().toISOString()
+          email,
+          reqForBaseUrl: req,
+          sourceEvent: event.type
         });
-
-        cacheSet(`tid:${tradieKey}`, { tradie_key: tradieKey });
       }
     }
 
-    const stripeObj = event.data.object;
-    const customerId = String(stripeObj?.customer || "").trim();
-    const subscriptionId = String(stripeObj?.id || stripeObj?.subscription || "").trim();
+    if (event.type === "invoice.payment_succeeded") {
+      const customerId = String(stripeObj?.customer || "").trim();
+      const subscriptionId = String(stripeObj?.subscription || "").trim();
+      console.log("stripe webhook step: invoice.payment_succeeded", { customerId, subscriptionId });
 
-    if (customerId && event.type === "customer.subscription.created") {
-      const localStatus = mapStripeStatusToLocalStatus(stripeObj?.status);
-      await updateTradieSubscriptionByCustomerId(customerId, {
-        subscription_status: localStatus,
-        stripe_subscription_id: String(stripeObj?.id || "").trim() || undefined,
-        status: localStatus
-      });
-      void ensureProvisioningForActiveSubscription({
+      let plan = "UNKNOWN";
+      if (subscriptionId) {
+        const sub = await stripe.subscriptions.retrieve(subscriptionId, { expand: ["items.data.price"] });
+        plan = planFromPriceId(sub?.items?.data?.[0]?.price?.id || "");
+      }
+
+      await syncActiveSubscriptionAndProvision({
         customerId,
         subscriptionId,
-        status: localStatus,
-        reqForBaseUrl: req
+        plan,
+        email: stripeObj?.customer_email || "",
+        reqForBaseUrl: req,
+        sourceEvent: event.type
       });
     }
 
-    if (customerId && event.type === "customer.subscription.updated") {
-      const localStatus = mapStripeStatusToLocalStatus(stripeObj?.status);
-      await updateTradieSubscriptionByCustomerId(customerId, {
-        subscription_status: localStatus,
-        stripe_subscription_id: String(stripeObj?.id || "").trim() || undefined,
-        status: localStatus
-      });
-      void ensureProvisioningForActiveSubscription({
-        customerId,
-        subscriptionId,
-        status: localStatus,
-        reqForBaseUrl: req
-      });
+    if (event.type === "customer.subscription.updated") {
+      const customerId = String(stripeObj?.customer || "").trim();
+      const subscriptionId = String(stripeObj?.id || "").trim();
+      const status = mapWebhookStatus(stripeObj?.status);
+      console.log("stripe webhook step: customer.subscription.updated", { customerId, subscriptionId, status });
+      if (customerId) {
+        await updateTradieSubscriptionByCustomerId(customerId, {
+          subscription_status: status,
+          stripe_subscription_id: subscriptionId || undefined,
+          status
+        });
+      }
     }
 
-    if (customerId && event.type === "customer.subscription.deleted") {
-      await updateTradieSubscriptionByCustomerId(customerId, {
-        subscription_status: "CANCELLED",
-        stripe_subscription_id: String(stripeObj?.id || "").trim() || undefined,
-        status: "CANCELLED"
-      });
+    if (event.type === "customer.subscription.deleted") {
+      const customerId = String(stripeObj?.customer || "").trim();
+      const subscriptionId = String(stripeObj?.id || "").trim();
+      console.log("stripe webhook step: customer.subscription.deleted", { customerId, subscriptionId });
+      if (customerId) {
+        await updateTradieSubscriptionByCustomerId(customerId, {
+          subscription_status: "cancelled",
+          stripe_subscription_id: subscriptionId || undefined,
+          status: "cancelled"
+        });
+      }
     }
 
-    if (customerId && event.type === "invoice.payment_failed") {
-      await updateTradieSubscriptionByCustomerId(customerId, {
-        subscription_status: "PAST_DUE",
-        stripe_subscription_id: String(stripeObj?.subscription || "").trim() || undefined,
-        status: "PAST_DUE"
-      });
-    }
-
-    if (customerId && event.type === "invoice.payment_succeeded") {
-      await updateTradieSubscriptionByCustomerId(customerId, {
-        subscription_status: "ACTIVE",
-        stripe_subscription_id: String(stripeObj?.subscription || "").trim() || undefined,
-        status: "ACTIVE"
-      });
-      void ensureProvisioningForActiveSubscription({
-        customerId,
-        subscriptionId,
-        status: "ACTIVE",
-        reqForBaseUrl: req
-      });
+    if (event.type === "invoice.payment_failed") {
+      const customerId = String(stripeObj?.customer || "").trim();
+      const subscriptionId = String(stripeObj?.subscription || "").trim();
+      console.log("stripe webhook step: invoice.payment_failed", { customerId, subscriptionId });
+      if (customerId) {
+        await updateTradieSubscriptionByCustomerId(customerId, {
+          subscription_status: "past_due",
+          stripe_subscription_id: subscriptionId || undefined,
+          status: "past_due"
+        });
+      }
     }
 
     return res.json({ received: true });
@@ -2445,6 +2608,20 @@ app.post("/sms", async (req, res) => {
 
 app.post("/twilio/voice", (req, res) => {
   return res.redirect(307, "/voice");
+});
+
+app.post("/voice/inbound", (req, res) => {
+  return res.redirect(307, "/voice");
+});
+
+app.post("/twilio/status", (req, res) => {
+  console.log("twilio status callback", {
+    callSid: String(req.body?.CallSid || ""),
+    callStatus: String(req.body?.CallStatus || ""),
+    to: String(req.body?.To || ""),
+    from: String(req.body?.From || "")
+  });
+  return res.status(200).send("ok");
 });
 
 app.post("/twilio/sms", (req, res) => {
