@@ -581,6 +581,8 @@ async function sendCustomerSms(tradie, toCustomer, body) {
 
 const TWILIO_BUY_COUNTRY = (process.env.TWILIO_BUY_COUNTRY || "AU").trim();
 const TWILIO_BUY_AREA_CODE = String(process.env.TWILIO_BUY_AREA_CODE || "").trim();
+const TWILIO_VOICE_URL = "https://twilio-voice-bot-w9gq.onrender.com/twilio/voice";
+const TWILIO_SMS_URL = "https://twilio-voice-bot-w9gq.onrender.com/twilio/sms";
 
 function planFromPriceId(priceId = "") {
   if (priceId === STRIPE_PRICE_PRO) return "PRO";
@@ -698,59 +700,86 @@ async function provisionTwilioNumberForTradie(tradie, reqForBaseUrl) {
 
   console.log("twilio provisioning started", { tradie_id: tradieId, stripe_customer_id: tradie?.stripe_customer_id || "" });
 
-  const masterSid = String(process.env.TWILIO_MASTER_ACCOUNT_SID || "").trim();
-  const masterToken = String(process.env.TWILIO_MASTER_AUTH_TOKEN || "").trim();
-  const canCreateSubaccount = !!(masterSid && masterToken);
-  const baseClient = getTwilioClient(canCreateSubaccount ? { accountSid: masterSid, authToken: masterToken } : {});
-  if (!baseClient) throw new Error("Twilio client not configured");
+  const twilioClient = getTwilioClient();
+  if (!twilioClient) throw new Error("Twilio client not configured");
 
-  let targetClient = baseClient;
-  let subaccountSid = "";
-  if (canCreateSubaccount) {
-    const subaccount = await baseClient.api.v2010.accounts.create({
-      friendlyName: `${tradie.business_name || tradie.email || tradieId}`.slice(0, 64)
+  const tryClaimNumberBySid = async (numberSid, phoneNumber) => {
+    const { data, error } = await supabase
+      .from("twilio_numbers")
+      .update({ assigned_tradie_id: tradieId })
+      .eq("sid", numberSid)
+      .is("assigned_tradie_id", null)
+      .select("sid, phone_number")
+      .maybeSingle();
+
+    if (error) throw error;
+    if (!data?.sid) return null;
+    return { sid: data.sid, phoneNumber: data.phone_number || phoneNumber };
+  };
+
+  let allocated = null;
+
+  const incoming = await twilioClient.incomingPhoneNumbers.list({ limit: 200 });
+  const { data: assignedRows, error: assignedErr } = await supabase
+    .from("twilio_numbers")
+    .select("sid")
+    .not("assigned_tradie_id", "is", null);
+  if (assignedErr) throw assignedErr;
+
+  const assignedSet = new Set((assignedRows || []).map((row) => row.sid).filter(Boolean));
+  const freeIncoming = incoming.filter((num) => !assignedSet.has(num.sid));
+
+  for (const num of freeIncoming) {
+    const { error: upsertErr } = await supabase
+      .from("twilio_numbers")
+      .upsert({ sid: num.sid, phone_number: num.phoneNumber, assigned_tradie_id: null }, { onConflict: "sid" });
+    if (upsertErr) throw upsertErr;
+
+    allocated = await tryClaimNumberBySid(num.sid, num.phoneNumber);
+    if (allocated) break;
+  }
+
+  if (!allocated) {
+    const searchParams = {
+      smsEnabled: true,
+      voiceEnabled: true,
+      limit: 1
+    };
+    if (TWILIO_BUY_AREA_CODE) searchParams.areaCode = TWILIO_BUY_AREA_CODE;
+
+    const list = await twilioClient.availablePhoneNumbers(TWILIO_BUY_COUNTRY).local.list(searchParams);
+    if (!list?.length) throw new Error("No AU numbers available to buy (Twilio search returned 0).");
+
+    const purchased = await twilioClient.incomingPhoneNumbers.create({
+      phoneNumber: list[0].phoneNumber,
+      voiceUrl: TWILIO_VOICE_URL,
+      voiceMethod: "POST",
+      smsUrl: TWILIO_SMS_URL,
+      smsMethod: "POST"
     });
-    subaccountSid = subaccount.sid;
-    targetClient = getTwilioClient({ accountSid: subaccount.sid, authToken: masterToken });
+
+    const { error: insertErr } = await supabase
+      .from("twilio_numbers")
+      .upsert({ sid: purchased.sid, phone_number: purchased.phoneNumber, assigned_tradie_id: null }, { onConflict: "sid" });
+    if (insertErr) throw insertErr;
+
+    allocated = await tryClaimNumberBySid(purchased.sid, purchased.phoneNumber);
+    if (!allocated) throw new Error("Failed to claim purchased Twilio number");
   }
 
-  const baseUrl = getBaseUrl(reqForBaseUrl || { headers: {} });
-  const voiceUrl = `${baseUrl}/voice/inbound?tradie_id=${encodeURIComponent(tradieId)}`;
-  const statusCallback = `${baseUrl}/twilio/status`;
-  const smsRouteAvailable = true;
-  const smsUrl = `${baseUrl}/twilio/sms`;
-
-  const searchParams = {
-    smsEnabled: true,
-    voiceEnabled: true,
-    limit: 10
-  };
-  if (TWILIO_BUY_AREA_CODE) searchParams.areaCode = TWILIO_BUY_AREA_CODE;
-
-  const list = await targetClient.availablePhoneNumbers(TWILIO_BUY_COUNTRY).local.list(searchParams);
-  if (!list?.length) throw new Error("No Twilio numbers available to buy");
-
-  const choice = list[0];
-  const buyParams = {
-    phoneNumber: choice.phoneNumber,
-    voiceUrl,
+  await twilioClient.incomingPhoneNumbers(allocated.sid).update({
+    voiceUrl: TWILIO_VOICE_URL,
     voiceMethod: "POST",
-    statusCallback,
-    statusCallbackMethod: "POST"
-  };
-  if (smsRouteAvailable) {
-    buyParams.smsUrl = smsUrl;
-    buyParams.smsMethod = "POST";
-  }
-
-  const purchased = await targetClient.incomingPhoneNumbers.create(buyParams);
+    smsUrl: TWILIO_SMS_URL,
+    smsMethod: "POST"
+  });
 
   if (supaReady() && supabase) {
     await supabase.from(SUPABASE_TRADIE_ACCOUNTS_TABLE).upsert({
       tradie_id: tradieId,
-      twilio_phone_number: purchased.phoneNumber,
-      twilio_incoming_sid: purchased.sid,
-      twilio_subaccount_sid: subaccountSid || null,
+      twilio_phone_number: allocated.phoneNumber,
+      twilio_incoming_sid: allocated.sid,
+      twilio_subaccount_sid: null,
       provisioning_status: "PROVISIONED",
       provisioned_at: new Date().toISOString(),
       stripe_subscription_id: tradie.stripe_subscription_id || null
@@ -758,21 +787,21 @@ async function provisionTwilioNumberForTradie(tradie, reqForBaseUrl) {
 
     await supabase.from(SUPABASE_TRADIES_TABLE)
       .update({
-        twilio_phone_number: purchased.phoneNumber,
-        twilio_phone_sid: purchased.sid,
-        twilio_number: purchased.phoneNumber,
-        twilio_incoming_sid: purchased.sid,
+        twilio_phone_number: allocated.phoneNumber,
+        twilio_phone_sid: allocated.sid,
+        twilio_number: allocated.phoneNumber,
+        twilio_incoming_sid: allocated.sid,
         updated_at: new Date().toISOString()
       })
       .eq("id", tradieId);
   }
 
   if (tradieKey) {
-    cacheSet(`tid:${tradieKey}`, { tradie_key: tradieKey, twilio_number: purchased.phoneNumber });
+    cacheSet(`tid:${tradieKey}`, { tradie_key: tradieKey, twilio_number: allocated.phoneNumber });
   }
 
   console.log("twilio provisioning success", { tradie_id: tradieId, stripe_customer_id: tradie?.stripe_customer_id || "" });
-  return { skipped: false, phoneNumber: purchased.phoneNumber, sid: purchased.sid, subaccountSid };
+  return { skipped: false, phoneNumber: allocated.phoneNumber, sid: allocated.sid, subaccountSid: "" };
 }
 
 // ----------------------------------------------------------------------------
