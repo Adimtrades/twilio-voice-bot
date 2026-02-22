@@ -1155,6 +1155,77 @@ app.post("/stripe/webhook", express.raw({ type: "application/json" }), async (re
         const priceId = expanded?.subscription?.items?.data?.[0]?.price?.id || "";
         const plan = planFromPriceId(priceId);
         const email = expanded?.customer_details?.email || expanded?.customer_email || "";
+        const tradieKey = `t_${String(customerId).replace(/[^a-zA-Z0-9]/g, "").slice(-10)}`;
+
+        if (supaReady()) {
+          await upsertRow(SUPABASE_TRADIES_TABLE, {
+            tradie_key: tradieKey,
+            email,
+            plan,
+            status: "active",
+            subscription_status: "active",
+            stripe_customer_id: customerId,
+            stripe_subscription_id: subscriptionId,
+            updated_at: new Date().toISOString()
+          });
+          cacheSet(`tid:${tradieKey}`, { tradie_key: tradieKey, stripe_customer_id: customerId });
+        }
+
+        (async () => {
+          try {
+            console.log("AUTO_PROVISION start", tradieKey);
+            const existing = await getOne(
+              SUPABASE_TRADIES_TABLE,
+              `tradie_key=eq.${encodeURIComponent(tradieKey)}&select=*`
+            );
+            if (!existing) return;
+
+            if (existing.twilio_number || existing.twilio_phone_number) {
+              console.log("AUTO_PROVISION already has number", existing.twilio_number || existing.twilio_phone_number);
+            } else {
+              const provisioned = await provisionTwilioNumberForTradie(existing, req);
+              const phoneNumber = provisioned?.phoneNumber || "";
+              if (phoneNumber) {
+                console.log("AUTO_PROVISION provisioned", phoneNumber);
+                await upsertRow(SUPABASE_TRADIES_TABLE, {
+                  tradie_key: tradieKey,
+                  twilio_number: phoneNumber,
+                  twilio_incoming_sid: provisioned?.sid || null,
+                  updated_at: new Date().toISOString()
+                });
+              }
+            }
+
+            const fresh = await getOne(
+              SUPABASE_TRADIES_TABLE,
+              `tradie_key=eq.${encodeURIComponent(tradieKey)}&select=*`
+            );
+            if (!fresh) return;
+            const twilioNumber = String(fresh.twilio_number || fresh.twilio_phone_number || "").trim();
+            if (!twilioNumber) return;
+
+            const tradieCfg = await getTradieConfig({ query: { tid: tradieKey }, body: {} });
+            await sendOwnerSms(
+              tradieCfg,
+              `Your AI receptionist is live ✅\nYour bot number: ${twilioNumber}\nNext: call it for a quick test, then forward your current business line.`
+            ).catch(() => {});
+
+            const baseUrl = process.env.BASE_URL || getBaseUrl(req);
+            const setupLink = `${String(baseUrl).replace(/\/+$/, "")}/onboarding?tradie_key=${encodeURIComponent(tradieKey)}`;
+            const recipient = fresh.email || email;
+            if (recipient) {
+              await sendTradieEmail(
+                recipient,
+                "Your AI receptionist number is ready",
+                `You're all set ✅\n\nYour bot number: ${twilioNumber}\n\nNext steps:\n• Call the number for a quick test\n• Forward your current business line to this number\n• Complete setup here: ${setupLink}`
+              ).catch((err) => {
+                console.error("AUTO_PROVISION failed", err);
+              });
+            }
+          } catch (err) {
+            console.error("AUTO_PROVISION failed", err);
+          }
+        })();
 
         await syncActiveSubscriptionAndProvision({
           customerId,
