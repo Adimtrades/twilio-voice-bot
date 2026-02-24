@@ -84,6 +84,7 @@ const VOICE_GATHER_TIMEOUT_SECONDS = Number(process.env.VOICE_GATHER_TIMEOUT_SEC
 const SESSION_TTL_MS = Number(process.env.VOICE_SESSION_TTL_MS || 30 * 60 * 1000);
 const WEBHOOK_IDEMPOTENCY_TTL_MS = Number(process.env.WEBHOOK_IDEMPOTENCY_TTL_MS || 7000);
 const MIN_SPEECH_CONFIDENCE = Number(process.env.MIN_SPEECH_CONFIDENCE || 0.45);
+const CALENDAR_CHECK_INTERMEDIATE_MS = Number(process.env.CALENDAR_CHECK_INTERMEDIATE_MS || 5000);
 
 // ----------------------------------------------------------------------------
 // Helpers: Base URL
@@ -1748,6 +1749,54 @@ function keepCallAliveForProcessing(req, twiml, message = "One moment while I ch
   twiml.redirect({ method: "POST" }, nextStepUrl);
 }
 
+function beginAsyncCalendarAvailabilityCheck(session, tradie, dt, tz) {
+  if (!session) return;
+  const requestedDtISO = dt.toISO();
+
+  session.calendarCheck = {
+    status: "pending",
+    requestedDtISO,
+    startedAt: Date.now(),
+    retryAttempted: false,
+    announceRetryMessage: false,
+    completedAt: null,
+    slots: [],
+    error: null
+  };
+
+  const runCheck = async (isRetry = false) => {
+    try {
+      const slots = await withTimeout(
+        nextAvailableSlots(tradie, dt, 3),
+        CALENDAR_OP_TIMEOUT_MS,
+        "calendar availability"
+      );
+
+      if (!session.calendarCheck || session.calendarCheck.requestedDtISO !== requestedDtISO) return;
+      session.calendarCheck.status = "complete";
+      session.calendarCheck.slots = slots;
+      session.calendarCheck.completedAt = Date.now();
+      session.calendarCheck.error = null;
+    } catch (err) {
+      if (!session.calendarCheck || session.calendarCheck.requestedDtISO !== requestedDtISO) return;
+      session.calendarCheck.error = err?.message || String(err);
+
+      if (!isRetry) {
+        session.calendarCheck.status = "retrying";
+        session.calendarCheck.retryAttempted = true;
+        session.calendarCheck.announceRetryMessage = true;
+        runCheck(true).catch(() => {});
+        return;
+      }
+
+      session.calendarCheck.status = "failed";
+      session.calendarCheck.completedAt = Date.now();
+    }
+  };
+
+  runCheck(false).catch(() => {});
+}
+
 function normStr(s) {
   return String(s || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
 }
@@ -2734,49 +2783,78 @@ app.post("/process-speech", async (req, res) => {
         if (!dt) dt = DateTime.now().setZone(tz).plus({ minutes: 10 }).startOf("minute");
       }
 
-      // If calendar configured, keep the call alive before heavier checks.
-      if (tradie.calendarId && tradie.googleServiceJson && !session.awaitingCalendarCheck) {
-        session.awaitingCalendarCheck = {
-          requestedAt: Date.now(),
-          dtISO: dt.toISO()
-        };
-        keepCallAliveForProcessing(req, twiml);
-        return res.type("text/xml").send(twiml.toString());
-      }
-
-      // If calendar configured, offer next 3 slots if requested time is busy
       if (tradie.calendarId && tradie.googleServiceJson) {
-        if (session.awaitingCalendarCheck?.dtISO) {
-          dt = DateTime.fromISO(session.awaitingCalendarCheck.dtISO, { zone: tz });
-        }
-        session.awaitingCalendarCheck = null;
-        const slots = await withTimeout(
-          nextAvailableSlots(tradie, dt, 3),
-          CALENDAR_OP_TIMEOUT_MS,
-          "calendar availability"
-        );
+        const existingCheck = session.calendarCheck;
 
-        if (slots.length === 0) {
-          await missedRevenueAlert(tradie, session, "No availability found (14d) — manual scheduling").catch(() => {});
-          twiml.say("Thanks. We’ll call you back shortly to lock in a time.", { voice: "Polly.Amy", language: "en-AU" });
-          resetSession(callSid);
+        if (!existingCheck || !["pending", "retrying"].includes(existingCheck.status)) {
+          beginAsyncCalendarAvailabilityCheck(session, tradie, dt, tz);
+          keepCallAliveForProcessing(req, twiml, "Okay, just a moment while I check that for you.");
           return res.type("text/xml").send(twiml.toString());
         }
 
-        const first = slots[0];
-        const deltaMin = Math.abs(first.diff(dt, "minutes").minutes);
+        if (existingCheck.announceRetryMessage) {
+          existingCheck.announceRetryMessage = false;
+          keepCallAliveForProcessing(req, twiml, "I'm having trouble checking the calendar. Let me try that again.");
+          return res.type("text/xml").send(twiml.toString());
+        }
 
-        // If chosen time isn't close to available, switch to pickSlot
-        if (deltaMin > 5) {
-          session.proposedSlots = slots.map((x) => x.toMillis());
-          session.step = "pickSlot";
-          session.lastPrompt = `We’re booked at that time. I can do: ${slotsVoiceLine(slots, tz)} Say first, second, or third — or tell me another time. (Or press 1, 2, or 3)`;
+        if (["pending", "retrying"].includes(existingCheck.status)) {
+          const elapsedMs = Date.now() - (existingCheck.startedAt || Date.now());
+          if (elapsedMs > CALENDAR_CHECK_INTERMEDIATE_MS) {
+            keepCallAliveForProcessing(req, twiml, "Still checking availability — thanks for your patience.");
+            return res.type("text/xml").send(twiml.toString());
+          }
+          keepCallAliveForProcessing(req, twiml, "Okay, just a moment while I check that for you.");
+          return res.type("text/xml").send(twiml.toString());
+        }
+
+        if (existingCheck.status === "failed") {
+          session.calendarCheck = null;
+          session.bookedStartMs = null;
+          session.lastStepBeforeFallback = "time";
+          session.promptBeforeFallback = "Would you like another time?";
+          session.step = "sms_fallback_offer";
+          session.lastPrompt = "I’m still having trouble checking the calendar. I can send an SMS to confirm availability, or you can try another time now. Would you like that text?";
           addToHistory(session, "assistant", session.lastPrompt);
-          ask(twiml, session.lastPrompt, actionUrl);
+          ask(twiml, session.lastPrompt, actionUrl, { input: "speech", timeout: 7, speechTimeout: "auto" });
           return res.type("text/xml").send(twiml.toString());
         }
 
-        dt = first;
+        if (existingCheck.status === "complete") {
+          const requestedDt = DateTime.fromISO(existingCheck.requestedDtISO, { zone: tz });
+          const slots = Array.isArray(existingCheck.slots) ? existingCheck.slots : [];
+          session.calendarCheck = null;
+
+          if (slots.length === 0) {
+            await missedRevenueAlert(tradie, session, "No availability found (14d) — manual scheduling").catch(() => {});
+            session.bookedStartMs = null;
+            session.lastPrompt = "That time is unavailable. Would you like another time?";
+            addToHistory(session, "assistant", session.lastPrompt);
+            ask(twiml, session.lastPrompt, actionUrl);
+            return res.type("text/xml").send(twiml.toString());
+          }
+
+          const first = slots[0];
+          const deltaMin = Math.abs(first.diff(requestedDt, "minutes").minutes);
+
+          if (deltaMin > 5) {
+            session.bookedStartMs = null;
+            session.step = "time";
+            session.lastPrompt = "That time is unavailable. Would you like another time?";
+            addToHistory(session, "assistant", session.lastPrompt);
+            ask(twiml, session.lastPrompt, actionUrl);
+            return res.type("text/xml").send(twiml.toString());
+          }
+
+          dt = first;
+          session.bookedStartMs = dt.toMillis();
+          session.step = "confirm";
+          const whenTextAvailable = dt.setZone(tz).toFormat("cccc 'at' h:mm a");
+          session.lastPrompt = `Good news — ${whenTextAvailable} is available. Would you like me to book it?`;
+          addToHistory(session, "assistant", session.lastPrompt);
+          ask(twiml, session.lastPrompt, actionUrl, { input: "speech", timeout: 7, speechTimeout: "auto" });
+          return res.type("text/xml").send(twiml.toString());
+        }
       }
 
       session.bookedStartMs = dt.toMillis();
