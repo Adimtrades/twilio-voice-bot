@@ -162,30 +162,80 @@ async function getMany(table, query) {
 }
 
 async function resolveCalendarIdFromCalledNumber({ supabase, calledNumber }) {
-  const normalizedCalledNumber = String(calledNumber || "").trim();
+  const rawCalledNumber = String(calledNumber || "").trim();
+  const normalizedCalledNumber = rawCalledNumber.startsWith("+")
+    ? `+${rawCalledNumber.slice(1).replace(/\D/g, "")}`
+    : rawCalledNumber.replace(/\D/g, "");
   if (!normalizedCalledNumber) throw new Error("MISSING_CALLED_NUMBER");
 
-  const { data: tw, error: twErr } = await supabase
-    .from("twilio_numbers")
-    .select("tradie_id, phone")
-    .eq("phone", normalizedCalledNumber)
-    .maybeSingle();
+  console.log("TRADE_LOOKUP_START", { calledNumber: normalizedCalledNumber });
 
-  if (twErr) throw new Error(`TWILIO_NUMBER_LOOKUP_FAILED: ${twErr.message}`);
-  if (!tw) throw new Error(`NO_TWILIO_NUMBER_MATCH: ${normalizedCalledNumber}`);
-
-  const { data: tradie, error: trErr } = await supabase
+  const { data: accountByNumber, error: accountByNumberErr } = await supabase
     .from("tradie_accounts")
-    .select("calendar_email")
-    .eq("id", tw.tradie_id)
+    .select("trade_key,calendar_email")
+    .eq("twilio_number", normalizedCalledNumber)
     .maybeSingle();
 
-  if (trErr) throw new Error(`TRADIE_LOOKUP_FAILED: ${trErr.message}`);
-  if (!tradie?.calendar_email) {
-    throw new Error(`MISSING_TRADIE_CALENDAR_EMAIL for tradie_id=${tw.tradie_id}`);
+  if (accountByNumberErr) {
+    throw new Error(`TRADIE_ACCOUNT_LOOKUP_BY_NUMBER_FAILED: ${accountByNumberErr.message}`);
   }
 
-  return tradie.calendar_email;
+  let resolvedTradeKey = String(accountByNumber?.trade_key || "").trim();
+  let resolvedTradeId = null;
+  let resolvedCalendarEmail = String(accountByNumber?.calendar_email || "").trim();
+  let lookupPath = "tradie_accounts.twilio_number";
+
+  if (!resolvedTradeKey) {
+    const { data: twilioNumberRow, error: twilioNumberErr } = await supabase
+      .from("twilio_numbers")
+      .select("phone,trade_id")
+      .eq("phone", normalizedCalledNumber)
+      .maybeSingle();
+
+    if (twilioNumberErr) throw new Error(`TWILIO_NUMBER_LOOKUP_FAILED: ${twilioNumberErr.message}`);
+    if (!twilioNumberRow?.trade_id) {
+      throw new Error(`NO_CALLED_NUMBER_MATCH: ${normalizedCalledNumber}`);
+    }
+
+    resolvedTradeId = String(twilioNumberRow.trade_id).trim();
+
+    const { data: tradieRow, error: tradieErr } = await supabase
+      .from("tradies")
+      .select("id,trade_key")
+      .eq("id", resolvedTradeId)
+      .maybeSingle();
+
+    if (tradieErr) throw new Error(`TRADIE_LOOKUP_FAILED: ${tradieErr.message}`);
+
+    resolvedTradeKey = String(tradieRow?.trade_key || "").trim();
+    resolvedTradeId = String(tradieRow?.id || resolvedTradeId).trim() || null;
+    lookupPath = "twilio_numbers.phone->tradies.id";
+
+    if (resolvedTradeKey) {
+      const { data: accountByTradeKey, error: accountByTradeKeyErr } = await supabase
+        .from("tradie_accounts")
+        .select("calendar_email")
+        .eq("trade_key", resolvedTradeKey)
+        .maybeSingle();
+      if (accountByTradeKeyErr) {
+        throw new Error(`TRADIE_ACCOUNT_LOOKUP_BY_TRADE_KEY_FAILED: ${accountByTradeKeyErr.message}`);
+      }
+      resolvedCalendarEmail = String(accountByTradeKey?.calendar_email || "").trim();
+    }
+  }
+
+  console.log("TRADE_LOOKUP_RESOLVED", {
+    calledNumber: normalizedCalledNumber,
+    lookupPath,
+    trade_key: resolvedTradeKey || null,
+    trade_id: resolvedTradeId || null
+  });
+
+  if (!resolvedCalendarEmail) {
+    throw new Error(`MISSING_TRADIE_CALENDAR_EMAIL for trade_key=${resolvedTradeKey || "unknown"} trade_id=${resolvedTradeId || "unknown"}`);
+  }
+
+  return resolvedCalendarEmail;
 }
 async function delWhere(table, query) {
   if (!supaReady()) return false;
