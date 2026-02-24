@@ -81,6 +81,9 @@ const MessagingResponse = twilio.twiml.MessagingResponse;
 const MAX_NO_SPEECH_RETRIES = Number(process.env.MAX_NO_SPEECH_RETRIES || 2);
 const CALENDAR_OP_TIMEOUT_MS = Number(process.env.CALENDAR_OP_TIMEOUT_MS || 8000);
 const VOICE_GATHER_TIMEOUT_SECONDS = Number(process.env.VOICE_GATHER_TIMEOUT_SECONDS || 6);
+const SESSION_TTL_MS = Number(process.env.VOICE_SESSION_TTL_MS || 30 * 60 * 1000);
+const WEBHOOK_IDEMPOTENCY_TTL_MS = Number(process.env.WEBHOOK_IDEMPOTENCY_TTL_MS || 7000);
+const MIN_SPEECH_CONFIDENCE = Number(process.env.MIN_SPEECH_CONFIDENCE || 0.45);
 
 // ----------------------------------------------------------------------------
 // Helpers: Base URL
@@ -1522,8 +1525,20 @@ app.get("/admin/metrics", async (req, res) => {
 // Conversation / session store (in-memory)
 // ----------------------------------------------------------------------------
 const sessions = new Map();
+const processSpeechLocks = new Map();
+
+function cleanupMaps() {
+  const now = Date.now();
+  for (const [sid, data] of sessions.entries()) {
+    if (!data?.updatedAt || (now - data.updatedAt) > SESSION_TTL_MS) sessions.delete(sid);
+  }
+  for (const [key, exp] of processSpeechLocks.entries()) {
+    if (!exp || now > exp) processSpeechLocks.delete(key);
+  }
+}
 
 function getSession(callSid, fromNumber = "") {
+  cleanupMaps();
   if (!sessions.has(callSid)) {
     sessions.set(callSid, {
       step: "intent",
@@ -1561,11 +1576,27 @@ function getSession(callSid, fromNumber = "") {
     });
   } else {
     const s = sessions.get(callSid);
-    if (!s.from && fromNumber) s.from = fromNumber;
+      if (!s.from && fromNumber) s.from = fromNumber;
   }
+  const active = sessions.get(callSid);
+  active.updatedAt = Date.now();
   return sessions.get(callSid);
 }
 function resetSession(callSid) { sessions.delete(callSid); }
+
+
+// idempotency lock: suppress duplicate CallSid+step webhook processing within short TTL
+function acquireProcessSpeechLock(callSid, step) {
+  cleanupMaps();
+  const key = `${callSid}:${step}`;
+  if (processSpeechLocks.has(key)) return false;
+  processSpeechLocks.set(key, Date.now() + WEBHOOK_IDEMPOTENCY_TTL_MS);
+  return true;
+}
+
+function isLowConfidence(confidence) {
+  return typeof confidence === "number" && confidence > 0 && confidence < MIN_SPEECH_CONFIDENCE;
+}
 
 function addToHistory(session, role, content) {
   if (!session) return;
@@ -1612,7 +1643,8 @@ function buildInitialVoiceTwiml(req, greetingText = "Hi. What would you like hel
     timeout: VOICE_GATHER_TIMEOUT_SECONDS,
     speechTimeout: "auto",
     action: voiceActionUrl(req),
-    method: "POST"
+    method: "POST",
+    language: "en-AU"
   });
   gather.say(greetingText, { voice: "Polly.Amy", language: "en-AU" });
   return twiml;
@@ -1634,13 +1666,11 @@ function handleVoiceEntry(req, res) {
 
 function ask(twiml, prompt, actionUrl, options = {}) {
   const gather = twiml.gather({
-    input: "speech dtmf",
+    input: "speech",
     speechTimeout: "auto",
-    speechModel: "phone_call",
-    enhanced: true,
     action: actionUrl,
     method: "POST",
-    profanityFilter: false,
+    language: "en-AU",
     timeout: VOICE_GATHER_TIMEOUT_SECONDS,
     ...options
   });
@@ -1674,29 +1704,29 @@ function incrementRetryCountForStep(session, step) {
 function repeatLastStepPrompt(req, twiml, session, step, reason = "NO_SPEECH") {
   const retryCount = incrementRetryCountForStep(session, step);
   const actionUrl = voiceActionUrl(req);
+  const basePrompt = session.lastPrompt || "Could you repeat that?";
 
   if (retryCount <= MAX_NO_SPEECH_RETRIES) {
-    const repeatPrompt = session.lastPrompt || "Sorry, I didn’t catch that. Could you repeat that?";
-    const prompt = `Sorry, I didn’t catch that. ${repeatPrompt}`;
-    session.lastPrompt = repeatPrompt;
+    const prompt = `No worries — take your time. ${basePrompt}`;
+    session.lastPrompt = basePrompt;
     console.log(`STEP=${step} speech='' interpreted='${reason}' retryCount=${retryCount}`);
-    ask(twiml, prompt, actionUrl, { input: step === "confirm" ? "speech" : "speech dtmf", timeout: 7, speechTimeout: "auto" });
+    ask(twiml, prompt, actionUrl, { input: "speech", timeout: 6, speechTimeout: "auto" });
     return { handled: true };
   }
 
   if (retryCount === MAX_NO_SPEECH_RETRIES + 1) {
     session.lastStepBeforeFallback = step;
+    session.promptBeforeFallback = basePrompt;
     session.step = "sms_fallback_offer";
-    session.lastPrompt = "No worries. Would you like me to text you a link to finish this booking? Please say yes or no.";
+    session.lastPrompt = "I didn’t catch that. You can say it again, or say ‘text me’ and I’ll send an SMS link.";
     console.log(`STEP=${step} speech='' interpreted='${reason}' retryCount=${retryCount}`);
-    ask(twiml, session.lastPrompt, actionUrl, { input: "speech", timeout: 7, speechTimeout: "auto" });
+    ask(twiml, session.lastPrompt, actionUrl, { input: "speech", timeout: 6, speechTimeout: "auto" });
     return { handled: true };
   }
 
   console.log(`STEP=${step} speech='' interpreted='${reason}' retryCount=${retryCount}`);
-  twiml.say("No worries. We can continue another time. Goodbye.", { voice: "Polly.Amy", language: "en-AU" });
-  twiml.hangup();
-  return { handled: true, shouldReset: true };
+  ask(twiml, `No worries — take your time. ${basePrompt}`, actionUrl, { input: "speech", timeout: 6, speechTimeout: "auto" });
+  return { handled: true };
 }
 
 function keepCallAliveForProcessing(req, twiml, message = "One moment while I check that for you.") {
@@ -1736,27 +1766,13 @@ function resolveCallSid(req) {
   return `missing-callsid-${String(req?.body?.From || req?.query?.From || "unknown").trim() || "unknown"}`;
 }
 
-function looksLikePhoneOrJunkName(s) {
-  const t = String(s || "").trim();
-  if (!t) return true;
-  if (/\d{6,}/.test(t)) return true;
-  if (t.split(/\s+/).length > 5) return true;
-  return false;
-}
 function validateName(speech) {
   const s = String(speech || "").trim();
-  if (!s || s.length < 2) return false;
-  if (looksLikePhoneOrJunkName(s)) return false;
-  if (/(tomorrow|today|am|pm|\d{1,2}:\d{2}|\d{1,2}\s?(am|pm))/i.test(s)) return false;
-  return true;
+  return s.length >= 2;
 }
 function validateAddress(speech) {
-  const s = String(speech || "").toLowerCase().trim();
-  if (!s || s.length < 6) return false;
-  const hasNum = /\d{1,5}/.test(s);
-  const hasHint = /(st|street|rd|road|ave|avenue|dr|drive|cres|crescent|ct|court|pl|place|terrace|tce|lane|ln|way|circuit|cct|nsw|vic|qld|sa|wa|tas|act|nt)\b/i.test(s);
-  const hasUnit = /(unit|apt|apartment|lot|suite)\s*\d+/i.test(s);
-  return (hasNum && (hasHint || hasUnit)) || (hasHint && s.split(" ").length >= 3);
+  const s = String(speech || "").trim();
+  return s.length >= 5;
 }
 function validateJob(speech) {
   const s = String(speech || "").trim();
@@ -1768,7 +1784,7 @@ function validateJob(speech) {
 function validateAccess(speech) {
   const s = String(speech || "").trim();
   if (!s) return true; // optional
-  if (/^(none|no|nope|nah)$/i.test(s)) return true;
+  if (/^(none|no|nope|nah|skip)$/i.test(s)) return true;
 
   const sl = s.toLowerCase();
   if (/\bno\s+access\b/.test(sl)) return true;
@@ -1778,19 +1794,10 @@ function validateAccess(speech) {
   return s.length >= 2;
 }
 
+// confidence gating: only reject when speech is empty, low confidence, or invalid for the current step
 function shouldReject(step, speech, confidence) {
   if (!speech || speech.length < 2) return true;
-
-  const minConf =
-    step === "address" ? 0.55 :
-    step === "time" ? 0.45 :
-    step === "name" ? 0.35 :
-    step === "job" ? 0.25 :
-    0.15;
-
-  if (typeof confidence === "number" && confidence > 0 && confidence < minConf) {
-    if (speech.split(" ").length <= 3) return true;
-  }
+  if (isLowConfidence(confidence)) return true;
 
   if (step === "address") return !validateAddress(speech);
   if (step === "name") return !validateName(speech);
@@ -1929,7 +1936,7 @@ function detectGlobalVoiceOverride(text) {
   const t = (text || "").toLowerCase();
   if (!t) return null;
   if (t.includes("start over")) return "START_OVER";
-  if (t.includes("cancel")) return "CANCEL";
+  if (t.includes("cancel") || t.includes("goodbye")) return "CANCEL";
   if (t.includes("operator")) return "OPERATOR";
   return null;
 }
@@ -2308,6 +2315,17 @@ app.post("/process-speech", async (req, res) => {
 
     const session = getSession(callSid, fromNumber);
 
+    // state persistence: CallSid keyed session is authoritative for the current step
+    const authoritativeStep = session.step || "intent";
+
+    // idempotency lock: ignore duplicate webhooks for the same CallSid+step within a short TTL
+    if (hasSpeechField && !acquireProcessSpeechLock(callSid, authoritativeStep)) {
+      console.log(`IDEMPOTENT_DUPLICATE TID=${tradie.key} CALLSID=${callSid} STEP=${authoritativeStep}`);
+      const replayPrompt = session.lastPrompt || "No worries — take your time. Please say that again.";
+      ask(twiml, replayPrompt, voiceActionUrl(req), { input: "speech", timeout: 6, speechTimeout: "auto" });
+      return res.type("text/xml").send(twiml.toString());
+    }
+
     // Count inbound call once for analytics
     if (!session._countedCall) {
       session._countedCall = true;
@@ -2390,32 +2408,43 @@ app.post("/process-speech", async (req, res) => {
       if (speech || digits) {
         session.retryCount = 0;
         session.lastNoSpeechFallback = false;
-        resetRetryCountForStep(session, session.step);
       }
     }
 
+    // confidence gating: do not advance when Twilio speech confidence is too low
+    if (speech && isLowConfidence(confidence)) {
+      const currentStep = session.step || "intent";
+      console.log(`LOW_CONFIDENCE TID=${tradie.key} CALLSID=${callSid} STEP=${currentStep} confidence=${confidence}`);
+      session.lastPrompt = "Sorry, I didn’t quite catch that. Please say it again.";
+      ask(twiml, session.lastPrompt, voiceActionUrl(req), { input: "speech", timeout: 6, speechTimeout: "auto" });
+      return res.type("text/xml").send(twiml.toString());
+    }
+
+    resetRetryCountForStep(session, session.step);
+
     if (session.step === "sms_fallback_offer") {
       const ynFallback = detectYesNo(speech);
-      if (ynFallback === "YES") {
+      const wantsText = /\btext me\b/i.test(speech || "");
+      if (ynFallback === "YES" || wantsText) {
         console.log(`STEP=sms_fallback_offer speech='${speech}' interpreted='YES|SEND_SMS' retryCount=${getRetryCountForStep(session, "sms_fallback_offer")}`);
         if (session.from) {
           await sendCustomerSms(tradie, session.from, "No worries — use this link to finish your booking: https://example.com/booking").catch(() => {});
         }
-        twiml.say("Done. I’ve sent the link by text. Thanks for calling.", { voice: "Polly.Amy", language: "en-AU" });
-        resetSession(callSid);
+        session.step = session.lastStepBeforeFallback || "intent";
+        session.lastPrompt = "Done. I’ve sent an SMS link. You can also keep going here — please say your answer again.";
+        ask(twiml, session.lastPrompt, voiceActionUrl(req), { input: "speech", timeout: 6, speechTimeout: "auto" });
         return res.type("text/xml").send(twiml.toString());
       }
 
       if (ynFallback === "NO") {
         console.log(`STEP=sms_fallback_offer speech='${speech}' interpreted='NO|DECLINED_SMS' retryCount=${getRetryCountForStep(session, "sms_fallback_offer")}`);
-        twiml.say("No worries. We can continue another time. Goodbye.", { voice: "Polly.Amy", language: "en-AU" });
-        twiml.hangup();
-        resetSession(callSid);
+        session.step = session.lastStepBeforeFallback || "intent";
+        const resumePrompt = `No worries — take your time. ${session.promptBeforeFallback || "Please say that again."}`;
+        ask(twiml, resumePrompt, voiceActionUrl(req), { input: "speech", timeout: 6, speechTimeout: "auto" });
         return res.type("text/xml").send(twiml.toString());
       }
 
       const repeatedFallback = repeatLastStepPrompt(req, twiml, session, "sms_fallback_offer", speech ? "UNCLEAR" : "NO_SPEECH");
-      if (repeatedFallback.shouldReset) resetSession(callSid);
       return res.type("text/xml").send(twiml.toString());
     }
 
@@ -2684,6 +2713,11 @@ app.post("/process-speech", async (req, res) => {
       if (session.bookedStartMs) dt = DateTime.fromMillis(session.bookedStartMs, { zone: tz });
       else {
         if (!looksLikeAsap(session.time)) dt = parseRequestedDateTime(session.time, tz);
+        if (!dt && speech && !looksLikeAsap(session.time)) {
+          session.lastPrompt = "Sorry, I didn’t quite catch that time. Please say it again, for example: tomorrow at 2 pm.";
+          ask(twiml, session.lastPrompt, actionUrl, { input: "speech", timeout: 6, speechTimeout: "auto" });
+          return res.type("text/xml").send(twiml.toString());
+        }
         if (!dt && isAfterHoursNow(tradie)) dt = nextBusinessOpenSlot(tradie);
         if (!dt) dt = DateTime.now().setZone(tz).plus({ minutes: 10 }).startOf("minute");
       }
