@@ -318,6 +318,7 @@ function normalizeTradieConfig(row) {
   const smsFrom = twilioNumber || String(t.smsFrom || process.env.TWILIO_SMS_FROM || "");
 
   return {
+    id: t.id || null,
     key: String(t.tradie_key || t.key || "default"),
     status: String(t.status || "ACTIVE"),
     plan: String(t.plan || ""),
@@ -331,7 +332,7 @@ function normalizeTradieConfig(row) {
     businessStartHour: Number(t.businessStartHour ?? t.business_start_hour ?? process.env.BUSINESS_START_HOUR ?? 7),
     businessEndHour: Number(t.businessEndHour ?? t.business_end_hour ?? process.env.BUSINESS_END_HOUR ?? 17),
 
-    calendarId: String(t.calendarId || t.calendar_id || process.env.GOOGLE_CALENDAR_ID || ""),
+    calendarId: String(t.calendarId || t.calendar_id || t.calendar_email || process.env.GOOGLE_CALENDAR_ID || ""),
     googleServiceJson: String(t.googleServiceJson || t.google_service_json || process.env.GOOGLE_SERVICE_JSON || ""),
 
     avgJobValue: Number.isFinite(avgJobValue) ? avgJobValue : 250,
@@ -2130,6 +2131,128 @@ function getCalendarClient(tradie) {
 }
 function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
 
+async function resolveCalendarTarget(tradie, context = {}) {
+  const fallbackCalendarId = String(tradie?.calendarId || "").trim();
+  if (fallbackCalendarId && fallbackCalendarId.toLowerCase() !== "default") {
+    return {
+      calendarId: fallbackCalendarId,
+      source: "tradie-config",
+      timezone: String(tradie?.timezone || "Australia/Sydney")
+    };
+  }
+  if (fallbackCalendarId.toLowerCase() === "default") {
+    console.warn("CALENDAR_TARGET_DEFAULT_REJECTED", {
+      bookingId: context.bookingId || null,
+      callSid: context.callSid || null,
+      tradieKey: tradie?.key || null
+    });
+  }
+
+  if (supabase && (tradie?.id || tradie?.key)) {
+    const query = supabase
+      .from(SUPABASE_TRADIE_ACCOUNTS_TABLE)
+      .select("calendar_email,calendar_id,timezone")
+      .limit(1);
+
+    const scoped = tradie?.id
+      ? query.eq("tradie_id", tradie.id)
+      : query.eq("tradie_key", tradie.key);
+
+    const { data, error } = await scoped.single();
+    if (error && error.code !== "PGRST116") {
+      console.error("CALENDAR_TARGET_LOOKUP_ERROR", {
+        bookingId: context.bookingId || null,
+        callSid: context.callSid || null,
+        message: error.message,
+        code: error.code || null
+      });
+    }
+
+    const calendarId = String(data?.calendar_email || data?.calendar_id || "").trim();
+    if (calendarId) {
+      return {
+        calendarId,
+        source: "tradie_accounts",
+        timezone: String(data?.timezone || tradie?.timezone || "Australia/Sydney")
+      };
+    }
+  }
+
+  console.warn("CALENDAR_TARGET_MISSING", {
+    bookingId: context.bookingId || null,
+    callSid: context.callSid || null,
+    tradieKey: tradie?.key || null,
+    tradieId: tradie?.id || null
+  });
+  return { calendarId: "", source: "none", timezone: String(tradie?.timezone || "Australia/Sydney") };
+}
+
+function shortJobText(job = "") {
+  return String(job || "Job").trim().slice(0, 80);
+}
+
+async function createBookingCalendarEvent({ tradie, booking, context = {} }) {
+  const target = await resolveCalendarTarget(tradie, context);
+  if (!target.calendarId) return { ok: false, reason: "missing_calendar" };
+
+  let calendar;
+  try {
+    calendar = getCalendarClient(tradie);
+  } catch (err) {
+    console.error("CALENDAR_EVENT_CREATE_ERROR", {
+      message: err?.message || String(err),
+      stack: err?.stack || null,
+      calendarId: target.calendarId
+    });
+    return { ok: false, reason: "insert_failed", error: err };
+  }
+
+  const tz = target.timezone || "Australia/Sydney";
+  const startDt = DateTime.fromISO(booking.startISO, { zone: tz });
+  const endDt = DateTime.fromISO(booking.endISO, { zone: tz });
+  const requestBody = {
+    summary: String(booking.summary || `${tradie.bizName || "Business"} Booking — ${shortJobText(booking.job)}`).slice(0, 120),
+    location: booking.address,
+    description: [
+      `Name: ${booking.name || "Unknown"}`,
+      `Phone: ${booking.phone || "Unknown"}`,
+      `Address: ${booking.address || "Unknown"}`,
+      `Job: ${booking.job || "Unknown"}`,
+      `callSid: ${context.callSid || booking.callSid || "unknown"}`,
+      `bookingId: ${booking.bookingId || context.bookingId || "unknown"}`
+    ].join("\n"),
+    start: { dateTime: toGoogleDateTime(startDt), timeZone: tz },
+    end: { dateTime: toGoogleDateTime(endDt), timeZone: tz }
+  };
+
+  console.log("CALENDAR_EVENT_CREATE_START", {
+    calendarId: target.calendarId,
+    startISO: booking.startISO,
+    endISO: booking.endISO,
+    bookingId: booking.bookingId || context.bookingId || null,
+    callSid: context.callSid || booking.callSid || null
+  });
+
+  try {
+    const resp = await withTimeout(
+      insertCalendarEventWithRetry(calendar, target.calendarId, requestBody),
+      CALENDAR_OP_TIMEOUT_MS,
+      "calendar insert"
+    );
+    const eventId = resp?.data?.id || null;
+    const htmlLink = resp?.data?.htmlLink || null;
+    console.log("CALENDAR_EVENT_CREATE_SUCCESS", { eventId, htmlLink });
+    return { ok: true, eventId, htmlLink, calendarId: target.calendarId };
+  } catch (err) {
+    console.error("CALENDAR_EVENT_CREATE_ERROR", {
+      message: err?.message || String(err),
+      stack: err?.stack || null,
+      calendarId: target.calendarId
+    });
+    return { ok: false, reason: "insert_failed", error: err };
+  }
+}
+
 async function insertCalendarEventWithRetry(calendar, calendarId, requestBody) {
   let lastErr = null;
   for (let attempt = 1; attempt <= CAL_RETRY_ATTEMPTS; attempt++) {
@@ -2927,7 +3050,10 @@ Is that correct? Please say 'yes' to confirm or 'no' to change it.`;
 
       // Pending confirmation (for inbound SMS Y/N)
       const pendingKey = makePendingKey(tradie.key, session.from);
+      const bookingId = `${callSid}:${startDt.toMillis()}`;
       const payload = {
+        bookingId,
+        callSid,
         tradie_key: tradie.key,
         from: session.from,
         name: session.name,
@@ -2935,7 +3061,8 @@ Is that correct? Please say 'yes' to confirm or 'no' to change it.`;
         job: session.job,
         access: session.accessNote || "",
         startISO: startDt.toISO(),
-        endISO: endDt.toISO()
+        endISO: endDt.toISO(),
+        timezone: tz
       };
 
       let wroteDb = false;
@@ -2959,25 +3086,29 @@ Time: ${formatForVoice(startDt)}
 Confirm: customer will reply Y/N
 ${historyLine}${memoryLine}${accessLine2}`.trim()).catch(() => {});
 
-      // Insert calendar event if configured
-      if (tradie.calendarId && tradie.googleServiceJson) {
-        try {
-          const calendar = getCalendarClient(tradie);
-          await withTimeout(insertCalendarEventWithRetry(calendar, tradie.calendarId, {
-            summary: `${session.name} — ${session.job}`.slice(0, 120),
-            location: session.address,
-            description: [
-              `Caller: ${session.from}`,
-              session.customerNote ? `Customer note: ${session.customerNote}` : null,
-              session.accessNote ? `Access notes: ${session.accessNote}` : null
-            ].filter(Boolean).join("\n"),
-            start: { dateTime: toGoogleDateTime(startDt), timeZone: tz },
-            end: { dateTime: toGoogleDateTime(endDt), timeZone: tz }
-          }), CALENDAR_OP_TIMEOUT_MS, "calendar insert");
-        } catch (e) {
-          console.warn("Calendar insert failed, continuing:", e?.message || e);
-          await missedRevenueAlert(tradie, session, "Calendar insert failed — manual follow-up").catch(() => {});
-        }
+      const eventResult = await createBookingCalendarEvent({
+        tradie,
+        booking: {
+          bookingId,
+          callSid,
+          name: session.name,
+          phone: session.from,
+          address: session.address,
+          job: session.job,
+          startISO: startDt.toISO(),
+          endISO: endDt.toISO()
+        },
+        context: { bookingId, callSid }
+      });
+
+      let customerCalendarNotice = "";
+      if (!eventResult.ok && eventResult.reason === "missing_calendar") {
+        await sendOwnerSms(tradie, "Calendar not connected yet — please share your calendar.").catch(() => {});
+        customerCalendarNotice = " Calendar not connected yet — please share your calendar.";
+      }
+      if (!eventResult.ok && eventResult.reason === "insert_failed") {
+        customerCalendarNotice = " I couldn’t write to the calendar yet, but I’ve saved the booking and will text you.";
+        await missedRevenueAlert(tradie, session, "Calendar insert failed — manual follow-up").catch(() => {});
       }
 
       // Customer SMS: confirm Y/N
@@ -2989,7 +3120,7 @@ ${historyLine}${memoryLine}${accessLine2}`.trim()).catch(() => {});
         ).catch(() => {});
       }
 
-      twiml.say("All set. We’ve sent you a text to confirm. Thanks!", { voice: "Polly.Amy", language: "en-AU" });
+      twiml.say(`All set. We’ve sent you a text to confirm. Thanks!${customerCalendarNotice}`, { voice: "Polly.Amy", language: "en-AU" });
       resetSession(callSid);
       return sendVoiceTwiml(res, twiml);
     }
@@ -3049,8 +3180,32 @@ app.post("/sms", async (req, res) => {
       const nice = `Name: ${payload.name}\nAddress: ${payload.address}\nJob: ${payload.job}\nTime: ${payload.startISO}`;
 
       if (bodyLower === "y" || bodyLower === "yes" || bodyLower.startsWith("y ")) {
-        await sendOwnerSms(tradie, `CUSTOMER CONFIRMED ✅\n${nice}`).catch(() => {});
-        twiml.message("Confirmed ✅ Thanks — see you then.");
+        const eventResult = await createBookingCalendarEvent({
+          tradie,
+          booking: {
+            bookingId: payload.bookingId,
+            callSid: payload.callSid,
+            name: payload.name,
+            phone: from,
+            address: payload.address,
+            job: payload.job,
+            startISO: payload.startISO,
+            endISO: payload.endISO
+          },
+          context: { bookingId: payload.bookingId, callSid: payload.callSid }
+        });
+
+        await sendOwnerSms(tradie, `CUSTOMER CONFIRMED ✅
+${nice}`).catch(() => {});
+
+        if (!eventResult.ok && eventResult.reason === "missing_calendar") {
+          await sendOwnerSms(tradie, "Calendar not connected yet — please share your calendar.").catch(() => {});
+          twiml.message("Confirmed ✅ Calendar not connected yet — please share your calendar.");
+        } else if (!eventResult.ok) {
+          twiml.message("Confirmed ✅ I couldn’t write to the calendar yet, but I’ve saved the booking and will text you.");
+        } else {
+          twiml.message("Confirmed ✅ Thanks — see you then.");
+        }
 
         await deletePendingConfirmationDb(pendingKey).catch(() => {});
         clearPendingConfirmationMemory(pendingKey);
@@ -3329,6 +3484,52 @@ console.error("POST /form/submit error:", err);
 return res.status(500).send("Server error");
 }
 });
+
+
+app.post("/debug/create-test-event", express.json({ limit: "256kb" }), async (req, res) => {
+  const expected = String(process.env.DEBUG_CALENDAR_SECRET || "").trim();
+  const got = String(req.get("x-debug-secret") || "").trim();
+  if (!expected) return res.status(500).json({ ok: false, error: "Missing DEBUG_CALENDAR_SECRET" });
+  if (!got || got !== expected) return res.status(401).json({ ok: false, error: "Unauthorized" });
+
+  try {
+    const tradie = await getTradieConfig(req);
+    const requestedCalendarId = String(req.body?.calendarId || "").trim();
+    const now = DateTime.now().setZone(tradie.timezone || "Australia/Sydney");
+    const startDt = now.plus({ minutes: 5 }).startOf("minute");
+    const endDt = startDt.plus({ minutes: Number(req.body?.durationMinutes || tradie.slotMinutes || 60) });
+    const bookingId = `debug:${Date.now()}`;
+
+    if (requestedCalendarId) tradie.calendarId = requestedCalendarId;
+
+    const result = await createBookingCalendarEvent({
+      tradie,
+      booking: {
+        bookingId,
+        callSid: "debug",
+        name: "Debug Tester",
+        phone: String(req.body?.phone || "debug"),
+        address: String(req.body?.address || "Debug Address"),
+        job: "TEST EVENT",
+        summary: "TEST EVENT",
+        startISO: startDt.toISO(),
+        endISO: endDt.toISO()
+      },
+      context: { bookingId, callSid: "debug" }
+    });
+
+    if (!result.ok) return res.status(500).json({ ok: false, result });
+    return res.json({ ok: true, result });
+  } catch (err) {
+    console.error("CALENDAR_EVENT_CREATE_ERROR", {
+      message: err?.message || String(err),
+      stack: err?.stack || null,
+      calendarId: String(req.body?.calendarId || "") || null
+    });
+    return res.status(500).json({ ok: false, error: err?.message || "failed" });
+  }
+});
+
 // ----------------------------------------------------------------------------
 // Listen
 // ----------------------------------------------------------------------------
