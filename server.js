@@ -1479,6 +1479,7 @@ function getSession(callSid, fromNumber = "") {
       tries: 0,
       silenceTries: 0,
       retryCount: 0,
+      retryCountByStep: {},
       from: fromNumber,
 
       lastAtAddress: null,
@@ -1580,6 +1581,56 @@ function ask(twiml, prompt, actionUrl, options = {}) {
 
   gather.say(prompt || "Sorry, can you repeat that?", { voice: "Polly.Amy", language: "en-AU" });
   twiml.pause({ length: 1 });
+}
+
+function getRetryCountForStep(session, step) {
+  if (!session.retryCountByStep || typeof session.retryCountByStep !== "object") {
+    session.retryCountByStep = {};
+  }
+  return Number(session.retryCountByStep[step] || 0);
+}
+
+function resetRetryCountForStep(session, step) {
+  if (!session.retryCountByStep || typeof session.retryCountByStep !== "object") {
+    session.retryCountByStep = {};
+  }
+  session.retryCountByStep[step] = 0;
+}
+
+function incrementRetryCountForStep(session, step) {
+  if (!session.retryCountByStep || typeof session.retryCountByStep !== "object") {
+    session.retryCountByStep = {};
+  }
+  session.retryCountByStep[step] = Number(session.retryCountByStep[step] || 0) + 1;
+  return session.retryCountByStep[step];
+}
+
+function repeatLastStepPrompt(req, twiml, session, step, reason = "NO_SPEECH") {
+  const retryCount = incrementRetryCountForStep(session, step);
+  const actionUrl = voiceActionUrl(req);
+
+  if (retryCount <= MAX_NO_SPEECH_RETRIES) {
+    const repeatPrompt = session.lastPrompt || "Sorry, I didn’t catch that. Could you repeat that?";
+    const prompt = `Sorry, I didn’t catch that. ${repeatPrompt}`;
+    session.lastPrompt = repeatPrompt;
+    console.log(`STEP=${step} speech='' interpreted='${reason}' retryCount=${retryCount}`);
+    ask(twiml, prompt, actionUrl, { input: step === "confirm" ? "speech" : "speech dtmf", timeout: 7, speechTimeout: "auto" });
+    return { handled: true };
+  }
+
+  if (retryCount === MAX_NO_SPEECH_RETRIES + 1) {
+    session.lastStepBeforeFallback = step;
+    session.step = "sms_fallback_offer";
+    session.lastPrompt = "No worries. Would you like me to text you a link to finish this booking? Please say yes or no.";
+    console.log(`STEP=${step} speech='' interpreted='${reason}' retryCount=${retryCount}`);
+    ask(twiml, session.lastPrompt, actionUrl, { input: "speech", timeout: 7, speechTimeout: "auto" });
+    return { handled: true };
+  }
+
+  console.log(`STEP=${step} speech='' interpreted='${reason}' retryCount=${retryCount}`);
+  twiml.say("No worries. We can continue another time. Goodbye.", { voice: "Polly.Amy", language: "en-AU" });
+  twiml.hangup();
+  return { handled: true, shouldReset: true };
 }
 
 function keepCallAliveForProcessing(req, twiml, message = "One moment while I check that for you.") {
@@ -1802,10 +1853,18 @@ function detectYesNoFromDigits(d) {
 function detectYesNo(text) {
   const t = (text || "").toLowerCase().trim();
   const yes = ["yes","yeah","yep","correct","that's right","that’s right","sounds good","ok","okay","confirm"];
-  const no = ["no","nope","nah","wrong","not right","don’t","dont"];
+  const no = ["no","nope","nah","wrong","not right","don’t","dont","change","edit"];
 
   if (yes.some((w) => t === w || t.includes(w))) return "YES";
   if (no.some((w) => t === w || t.includes(w))) return "NO";
+  return null;
+}
+function detectGlobalVoiceOverride(text) {
+  const t = (text || "").toLowerCase();
+  if (!t) return null;
+  if (t.includes("start over")) return "START_OVER";
+  if (t.includes("cancel")) return "CANCEL";
+  if (t.includes("operator")) return "OPERATOR";
   return null;
 }
 function detectCorrection(text) {
@@ -2205,6 +2264,28 @@ app.post("/process-speech", async (req, res) => {
       addToHistory(session, "user", speech);
     }
 
+    const globalOverride = detectGlobalVoiceOverride(speech);
+    if (globalOverride === "START_OVER") {
+      session.step = "intent";
+      session.lastPrompt = "No worries, starting over. What would you like help with today?";
+      resetRetryCountForStep(session, "intent");
+      ask(twiml, session.lastPrompt, voiceActionUrl(req), { input: "speech", timeout: 7, speechTimeout: "auto" });
+      return res.type("text/xml").send(twiml.toString());
+    }
+    if (globalOverride === "CANCEL") {
+      await missedRevenueAlert(tradie, session, "Caller said cancel").catch(() => {});
+      twiml.say("No problem. I’ve cancelled this request. Goodbye.", { voice: "Polly.Amy", language: "en-AU" });
+      twiml.hangup();
+      resetSession(callSid);
+      return res.type("text/xml").send(twiml.toString());
+    }
+    if (globalOverride === "OPERATOR") {
+      await missedRevenueAlert(tradie, session, "Caller requested operator").catch(() => {});
+      twiml.say("No worries. I’ll ask someone to call you back shortly.", { voice: "Polly.Amy", language: "en-AU" });
+      resetSession(callSid);
+      return res.type("text/xml").send(twiml.toString());
+    }
+
     console.log(`TID=${tradie.key} CALLSID=${callSid} TO=${req.body.To} FROM=${fromNumber} STEP=${session.step} Speech="${speech}" Digits="${digits}" Confidence=${confidence}`);
     logVoiceStep(req, { callSid, step: session.step, speech, retryCount: session.silenceTries || 0 });
 
@@ -2234,32 +2315,42 @@ app.post("/process-speech", async (req, res) => {
     if (!speech && !digits && hasSpeechField) {
       console.log(`NO_SPEECH_TIMEOUT TID=${tradie.key} CALLSID=${callSid} FROM=${fromNumber}`);
       session.silenceTries += 1;
-      session.retryCount = (session.retryCount || 0) + 1;
-
-      if (session.retryCount >= MAX_NO_SPEECH_RETRIES) {
-        await missedRevenueAlert(tradie, session, "Max no-speech retries reached").catch(() => {});
-        twiml.say("No problem. I’ll send you a text so you can book online.", { voice: "Polly.Amy", language: "en-AU" });
-        if (session.from) {
-          await sendCustomerSms(tradie, session.from, "No problem — you can book online here, or reply to this text and we can help.").catch(() => {});
-        }
-        resetSession(callSid);
-        return res.type("text/xml").send(twiml.toString());
-      }
-
-      const prompt = "I didn’t quite catch that. What job do you need help with?";
       session.lastNoSpeechFallback = true;
-      session.lastPrompt = prompt;
-      addToHistory(session, "assistant", prompt);
-
-      const actionUrl = "/process-speech" + (req.query.tid ? `?tid=${encodeURIComponent(req.query.tid)}` : "");
-      ask(twiml, prompt, actionUrl, { input: "speech" });
+      const repeated = repeatLastStepPrompt(req, twiml, session, session.step, "NO_SPEECH");
+      if (repeated.shouldReset) resetSession(callSid);
       return res.type("text/xml").send(twiml.toString());
     } else {
       session.silenceTries = 0;
       if (speech || digits) {
         session.retryCount = 0;
         session.lastNoSpeechFallback = false;
+        resetRetryCountForStep(session, session.step);
       }
+    }
+
+    if (session.step === "sms_fallback_offer") {
+      const ynFallback = detectYesNo(speech);
+      if (ynFallback === "YES") {
+        console.log(`STEP=sms_fallback_offer speech='${speech}' interpreted='YES|SEND_SMS' retryCount=${getRetryCountForStep(session, "sms_fallback_offer")}`);
+        if (session.from) {
+          await sendCustomerSms(tradie, session.from, "No worries — use this link to finish your booking: https://example.com/booking").catch(() => {});
+        }
+        twiml.say("Done. I’ve sent the link by text. Thanks for calling.", { voice: "Polly.Amy", language: "en-AU" });
+        resetSession(callSid);
+        return res.type("text/xml").send(twiml.toString());
+      }
+
+      if (ynFallback === "NO") {
+        console.log(`STEP=sms_fallback_offer speech='${speech}' interpreted='NO|DECLINED_SMS' retryCount=${getRetryCountForStep(session, "sms_fallback_offer")}`);
+        twiml.say("No worries. We can continue another time. Goodbye.", { voice: "Polly.Amy", language: "en-AU" });
+        twiml.hangup();
+        resetSession(callSid);
+        return res.type("text/xml").send(twiml.toString());
+      }
+
+      const repeatedFallback = repeatLastStepPrompt(req, twiml, session, "sms_fallback_offer", speech ? "UNCLEAR" : "NO_SPEECH");
+      if (repeatedFallback.shouldReset) resetSession(callSid);
+      return res.type("text/xml").send(twiml.toString());
     }
 
     // Optional: early “human” request
@@ -2413,7 +2504,7 @@ app.post("/process-speech", async (req, res) => {
 
       session.lastPrompt = "Sorry — what should I change? job, address, name, time, or access notes?";
       addToHistory(session, "assistant", session.lastPrompt);
-      ask(twiml, session.lastPrompt, actionUrl);
+      ask(twiml, session.lastPrompt, actionUrl, { input: "speech", timeout: 7, speechTimeout: "auto" });
       return res.type("text/xml").send(twiml.toString());
     }
 
@@ -2603,10 +2694,10 @@ app.post("/process-speech", async (req, res) => {
 
       session.lastPrompt =
 `Great. I’ve got ${session.name}, ${session.address}, for ${session.job}, at ${whenText}. ${noteLine}${accessLine}
-Is that correct? Say yes to confirm — or say what you want to change: job, address, name, time, or access notes. (Press 1 yes, 2 no)`;
+Is that correct? Please say 'yes' to confirm or 'no' to change it.`;
 
       addToHistory(session, "assistant", session.lastPrompt);
-      ask(twiml, session.lastPrompt, actionUrl);
+      ask(twiml, session.lastPrompt, actionUrl, { input: "speech", timeout: 7, speechTimeout: "auto" });
       return res.type("text/xml").send(twiml.toString());
     }
 
@@ -2651,45 +2742,37 @@ Is that correct? Say yes to confirm — or say what you want to change: job, add
 
       session.lastPrompt =
 `Great. I’ve got ${session.name}, ${session.address}, for ${session.job}, at ${whenText}. ${noteLine}${accessLine}
-Is that correct? Say yes to confirm — or say what you want to change: job, address, name, time, or access notes.`;
+Is that correct? Please say 'yes' to confirm or 'no' to change it.`;
 
       addToHistory(session, "assistant", session.lastPrompt);
-      ask(twiml, session.lastPrompt, actionUrl);
+      ask(twiml, session.lastPrompt, actionUrl, { input: "speech", timeout: 7, speechTimeout: "auto" });
       return res.type("text/xml").send(twiml.toString());
     }
 
     // STEP: confirm
     if (session.step === "confirm") {
-      const yn2 = detectYesNoFromDigits(digits) || detectYesNo(speech);
-      const changeField2 = detectChangeFieldFromSpeech(speech);
+      const confirmConfidenceTooLow = typeof confidence === "number" && confidence > 0 && confidence < 0.45;
+      const yn2 = detectYesNo(speech);
 
-      if (changeField2) {
-        session.step = changeField2;
-        session.lastPrompt =
-          changeField2 === "job" ? "Sure — what’s the job?"
-          : changeField2 === "address" ? "Sure — what’s the correct address?"
-          : changeField2 === "name" ? "Sure — what name should I use?"
-          : changeField2 === "access" ? "Sure — what access notes should I add or update?"
-          : "Sure — what time would you like instead?";
-        addToHistory(session, "assistant", session.lastPrompt);
-        ask(twiml, session.lastPrompt, actionUrl);
+      if (!speech || confirmConfidenceTooLow || !yn2) {
+        const interpreted = !speech ? "NO_SPEECH" : (confirmConfidenceTooLow ? "UNCLEAR" : "UNCLEAR");
+        console.log(`STEP=confirm speech='${speech}' interpreted='${interpreted}' retryCount=${getRetryCountForStep(session, "confirm") + 1}`);
+        const repeatedConfirm = repeatLastStepPrompt(req, twiml, session, "confirm", interpreted);
+        if (repeatedConfirm.shouldReset) resetSession(callSid);
         return res.type("text/xml").send(twiml.toString());
       }
 
+      resetRetryCountForStep(session, "confirm");
       if (yn2 === "NO") {
+        console.log(`STEP=confirm speech='${speech}' interpreted='NO' retryCount=${getRetryCountForStep(session, "confirm")}`);
         session.step = "clarify";
         session.lastPrompt = "No worries — what should I change? job, address, name, time, or access notes?";
         addToHistory(session, "assistant", session.lastPrompt);
-        ask(twiml, session.lastPrompt, actionUrl);
+        ask(twiml, session.lastPrompt, actionUrl, { input: "speech", timeout: 7, speechTimeout: "auto" });
         return res.type("text/xml").send(twiml.toString());
       }
 
-      if (yn2 !== "YES") {
-        session.lastPrompt = "Sorry — say yes to confirm, or tell me what you want to change: job, address, name, time, or access notes.";
-        addToHistory(session, "assistant", session.lastPrompt);
-        ask(twiml, session.lastPrompt, actionUrl);
-        return res.type("text/xml").send(twiml.toString());
-      }
+      console.log(`STEP=confirm speech='${speech}' interpreted='YES' retryCount=${getRetryCountForStep(session, "confirm")}`);
 
       // Create calendar event (if configured), else fallback “manual booking”
       const startDt = session.bookedStartMs
