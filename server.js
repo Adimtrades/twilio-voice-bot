@@ -160,6 +160,33 @@ async function getMany(table, query) {
     return [];
   }
 }
+
+async function resolveCalendarIdFromCalledNumber({ supabase, calledNumber }) {
+  const normalizedCalledNumber = String(calledNumber || "").trim();
+  if (!normalizedCalledNumber) throw new Error("MISSING_CALLED_NUMBER");
+
+  const { data: tw, error: twErr } = await supabase
+    .from("twilio_numbers")
+    .select("tradie_id, phone")
+    .eq("phone", normalizedCalledNumber)
+    .maybeSingle();
+
+  if (twErr) throw new Error(`TWILIO_NUMBER_LOOKUP_FAILED: ${twErr.message}`);
+  if (!tw) throw new Error(`NO_TWILIO_NUMBER_MATCH: ${normalizedCalledNumber}`);
+
+  const { data: tradie, error: trErr } = await supabase
+    .from("tradie_accounts")
+    .select("calendar_email")
+    .eq("id", tw.tradie_id)
+    .maybeSingle();
+
+  if (trErr) throw new Error(`TRADIE_LOOKUP_FAILED: ${trErr.message}`);
+  if (!tradie?.calendar_email) {
+    throw new Error(`MISSING_TRADIE_CALENDAR_EMAIL for tradie_id=${tw.tradie_id}`);
+  }
+
+  return tradie.calendar_email;
+}
 async function delWhere(table, query) {
   if (!supaReady()) return false;
   const url = `${SUPABASE_URL}/rest/v1/${table}?${query}`;
@@ -2187,13 +2214,31 @@ async function resolveCalendarTarget(tradie, context = {}) {
   return { calendarId: "", source: "none", timezone: String(tradie?.timezone || "Australia/Sydney") };
 }
 
-function shortJobText(job = "") {
-  return String(job || "Job").trim().slice(0, 80);
-}
-
 async function createBookingCalendarEvent({ tradie, booking, context = {} }) {
-  const target = await resolveCalendarTarget(tradie, context);
-  if (!target.calendarId) return { ok: false, reason: "missing_calendar" };
+  let calendarId = "";
+  const calledNumber = String(context.calledNumber || "").trim();
+
+  try {
+    if (supabase && calledNumber) {
+      calendarId = await resolveCalendarIdFromCalledNumber({ supabase, calledNumber });
+    } else {
+      const target = await resolveCalendarTarget(tradie, context);
+      calendarId = target.calendarId;
+    }
+  } catch (err) {
+    console.error("CALENDAR_ID_RESOLVE_ERROR", {
+      message: err?.message || String(err),
+      bookingId: booking.bookingId || context.bookingId || null,
+      callSid: context.callSid || booking.callSid || null,
+      calledNumber: calledNumber || null
+    });
+    return { ok: false, reason: "missing_calendar", error: err };
+  }
+
+  if (!calendarId) return { ok: false, reason: "missing_calendar" };
+  if (String(calendarId).toLowerCase().includes("adimtrades")) {
+    throw new Error(`SAFETY_BLOCK: Refusing to insert into admin calendar: ${calendarId}`);
+  }
 
   let calendar;
   try {
@@ -2202,52 +2247,49 @@ async function createBookingCalendarEvent({ tradie, booking, context = {} }) {
     console.error("CALENDAR_EVENT_CREATE_ERROR", {
       message: err?.message || String(err),
       stack: err?.stack || null,
-      calendarId: target.calendarId
+      calendarId
     });
     return { ok: false, reason: "insert_failed", error: err };
   }
 
-  const tz = target.timezone || "Australia/Sydney";
+  const tz = String(tradie?.timezone || "Australia/Sydney");
   const startDt = DateTime.fromISO(booking.startISO, { zone: tz });
   const endDt = DateTime.fromISO(booking.endISO, { zone: tz });
+  const customerName = booking.name || "Unknown";
+  const customerPhone = booking.phone || "Unknown";
+  const address = booking.address || "Unknown";
+  const job = booking.job || "Unknown";
+  const startISO = toGoogleDateTime(startDt);
+  const endISO = toGoogleDateTime(endDt);
   const requestBody = {
-    summary: String(booking.summary || `${tradie.bizName || "Business"} Booking — ${shortJobText(booking.job)}`).slice(0, 120),
-    location: booking.address,
-    description: [
-      `Name: ${booking.name || "Unknown"}`,
-      `Phone: ${booking.phone || "Unknown"}`,
-      `Address: ${booking.address || "Unknown"}`,
-      `Job: ${booking.job || "Unknown"}`,
-      `callSid: ${context.callSid || booking.callSid || "unknown"}`,
-      `bookingId: ${booking.bookingId || context.bookingId || "unknown"}`
-    ].join("\n"),
-    start: { dateTime: toGoogleDateTime(startDt), timeZone: tz },
-    end: { dateTime: toGoogleDateTime(endDt), timeZone: tz }
+    summary: `${customerName} — ${job}`,
+    location: address,
+    description: `Name: ${customerName}\nPhone: ${customerPhone}\nAddress: ${address}\nJob: ${job}`,
+    start: { dateTime: startISO, timeZone: "Australia/Sydney" },
+    end: { dateTime: endISO, timeZone: "Australia/Sydney" }
   };
 
-  console.log("CALENDAR_EVENT_CREATE_START", {
-    calendarId: target.calendarId,
-    startISO: booking.startISO,
-    endISO: booking.endISO,
-    bookingId: booking.bookingId || context.bookingId || null,
-    callSid: context.callSid || booking.callSid || null
+  console.log("CALENDAR_INSERT_START", {
+    callSid: context.callSid || booking.callSid || null,
+    calledNumber,
+    calendarId
   });
 
   try {
     const resp = await withTimeout(
-      insertCalendarEventWithRetry(calendar, target.calendarId, requestBody),
+      insertCalendarEventWithRetry(calendar, calendarId, requestBody),
       CALENDAR_OP_TIMEOUT_MS,
       "calendar insert"
     );
     const eventId = resp?.data?.id || null;
     const htmlLink = resp?.data?.htmlLink || null;
-    console.log("CALENDAR_EVENT_CREATE_SUCCESS", { eventId, htmlLink });
-    return { ok: true, eventId, htmlLink, calendarId: target.calendarId };
+    console.log("CALENDAR_INSERT_OK", { eventId, htmlLink });
+    return { ok: true, eventId, htmlLink, calendarId };
   } catch (err) {
     console.error("CALENDAR_EVENT_CREATE_ERROR", {
       message: err?.message || String(err),
       stack: err?.stack || null,
-      calendarId: target.calendarId
+      calendarId
     });
     return { ok: false, reason: "insert_failed", error: err };
   }
@@ -3098,7 +3140,7 @@ ${historyLine}${memoryLine}${accessLine2}`.trim()).catch(() => {});
           startISO: startDt.toISO(),
           endISO: endDt.toISO()
         },
-        context: { bookingId, callSid }
+        context: { bookingId, callSid, calledNumber: req.body.To }
       });
 
       let customerCalendarNotice = "";
@@ -3192,7 +3234,11 @@ app.post("/sms", async (req, res) => {
             startISO: payload.startISO,
             endISO: payload.endISO
           },
-          context: { bookingId: payload.bookingId, callSid: payload.callSid }
+          context: {
+            bookingId: payload.bookingId,
+            callSid: payload.callSid,
+            calledNumber: req.body.To
+          }
         });
 
         await sendOwnerSms(tradie, `CUSTOMER CONFIRMED ✅
