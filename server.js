@@ -528,7 +528,7 @@ function getSmtpTransporter() {
   });
 }
 
-async function sendTradieEmail(to, subject, text) {
+async function sendTradieEmail(to, subject, text, html = "") {
   const from = String(process.env.FROM_EMAIL || "").trim();
   if (!from || !to) {
     console.warn("Email skipped: sender/recipient missing", { to: to || "" });
@@ -547,7 +547,9 @@ async function sendTradieEmail(to, subject, text) {
         personalizations: [{ to: [{ email: to }] }],
         from: { email: from },
         subject,
-        content: [{ type: "text/plain", value: text }]
+        content: html
+          ? [{ type: "text/plain", value: text }, { type: "text/html", value: html }]
+          : [{ type: "text/plain", value: text }]
       })
     });
 
@@ -564,8 +566,107 @@ async function sendTradieEmail(to, subject, text) {
     return false;
   }
 
-  await transporter.sendMail({ from, to, subject, text });
+  await transporter.sendMail({ from, to, subject, text, ...(html ? { html } : {}) });
   return true;
+}
+
+async function getLatestActiveTwilioNumberForTradie(tradieId) {
+  if (!supaReady() || !supabase || !tradieId) return "";
+
+  const baseQuery = () => supabase
+    .from("twilio_numbers")
+    .select("phone_number,created_at")
+    .eq("assigned_tradie_id", tradieId)
+    .order("created_at", { ascending: false })
+    .limit(1);
+
+  let { data, error } = await baseQuery().eq("status", "active");
+  if (error) {
+    ({ data, error } = await baseQuery());
+  }
+  if (error) {
+    console.error("twilio number lookup failed", { tradie_id: tradieId, error: error.message || error });
+    return "";
+  }
+
+  return String(data?.[0]?.phone_number || "").trim();
+}
+
+function buildActivationEmailContent({ tradie, twilioNumber, setupLink, supportEmail }) {
+  const greeting = tradie?.business_name || "there";
+  const hasNumber = !!twilioNumber;
+  const numberLine = hasNumber
+    ? `Your newly provisioned AI receptionist number (E.164): ${twilioNumber}`
+    : "Your AI receptionist number is being provisioned. You will receive it shortly.";
+
+  const text =
+`Hi ${greeting},
+
+Your AI Receptionist is now live.
+
+${numberLine}
+
+This is your AI Receptionist number. Customers call it and it answers, collects job details, and books into your calendar.
+
+To enable calendar booking permissions, please share your Google Calendar with adimtrades@gmail.com (permission: Make changes to events):
+1) Open Google Calendar on web
+2) Left sidebar → My calendars → choose your calendar → three dots → Settings and sharing
+3) Share with specific people → Add adimtrades@gmail.com
+4) Set permission to “Make changes to events”
+5) Save
+
+If you have multiple calendars, share the one you want bookings to go into.
+
+Reply to this email once done so we can finish verification.
+Setup link: ${setupLink}
+
+Need help? ${supportEmail}`;
+
+  const html = `<p>Hi ${greeting},</p>
+<p><strong>Your AI Receptionist is now live.</strong></p>
+<p>${hasNumber
+    ? `<strong>Your newly provisioned AI receptionist number (E.164): ${twilioNumber}</strong>`
+    : "Your AI receptionist number is being provisioned. You will receive it shortly."}</p>
+<p>This is your AI Receptionist number. Customers call it and it answers, collects job details, and books into your calendar.</p>
+<p><strong>Enable calendar booking permissions:</strong><br/>Share your Google Calendar with <strong>adimtrades@gmail.com</strong> and set permission to <strong>Make changes to events</strong>.</p>
+<ol>
+  <li>Open Google Calendar on web</li>
+  <li>Left sidebar → My calendars → choose your calendar → three dots → Settings and sharing</li>
+  <li>Share with specific people → Add <strong>adimtrades@gmail.com</strong></li>
+  <li>Set permission to “Make changes to events”</li>
+  <li>Save</li>
+</ol>
+<p>If you have multiple calendars, share the one you want bookings to go into.</p>
+<p>Reply to this email once done so we can finish verification.</p>
+<p>Setup link: <a href="${setupLink}">${setupLink}</a></p>
+<p>Need help? <a href="mailto:${supportEmail}">${supportEmail}</a></p>`;
+
+  return { text, html };
+}
+
+async function sendActivationEmailForTradie({ tradie, reqForBaseUrl, emailFallback = "", source = "" }) {
+  const recipient = String(tradie?.email || emailFallback || "").trim();
+  if (!recipient) {
+    console.warn("activation email skipped: missing recipient", { tradie_id: tradie?.id || "", source });
+    return;
+  }
+
+  const baseUrl = getBaseUrl(reqForBaseUrl || { headers: {} });
+  const setupLink = `${baseUrl}/onboarding?tradie_id=${encodeURIComponent(tradie.id)}`;
+  const supportEmail = String(process.env.SUPPORT_EMAIL || process.env.FROM_EMAIL || "support@example.com").trim();
+  const twilioNumber = await getLatestActiveTwilioNumberForTradie(tradie.id);
+  const fallbackTriggered = !twilioNumber;
+
+  console.log("activation email target", { to: recipient, source });
+  console.log("activation email context", { tradie_id: tradie.id, stripe_customer_id: tradie.stripe_customer_id || "", source });
+  console.log("activation email number", { twilioNumber: twilioNumber || "", fallbackTriggered, source });
+
+  const { text, html } = buildActivationEmailContent({ tradie, twilioNumber, setupLink, supportEmail });
+  try {
+    await sendTradieEmail(recipient, "Your AI Receptionist is Live — Your New Number Inside", text, html);
+  } catch (err) {
+    console.error("activation email send failed", { tradie_id: tradie.id, source, error: err?.message || err });
+  }
 }
 
 async function sendSms({ from, to, body }) {
@@ -1086,25 +1187,7 @@ async function ensureProvisioningForActiveSubscription({ customerId, subscriptio
   try {
     const provisioned = await provisionTwilioNumberForTradie(tradie, reqForBaseUrl);
     if (provisioned?.skipped) return;
-
-    const baseUrl = getBaseUrl(reqForBaseUrl || { headers: {} });
-    const setupLink = `${baseUrl}/onboarding?tradie_id=${encodeURIComponent(tradie.id)}`;
-    const successText =
-`Hi ${tradie.business_name || "there"},
-
-Your AI receptionist is active.
-
-Your new Twilio number: ${provisioned.phoneNumber}
-
-What happens next:
-• Call ${provisioned.phoneNumber} from your mobile to run a quick live test.
-• Forward your current business line to this number with your telco.
-• Finish setup here: ${setupLink}
-• If anything looks off, reply to this email and we'll help.
-
-Thanks for choosing us.`;
-
-    await sendTradieEmail(tradie.email, "Your AI receptionist is active", successText).catch(() => {});
+    await sendActivationEmailForTradie({ tradie, reqForBaseUrl, source: "ensureProvisioningForActiveSubscription" });
   } catch (err) {
     await markProvisioningFailure(tradie, err?.message || err);
   }
@@ -1138,27 +1221,21 @@ async function syncActiveSubscriptionAndProvision({ customerId, subscriptionId, 
 
   if (provisioned.skipped) {
     console.log("stripe provisioning step: number already exists, skipping buy", { tradie_id: tradie.id, phone: provisioned.phoneNumber || "" });
+    await sendActivationEmailForTradie({
+      tradie: refreshedTradie || tradie,
+      reqForBaseUrl,
+      emailFallback: email,
+      source: "syncActiveSubscriptionAndProvision:existing"
+    });
     return;
   }
 
   console.log("stripe provisioning step: number provisioned", { tradie_id: tradie.id, phone: provisioned.phoneNumber });
-  const baseUrl = getBaseUrl(reqForBaseUrl || { headers: {} });
-  const setupLink = `${baseUrl}/onboarding?tradie_id=${encodeURIComponent(tradie.id)}`;
-  const text =
-`Hi ${tradie.business_name || "there"},
-
-Your AI receptionist is active.
-
-Your new Twilio number: ${provisioned.phoneNumber}
-
-What happens next:
-• Call ${provisioned.phoneNumber} from your mobile to run a quick live test.
-• Forward your current business line to this number with your telco.
-• Finish setup here: ${setupLink}
-• If anything looks off, reply to this email and we'll help.`;
-
-  await sendTradieEmail(tradie.email || email || "", "Your AI receptionist is active", text).catch((err) => {
-    console.error("stripe provisioning step: confirmation email failed", err?.message || err);
+  await sendActivationEmailForTradie({
+    tradie: refreshedTradie || tradie,
+    reqForBaseUrl,
+    emailFallback: email,
+    source: "syncActiveSubscriptionAndProvision:new"
   });
 }
 
@@ -1243,18 +1320,7 @@ app.post("/stripe/webhook", express.raw({ type: "application/json" }), async (re
               `Your AI receptionist is live ✅\nYour bot number: ${twilioNumber}\nNext: call it for a quick test, then forward your current business line.`
             ).catch(() => {});
 
-            const baseUrl = process.env.BASE_URL || getBaseUrl(req);
-            const setupLink = `${String(baseUrl).replace(/\/+$/, "")}/onboarding?tradie_key=${encodeURIComponent(tradieKey)}`;
-            const recipient = fresh.email || email;
-            if (recipient) {
-              await sendTradieEmail(
-                recipient,
-                "Your AI receptionist number is ready",
-                `You're all set ✅\n\nYour bot number: ${twilioNumber}\n\nNext steps:\n• Call the number for a quick test\n• Forward your current business line to this number\n• Complete setup here: ${setupLink}`
-              ).catch((err) => {
-                console.error("AUTO_PROVISION failed", err);
-              });
-            }
+            // Email send is handled in syncActiveSubscriptionAndProvision to avoid duplicates.
           } catch (err) {
             console.error("AUTO_PROVISION failed", err);
           }
