@@ -1553,7 +1553,7 @@ function buildInitialVoiceTwiml(req, greetingText = "Hi. What would you like hel
 
 function handleVoiceEntry(req, res) {
   const twiml = buildInitialVoiceTwiml(req);
-  const callSid = req.body?.CallSid || req.query?.CallSid || "unknown";
+  const callSid = resolveCallSid(req);
   const fromNumber = (req.body?.From || req.query?.From || "").trim();
   const session = getSession(callSid, fromNumber);
   session.step = "initial";
@@ -1591,6 +1591,32 @@ function keepCallAliveForProcessing(req, twiml, message = "One moment while I ch
 
 function normStr(s) {
   return String(s || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+}
+
+const ALLOWED_INITIAL_INTENTS = new Map([
+  ["booking", "NEW_BOOKING"],
+  ["reschedule", "CANCEL_RESCHEDULE"],
+  ["cancel", "CANCEL_RESCHEDULE"],
+  ["quote", "QUOTE"],
+  ["support", "EXISTING_CUSTOMER"],
+  ["admin", "EXISTING_CUSTOMER"],
+  ["pricing", "QUOTE"]
+]);
+
+function normalizeIntentSpeech(text) {
+  return String(text || "")
+    .toLowerCase()
+    .trim()
+    .replace(/[^a-z0-9\s]/g, "")
+    .replace(/\s+/g, " ");
+}
+
+function resolveCallSid(req) {
+  const fromBody = String(req?.body?.CallSid || req?.body?.CallSID || "").trim();
+  const fromQuery = String(req?.query?.CallSid || req?.query?.CallSID || "").trim();
+  if (fromBody) return fromBody;
+  if (fromQuery) return fromQuery;
+  return `missing-callsid-${String(req?.body?.From || req?.query?.From || "unknown").trim() || "unknown"}`;
 }
 
 function looksLikePhoneOrJunkName(s) {
@@ -2144,7 +2170,7 @@ app.post("/process-speech", async (req, res) => {
 
     const tz = tradie.timezone;
 
-    const callSid = req.body.CallSid || req.body.CallSID || "unknown";
+    const callSid = resolveCallSid(req);
     const fromNumber = (req.body.From || "").trim();
 
     const hasSpeechField = Object.prototype.hasOwnProperty.call(req.body || {}, "SpeechResult") ||
@@ -2326,40 +2352,46 @@ app.post("/process-speech", async (req, res) => {
 
     // STEP: intent
     if (session.step === "intent") {
-      session.intent = detectIntent(speech);
+      const normalized = normalizeIntentSpeech(speech);
+      const mappedIntent = ALLOWED_INITIAL_INTENTS.get(normalized);
 
-      // Emergency short-circuit
-      if (session.intent === "EMERGENCY") {
-        session.step = "address";
-        session.lastPrompt = "Understood. What is the address right now?";
-        addToHistory(session, "assistant", session.lastPrompt);
-        ask(twiml, session.lastPrompt, actionUrl);
-        return res.type("text/xml").send(twiml.toString());
-      }
+      // If caller says a supported intent keyword, follow existing routing.
+      if (mappedIntent) {
+        session.intent = mappedIntent;
 
-      // Cancel/reschedule
-      if (session.intent === "CANCEL_RESCHEDULE") {
-        session.step = "name";
-        session.lastPrompt = "No worries. What is your name so we can reschedule you?";
-        addToHistory(session, "assistant", session.lastPrompt);
-        ask(twiml, session.lastPrompt, actionUrl);
-        return res.type("text/xml").send(twiml.toString());
-      }
+        // Cancel/reschedule
+        if (session.intent === "CANCEL_RESCHEDULE") {
+          session.step = "name";
+          session.lastPrompt = "No worries. What is your name so we can reschedule you?";
+          addToHistory(session, "assistant", session.lastPrompt);
+          ask(twiml, session.lastPrompt, actionUrl);
+          return res.type("text/xml").send(twiml.toString());
+        }
 
-      // Quote
-      if (session.intent === "QUOTE") {
+        // Quote
+        if (session.intent === "QUOTE") {
+          session.step = "job";
+          session.lastPrompt = "Sure. What do you need a quote for?";
+          addToHistory(session, "assistant", session.lastPrompt);
+          ask(twiml, session.lastPrompt, actionUrl);
+          return res.type("text/xml").send(twiml.toString());
+        }
+
+        // Support/admin/existing or booking defaults to normal booking flow.
         session.step = "job";
-        session.lastPrompt = "Sure. What do you need a quote for?";
+        session.lastPrompt = "What job do you need help with?";
         addToHistory(session, "assistant", session.lastPrompt);
         ask(twiml, session.lastPrompt, actionUrl);
         return res.type("text/xml").send(twiml.toString());
       }
 
-      // Normal booking
-      session.step = "job";
-      session.lastPrompt = "What job do you need help with?";
+      // Otherwise treat first answer as the job description and continue.
+      if (speech) session.job = speech;
+      session.intent = "NEW_BOOKING";
+      session.step = "address";
+      session.lastPrompt = `Got it — ${session.job}. What’s the address for the job?`;
       addToHistory(session, "assistant", session.lastPrompt);
-      ask(twiml, session.lastPrompt, actionUrl);
+      ask(twiml, session.lastPrompt, actionUrl, { input: "speech" });
       return res.type("text/xml").send(twiml.toString());
     }
 
@@ -2739,11 +2771,11 @@ ${historyLine}${memoryLine}${accessLine2}`.trim()).catch(() => {});
       return res.type("text/xml").send(twiml.toString());
     }
 
-    // Fallback
+    // Fallback for missing/unknown step
     session.step = "intent";
-    session.lastPrompt = "How can we help today? You can say emergency, quote, reschedule, or new booking.";
+    session.lastPrompt = "Hi. What would you like help with today?";
     addToHistory(session, "assistant", session.lastPrompt);
-    ask(twiml, session.lastPrompt, actionUrl);
+    ask(twiml, session.lastPrompt, actionUrl, { input: "speech" });
     return res.type("text/xml").send(twiml.toString());
   } catch (err) {
     console.error("VOICE ERROR:", err);
