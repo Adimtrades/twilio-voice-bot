@@ -45,6 +45,7 @@ const { createClient } = require("@supabase/supabase-js");
 // ----------------------------------------------------------------------------
 const app = express();
 app.set("trust proxy", true);
+app.set("strict routing", false);
 
 // ----------------------------------------------------------------------------
 // Process-level safety
@@ -77,6 +78,8 @@ app.use((req, res, next) => {
 
 const VoiceResponse = twilio.twiml.VoiceResponse;
 const MessagingResponse = twilio.twiml.MessagingResponse;
+const MAX_NO_SPEECH_RETRIES = Number(process.env.MAX_NO_SPEECH_RETRIES || 2);
+const CALENDAR_OP_TIMEOUT_MS = Number(process.env.CALENDAR_OP_TIMEOUT_MS || 8000);
 
 // ----------------------------------------------------------------------------
 // Helpers: Base URL
@@ -1508,6 +1511,56 @@ function cleanSpeech(text) {
   return String(text).trim().replace(/\s+/g, " ");
 }
 
+async function withTimeout(promise, ms, label = "operation") {
+  let timer;
+  const timeoutErr = new Error(`${label} timed out after ${ms}ms`);
+  timeoutErr.code = "TIMEOUT";
+  const timeoutPromise = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(timeoutErr), ms);
+  });
+
+  try {
+    return await Promise.race([promise, timeoutPromise]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function logVoiceStep(req, { callSid = "unknown", step = "unknown", speech = "", retryCount = 0 } = {}) {
+  console.log(
+    `VOICE callSid=${callSid} step=${step} method=${req.method} path=${req.path} speechLen=${speech.length} retryCount=${retryCount}`
+  );
+}
+
+function voiceActionUrl(req) {
+  return "/process-speech" + (req.query.tid ? `?tid=${encodeURIComponent(req.query.tid)}` : "");
+}
+
+function buildInitialVoiceTwiml(req, greetingText = "Hi, this is your AI receptionist. How can I help you today?") {
+  const twiml = new VoiceResponse();
+  const gather = twiml.gather({
+    input: "speech",
+    timeout: 5,
+    speechTimeout: "auto",
+    action: voiceActionUrl(req),
+    method: "POST"
+  });
+  gather.say(greetingText, { voice: "Polly.Amy", language: "en-AU" });
+  return twiml;
+}
+
+function handleVoiceEntry(req, res) {
+  const twiml = buildInitialVoiceTwiml(req);
+  const callSid = req.body?.CallSid || req.query?.CallSid || "unknown";
+  const fromNumber = (req.body?.From || req.query?.From || "").trim();
+  const session = getSession(callSid, fromNumber);
+  session.hasEnteredVoice = true;
+  session.lastNoSpeechFallback = false;
+  session.silenceTries = 0;
+  logVoiceStep(req, { callSid, step: "initial", speech: "", retryCount: 0 });
+  return res.type("text/xml").send(twiml.toString());
+}
+
 function ask(twiml, prompt, actionUrl, options = {}) {
   const gather = twiml.gather({
     input: "speech dtmf",
@@ -2051,28 +2104,13 @@ Action: Call/text back ASAP.`;
 // ----------------------------------------------------------------------------
 // VOICE ROUTES
 // ----------------------------------------------------------------------------
-app.post("/voice", async (req, res) => {
-  const twiml = new VoiceResponse();
-
+app.all("/voice", async (req, res) => {
   try {
     if (!validateTwilioSignature(req)) return res.status(403).send("Forbidden");
-
-    const callSid = req.body.CallSid || req.body.CallSID || "unknown";
-    const fromNumber = (req.body.From || "").trim();
-    const session = getSession(callSid, fromNumber);
-    session.hasEnteredVoice = true;
-    session.lastNoSpeechFallback = false;
-
-    const actionUrl = "/process-speech" + (req.query.tid ? `?tid=${encodeURIComponent(req.query.tid)}` : "");
-
-    console.log(`INITIAL_CALL CALLSID=${callSid} FROM=${fromNumber}`);
-
-    const gather = twiml.gather({ input: "speech", timeout: 5, speechTimeout: "auto", action: actionUrl, method: "POST" });
-    gather.say("Hi, this is your AI receptionist. How can I help you today?", { voice: "Polly.Amy", language: "en-AU" });
-
-    return res.type("text/xml").send(twiml.toString());
+    return handleVoiceEntry(req, res);
   } catch (e) {
     console.error("/voice error", e);
+    const twiml = new VoiceResponse();
     twiml.say("Sorry, there was a temporary issue. Please try again.", { voice: "Polly.Amy", language: "en-AU" });
     return res.type("text/xml").send(twiml.toString());
   }
@@ -2117,11 +2155,8 @@ app.post("/process-speech", async (req, res) => {
       session.hasEnteredVoice = true;
       session.lastNoSpeechFallback = false;
       console.log(`INITIAL_CALL TID=${tradie.key} CALLSID=${callSid} FROM=${fromNumber} VIA=/process-speech`);
-
-      const actionUrl = "/process-speech" + (req.query.tid ? `?tid=${encodeURIComponent(req.query.tid)}` : "");
-      const gather = twiml.gather({ input: "speech", timeout: 5, speechTimeout: "auto", action: actionUrl, method: "POST" });
-      gather.say("Hi, this is your AI receptionist. How can I help you today?", { voice: "Polly.Amy", language: "en-AU" });
-      return res.type("text/xml").send(twiml.toString());
+      logVoiceStep(req, { callSid, step: session.step, speech, retryCount: session.silenceTries || 0 });
+      return res.type("text/xml").send(buildInitialVoiceTwiml(req).toString());
     }
 
     if (speech) {
@@ -2131,6 +2166,7 @@ app.post("/process-speech", async (req, res) => {
     }
 
     console.log(`TID=${tradie.key} CALLSID=${callSid} TO=${req.body.To} FROM=${fromNumber} STEP=${session.step} Speech="${speech}" Digits="${digits}" Confidence=${confidence}`);
+    logVoiceStep(req, { callSid, step: session.step, speech, retryCount: session.silenceTries || 0 });
 
     // Abuse handling
     if (speech && detectAbuse(speech)) {
@@ -2155,9 +2191,18 @@ app.post("/process-speech", async (req, res) => {
     }
 
     // Handle no-speech timeout from <Gather> callback only
-    if (!speech && !digits && hasConfidence) {
+    if (!speech && !digits && hasSpeechField) {
       console.log(`NO_SPEECH_TIMEOUT TID=${tradie.key} CALLSID=${callSid} FROM=${fromNumber}`);
       session.silenceTries += 1;
+      if (session.silenceTries > MAX_NO_SPEECH_RETRIES) {
+        await missedRevenueAlert(tradie, session, "Max no-speech retries reached").catch(() => {});
+        twiml.say("Sorry we couldn't hear you. We'll send you a text with the next steps, or someone will call you back shortly.", { voice: "Polly.Amy", language: "en-AU" });
+        if (session.from) {
+          await sendCustomerSms(tradie, session.from, "Sorry we missed you on the call. Reply here and we can help with your booking.").catch(() => {});
+        }
+        resetSession(callSid);
+        return res.type("text/xml").send(twiml.toString());
+      }
       const prompt = session.lastNoSpeechFallback
         ? "Could you please tell me how I can help you today?"
         : "Sorry, I didn’t catch that. Could you please repeat that?";
@@ -2438,7 +2483,11 @@ app.post("/process-speech", async (req, res) => {
 
       // If calendar configured, offer next 3 slots if requested time is busy
       if (tradie.calendarId && tradie.googleServiceJson) {
-        const slots = await nextAvailableSlots(tradie, dt, 3);
+        const slots = await withTimeout(
+          nextAvailableSlots(tradie, dt, 3),
+          CALENDAR_OP_TIMEOUT_MS,
+          "calendar availability"
+        );
 
         if (slots.length === 0) {
           await missedRevenueAlert(tradie, session, "No availability found (14d) — manual scheduling").catch(() => {});
@@ -2472,7 +2521,11 @@ app.post("/process-speech", async (req, res) => {
       if (tradie.calendarId && tradie.googleServiceJson) {
         try {
           const calendar = getCalendarClient(tradie);
-          const dup = await findDuplicate(calendar, tradie.calendarId, tz, session.name, session.address, dt);
+          const dup = await withTimeout(
+            findDuplicate(calendar, tradie.calendarId, tz, session.name, session.address, dt),
+            CALENDAR_OP_TIMEOUT_MS,
+            "calendar duplicate check"
+          );
           session.duplicateEvent = dup;
         } catch {}
       }
@@ -2623,7 +2676,7 @@ ${historyLine}${memoryLine}${accessLine2}`.trim()).catch(() => {});
       if (tradie.calendarId && tradie.googleServiceJson) {
         try {
           const calendar = getCalendarClient(tradie);
-          await insertCalendarEventWithRetry(calendar, tradie.calendarId, {
+          await withTimeout(insertCalendarEventWithRetry(calendar, tradie.calendarId, {
             summary: `${session.name} — ${session.job}`.slice(0, 120),
             location: session.address,
             description: [
@@ -2633,7 +2686,7 @@ ${historyLine}${memoryLine}${accessLine2}`.trim()).catch(() => {});
             ].filter(Boolean).join("\n"),
             start: { dateTime: toGoogleDateTime(startDt), timeZone: tz },
             end: { dateTime: toGoogleDateTime(endDt), timeZone: tz }
-          });
+          }), CALENDAR_OP_TIMEOUT_MS, "calendar insert");
         } catch (e) {
           console.warn("Calendar insert failed, continuing:", e?.message || e);
           await missedRevenueAlert(tradie, session, "Calendar insert failed — manual follow-up").catch(() => {});
@@ -2744,12 +2797,20 @@ app.post("/sms", async (req, res) => {
   }
 });
 
-app.post("/twilio/voice", (req, res) => {
-  return res.redirect(307, "/voice");
+app.all("/twilio/voice", async (req, res) => {
+  try {
+    if (!validateTwilioSignature(req)) return res.status(403).send("Forbidden");
+    return handleVoiceEntry(req, res);
+  } catch (e) {
+    console.error("/twilio/voice error", e);
+    const twiml = new VoiceResponse();
+    twiml.say("Sorry, we hit a temporary issue. Please try again.", { voice: "Polly.Amy", language: "en-AU" });
+    return res.type("text/xml").send(twiml.toString());
+  }
 });
 
-app.post("/voice/inbound", (req, res) => {
-  return res.redirect(307, "/voice");
+app.all("/voice/inbound", (req, res) => {
+  return handleVoiceEntry(req, res);
 });
 
 app.post("/twilio/status", (req, res) => {
