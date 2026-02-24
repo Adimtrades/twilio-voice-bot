@@ -823,12 +823,12 @@ async function getTradieByStripeRefs({ customerId, subscriptionId } = {}) {
   return null;
 }
 
-async function getTradieProvisioningRecord(tradieId) {
-  if (!supaReady() || !supabase || !tradieId) return null;
+async function getTradieProvisioningRecord(tradieKey) {
+  if (!supaReady() || !supabase || !tradieKey) return null;
   const { data } = await supabase
     .from(SUPABASE_TRADIE_ACCOUNTS_TABLE)
     .select("*")
-    .eq("tradie_id", tradieId)
+    .eq("tradie_key", tradieKey)
     .maybeSingle();
   return data || null;
 }
@@ -838,7 +838,7 @@ async function provisionTwilioNumberForTradie(tradie, reqForBaseUrl) {
   const tradieKey = String(tradie?.tradie_key || tradieId).trim();
   if (!tradieId) throw new Error("Cannot provision: missing tradie id");
 
-  const existingProvisioning = await getTradieProvisioningRecord(tradieId);
+  const existingProvisioning = await getTradieProvisioningRecord(tradieKey);
   if (tradie?.twilio_phone_number || tradie?.twilio_number || existingProvisioning?.twilio_phone_number || existingProvisioning?.provisioning_status === "PROVISIONED") {
     console.log("twilio provisioning skipped: already provisioned", { tradie_id: tradieId, stripe_customer_id: tradie?.stripe_customer_id || "" });
     return {
@@ -1224,7 +1224,7 @@ async function ensureProvisioningForActiveSubscription({ customerId, subscriptio
   const tradie = await getTradieByStripeRefs({ customerId, subscriptionId });
   if (!tradie?.id) return;
 
-  const existingProvisioning = await getTradieProvisioningRecord(tradie.id);
+  const existingProvisioning = await getTradieProvisioningRecord(tradie.tradie_key || tradie.id);
   if (tradie?.twilio_phone_number || tradie?.twilio_number || existingProvisioning?.twilio_phone_number || existingProvisioning?.provisioning_status === "PROVISIONED") {
     console.log("twilio provisioning skipped", { tradie_id: tradie.id, stripe_customer_id: customerId || "" });
     return;
@@ -2181,9 +2181,7 @@ async function resolveCalendarTarget(tradie, context = {}) {
       .select("calendar_email,calendar_id,timezone")
       .limit(1);
 
-    const scoped = tradie?.id
-      ? query.eq("tradie_id", tradie.id)
-      : query.eq("tradie_key", tradie.key);
+    const scoped = query.eq("tradie_key", tradie.key || tradie.id);
 
     const { data, error } = await scoped.single();
     if (error && error.code !== "PGRST116") {
