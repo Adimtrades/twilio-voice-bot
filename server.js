@@ -595,78 +595,92 @@ async function getLatestActiveTwilioNumberForTradie(tradieId) {
   return String(data?.[0]?.phone_number || "").trim();
 }
 
-function buildActivationEmailContent({ tradie, twilioNumber, setupLink, supportEmail }) {
-  const greeting = tradie?.business_name || "there";
-  const hasNumber = !!twilioNumber;
-  const numberLine = hasNumber
-    ? `Your newly provisioned AI receptionist number (E.164): ${twilioNumber}`
-    : "Your AI receptionist number is being provisioned. You will receive it shortly.";
+function buildActivationEmailContent({ customerName, businessName, provisionedPhoneNumber }) {
+  const safeCustomerName = customerName || "there";
+  const safeBusinessName = businessName || "Your Business";
+  const safePhoneNumber = provisionedPhoneNumber || "Not available";
+  const serviceAccountEmail = "twilio-voice@twilio-voice-booking.iam.gserviceaccount.com";
 
   const text =
-`Hi ${greeting},
+`Hi ${safeCustomerName},
 
-Your AI Receptionist is now live.
+Your AI booking assistant is now live.
 
-${numberLine}
+📞 Your dedicated booking number:
+${safePhoneNumber}
 
-This is your AI Receptionist number. Customers call it and it answers, collects job details, and books into your calendar.
+Save this number as "${safeBusinessName} Bookings".
 
-To enable calendar booking permissions, please share your Google Calendar with adimtrades@gmail.com (permission: Make changes to events):
-1) Open Google Calendar on web
-2) Left sidebar → My calendars → choose your calendar → three dots → Settings and sharing
-3) Share with specific people → Add adimtrades@gmail.com
-4) Set permission to “Make changes to events”
-5) Save
+To enable automatic bookings into your Google Calendar, please complete this quick step:
 
-If you have multiple calendars, share the one you want bookings to go into.
+1. Open Google Calendar
+2. Click Settings (⚙ icon, top right)
+3. Select your main calendar (left sidebar)
+4. Click “Share with specific people”
+5. Add this email:
+${serviceAccountEmail}
+6. Set permission to:
+"Make changes to events"
+7. Click Send
 
-Reply to this email once done so we can finish verification.
-Setup link: ${setupLink}
+Once done, your assistant will automatically create bookings in your calendar.
 
-Need help? ${supportEmail}`;
+No other setup is required.
 
-  const html = `<p>Hi ${greeting},</p>
-<p><strong>Your AI Receptionist is now live.</strong></p>
-<p>${hasNumber
-    ? `<strong>Your newly provisioned AI receptionist number (E.164): ${twilioNumber}</strong>`
-    : "Your AI receptionist number is being provisioned. You will receive it shortly."}</p>
-<p>This is your AI Receptionist number. Customers call it and it answers, collects job details, and books into your calendar.</p>
-<p><strong>Enable calendar booking permissions:</strong><br/>Share your Google Calendar with <strong>adimtrades@gmail.com</strong> and set permission to <strong>Make changes to events</strong>.</p>
+If you need help, simply reply to this email and we’ll assist immediately.
+
+Thanks,
+AdimTrades Automation`;
+
+  const html = `<p>Hi ${safeCustomerName},</p>
+<p>Your AI booking assistant is now live.</p>
+<p>📞 <strong>Your dedicated booking number:</strong><br/>${safePhoneNumber}</p>
+<p>Save this number as "${safeBusinessName} Bookings".</p>
+<p>To enable automatic bookings into your Google Calendar, please complete this quick step:</p>
 <ol>
-  <li>Open Google Calendar on web</li>
-  <li>Left sidebar → My calendars → choose your calendar → three dots → Settings and sharing</li>
-  <li>Share with specific people → Add <strong>adimtrades@gmail.com</strong></li>
-  <li>Set permission to “Make changes to events”</li>
-  <li>Save</li>
+  <li>Open Google Calendar</li>
+  <li>Click Settings (⚙ icon, top right)</li>
+  <li>Select your main calendar (left sidebar)</li>
+  <li>Click “Share with specific people”</li>
+  <li>Add this email:<br/><strong>${serviceAccountEmail}</strong></li>
+  <li>Set permission to:<br/>"Make changes to events"</li>
+  <li>Click Send</li>
 </ol>
-<p>If you have multiple calendars, share the one you want bookings to go into.</p>
-<p>Reply to this email once done so we can finish verification.</p>
-<p>Setup link: <a href="${setupLink}">${setupLink}</a></p>
-<p>Need help? <a href="mailto:${supportEmail}">${supportEmail}</a></p>`;
+<p>Once done, your assistant will automatically create bookings in your calendar.</p>
+<p>No other setup is required.</p>
+<p>If you need help, simply reply to this email and we’ll assist immediately.</p>
+<p>Thanks,<br/>AdimTrades Automation</p>`;
 
   return { text, html };
 }
 
-async function sendActivationEmailForTradie({ tradie, reqForBaseUrl, emailFallback = "", source = "" }) {
+async function sendActivationEmailForTradie({ tradie, provisionedPhoneNumber = "", emailFallback = "", source = "" }) {
   const recipient = String(tradie?.email || emailFallback || "").trim();
   if (!recipient) {
     console.warn("activation email skipped: missing recipient", { tradie_id: tradie?.id || "", source });
     return;
   }
 
-  const baseUrl = getBaseUrl(reqForBaseUrl || { headers: {} });
-  const setupLink = `${baseUrl}/onboarding?tradie_id=${encodeURIComponent(tradie.id)}`;
-  const supportEmail = String(process.env.SUPPORT_EMAIL || process.env.FROM_EMAIL || "support@example.com").trim();
-  const twilioNumber = await getLatestActiveTwilioNumberForTradie(tradie.id);
+  const twilioNumber = String(provisionedPhoneNumber || "").trim() || await getLatestActiveTwilioNumberForTradie(tradie.id);
   const fallbackTriggered = !twilioNumber;
+  const customerName = String(tradie?.customer_name || tradie?.name || tradie?.owner_name || tradie?.business_name || "there").trim();
+  const businessName = String(tradie?.business_name || tradie?.biz_name || tradie?.bizName || "Your Business").trim();
 
   console.log("activation email target", { to: recipient, source });
   console.log("activation email context", { tradie_id: tradie.id, stripe_customer_id: tradie.stripe_customer_id || "", source });
   console.log("activation email number", { twilioNumber: twilioNumber || "", fallbackTriggered, source });
 
-  const { text, html } = buildActivationEmailContent({ tradie, twilioNumber, setupLink, supportEmail });
+  const { text, html } = buildActivationEmailContent({
+    customerName,
+    businessName,
+    provisionedPhoneNumber: twilioNumber
+  });
   try {
-    await sendTradieEmail(recipient, "Your AI Receptionist is Live — Your New Number Inside", text, html);
+    await sendTradieEmail(recipient, "Your Booking Number is Ready 🚀 (Action Required)", text, html);
+    console.log("Activation email sent with booking number and calendar instructions", {
+      tradie_id: tradie.id,
+      source
+    });
   } catch (err) {
     console.error("activation email send failed", { tradie_id: tradie.id, source, error: err?.message || err });
   }
@@ -1190,7 +1204,11 @@ async function ensureProvisioningForActiveSubscription({ customerId, subscriptio
   try {
     const provisioned = await provisionTwilioNumberForTradie(tradie, reqForBaseUrl);
     if (provisioned?.skipped) return;
-    await sendActivationEmailForTradie({ tradie, reqForBaseUrl, source: "ensureProvisioningForActiveSubscription" });
+    await sendActivationEmailForTradie({
+      tradie,
+      provisionedPhoneNumber: provisioned?.phoneNumber || "",
+      source: "ensureProvisioningForActiveSubscription"
+    });
   } catch (err) {
     await markProvisioningFailure(tradie, err?.message || err);
   }
@@ -1224,19 +1242,13 @@ async function syncActiveSubscriptionAndProvision({ customerId, subscriptionId, 
 
   if (provisioned.skipped) {
     console.log("stripe provisioning step: number already exists, skipping buy", { tradie_id: tradie.id, phone: provisioned.phoneNumber || "" });
-    await sendActivationEmailForTradie({
-      tradie: refreshedTradie || tradie,
-      reqForBaseUrl,
-      emailFallback: email,
-      source: "syncActiveSubscriptionAndProvision:existing"
-    });
     return;
   }
 
   console.log("stripe provisioning step: number provisioned", { tradie_id: tradie.id, phone: provisioned.phoneNumber });
   await sendActivationEmailForTradie({
     tradie: refreshedTradie || tradie,
-    reqForBaseUrl,
+    provisionedPhoneNumber: provisioned.phoneNumber || "",
     emailFallback: email,
     source: "syncActiveSubscriptionAndProvision:new"
   });
