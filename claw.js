@@ -9,6 +9,7 @@ console.error('Claw unhandled rejection:', err);
 require('dotenv').config();
 const OpenAI = require("openai");
 const { createClient } = require('@supabase/supabase-js');
+const config = require('./claw.config');
 
 const openai = new OpenAI({
 apiKey: process.env.OPENAI_API_KEY
@@ -50,6 +51,11 @@ async function clawCycle() {
 // TODO: place continuous testing/improvement logic here.
 // For now, just log a heartbeat so we can confirm it runs 24/7.
 console.log("Claw heartbeat:", new Date().toISOString());
+
+if (process.env.RUN_TESTS === "true") {
+console.log("Running test hook...");
+// Future test runner logic here
+}
 }
 
 async function runClaw() {
@@ -61,7 +67,7 @@ await clawCycle();
 console.error("Claw cycle error:", err);
 }
 
-setTimeout(runClaw, 60000);
+setTimeout(runClaw, config.intervalMs);
 }
 
 runClaw();

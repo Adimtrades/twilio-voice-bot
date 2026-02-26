@@ -40,6 +40,28 @@ const { DateTime } = require("luxon");
 const { google } = require("googleapis");
 const { createClient } = require("@supabase/supabase-js");
 const OpenAI = require("openai");
+
+const requiredEnv = [
+  "SUPABASE_URL",
+  "SUPABASE_SERVICE_ROLE_KEY",
+  "OPENAI_API_KEY"
+];
+
+requiredEnv.forEach((key) => {
+  if (!process.env[key]) {
+    console.error(`Missing ENV variable: ${key}`);
+  }
+});
+
+const BOT_VERSION = "v1.0.0";
+console.log("Bot version:", BOT_VERSION);
+
+const DEV_MODE = process.env.DEV_MODE === "true";
+
+if (DEV_MODE) {
+  console.log("⚠️ Running in DEV_MODE");
+}
+
 // Start Claw bot in background
 require('./claw');
 // ----------------------------------------------------------------------------
