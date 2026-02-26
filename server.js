@@ -2435,13 +2435,112 @@ function parseGoogleServiceJson(raw) {
   if (typeof parsed === "string") parsed = JSON.parse(parsed);
   return parsed;
 }
-function getCalendarClient(tradie) {
-  const credentials = parseGoogleServiceJson(tradie.googleServiceJson);
-  const auth = new google.auth.GoogleAuth({
-    credentials,
-    scopes: ["https://www.googleapis.com/auth/calendar"]
-  });
-  return google.calendar({ version: "v3", auth });
+
+async function getAuthorizedGoogleClientForTradie(tradieId) {
+  try {
+    if (!supabase) throw new Error("Database not configured");
+    if (!tradieId) throw new Error("Missing tradieId");
+
+    const { data, error } = await supabase
+      .from(SUPABASE_TRADIE_ACCOUNTS_TABLE)
+      .select("id,google_refresh_token,google_access_token,google_token_expiry,google_connected")
+      .eq("id", tradieId)
+      .single();
+
+    if (error) throw error;
+
+    const refreshToken = String(data?.google_refresh_token || "").trim();
+    if (!refreshToken) throw new Error("Google not connected");
+
+    const auth = new google.auth.OAuth2(
+      process.env.GOOGLE_CLIENT_ID,
+      process.env.GOOGLE_CLIENT_SECRET,
+      `${BASE_URL}/google/callback`
+    );
+
+    const accessToken = String(data?.google_access_token || "").trim();
+    const expiryMs = data?.google_token_expiry ? new Date(data.google_token_expiry).getTime() : 0;
+
+    auth.setCredentials({
+      refresh_token: refreshToken,
+      ...(accessToken ? { access_token: accessToken } : {}),
+      ...(expiryMs ? { expiry_date: expiryMs } : {})
+    });
+
+    const now = Date.now();
+    const needsRefresh = !accessToken || !expiryMs || expiryMs <= (now + 2 * 60 * 1000);
+
+    if (needsRefresh) {
+      let refreshedAccessToken = "";
+      let refreshedExpiryMs = 0;
+
+      try {
+        const refreshed = await auth.refreshAccessToken();
+        if (refreshed?.credentials) {
+          refreshedAccessToken = String(refreshed.credentials.access_token || "").trim();
+          refreshedExpiryMs = Number(refreshed.credentials.expiry_date || 0);
+        }
+      } catch (refreshErr) {
+        console.error("GOOGLE_TOKEN_REFRESH_ACCESS_TOKEN_ERROR", refreshErr);
+      }
+
+      if (!refreshedAccessToken) {
+        const tokenResp = await auth.getAccessToken();
+        refreshedAccessToken = String(tokenResp?.token || "").trim();
+      }
+
+      const finalAccessToken = refreshedAccessToken || String(auth.credentials?.access_token || "").trim();
+      const finalExpiryMs = Number(refreshedExpiryMs || auth.credentials?.expiry_date || 0);
+
+      if (finalAccessToken) {
+        auth.setCredentials({
+          ...auth.credentials,
+          access_token: finalAccessToken,
+          ...(finalExpiryMs ? { expiry_date: finalExpiryMs } : {})
+        });
+
+        const updatePayload = {
+          google_access_token: finalAccessToken,
+          google_token_expiry: finalExpiryMs ? new Date(finalExpiryMs).toISOString() : null,
+          google_connected: true
+        };
+
+        const { error: updateError } = await supabase
+          .from(SUPABASE_TRADIE_ACCOUNTS_TABLE)
+          .update(updatePayload)
+          .eq("id", tradieId);
+
+        if (updateError) {
+          console.error("GOOGLE_TOKEN_UPDATE_ERROR", {
+            tradieId,
+            message: updateError.message,
+            code: updateError.code || null
+          });
+        }
+      }
+    }
+
+    return auth;
+  } catch (error) {
+    console.error("GOOGLE_AUTH_CLIENT_ERROR", {
+      tradieId,
+      message: error?.message || String(error)
+    });
+    throw error;
+  }
+}
+
+async function getCalendarClient(tradieId) {
+  try {
+    const auth = await getAuthorizedGoogleClientForTradie(tradieId);
+    return google.calendar({ version: "v3", auth });
+  } catch (error) {
+    console.error("GET_CALENDAR_CLIENT_ERROR", {
+      tradieId,
+      message: error?.message || String(error)
+    });
+    throw error;
+  }
 }
 function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
 
@@ -2529,7 +2628,7 @@ async function createBookingCalendarEvent({ tradie, booking, context = {} }) {
 
   let calendar;
   try {
-    calendar = getCalendarClient(tradie);
+    calendar = await getCalendarClient(tradie.id);
   } catch (err) {
     console.error("CALENDAR_EVENT_CREATE_ERROR", {
       message: err?.message || String(err),
@@ -2699,14 +2798,14 @@ async function getBusy(calendar, calendarId, tz, timeMinISO, timeMaxISO) {
 }
 
 async function nextAvailableSlots(tradie, startSearchDt, count = 3) {
-  if (!(tradie.calendarId && tradie.googleServiceJson)) return [];
+  if (!tradie.calendarId) return [];
   const tz = tradie.timezone;
 
   let start = startSearchDt;
   if (!start || !DateTime.isDateTime(start) || !start.isValid) start = DateTime.now().setZone(tz).plus({ minutes: 10 }).startOf("minute");
   else start = start.setZone(tz);
 
-  const calendar = getCalendarClient(tradie);
+  const calendar = await getCalendarClient(tradie.id);
   const searchEnd = start.plus({ days: 14 });
 
   const busy = await getBusy(
@@ -3170,11 +3269,11 @@ app.post("/process", async (req, res) => {
       }
 
       // address history
-      if (tradie.calendarId && tradie.googleServiceJson) {
+      if (tradie.calendarId && tradie.id) {
         try {
-          const calendar = getCalendarClient(tradie);
+          const calendar = await getCalendarClient(tradie.id);
           session.lastAtAddress = await getLastBookingAtAddress(calendar, tradie.calendarId, tz, session.address);
-        } catch {}
+        } catch (error) { console.error("CALENDAR_ADDRESS_HISTORY_ERROR", error); }
       }
 
       session.step = "name";
@@ -3259,7 +3358,7 @@ app.post("/process", async (req, res) => {
         if (!dt) dt = DateTime.now().setZone(tz).plus({ minutes: 10 }).startOf("minute");
       }
 
-      if (tradie.calendarId && tradie.googleServiceJson) {
+      if (tradie.calendarId && tradie.id) {
         session.bookedStartMs = dt.toMillis();
         session.calendarCheck = {
           requestedDtISO: dt.toISO(),
@@ -3275,16 +3374,18 @@ app.post("/process", async (req, res) => {
       const whenText = formatForVoice(dt);
 
       // Duplicate detection (calendar)
-      if (tradie.calendarId && tradie.googleServiceJson) {
+      if (tradie.calendarId && tradie.id) {
         try {
-          const calendar = getCalendarClient(tradie);
+          const calendar = await getCalendarClient(tradie.id);
           const dup = await withTimeout(
             findDuplicate(calendar, tradie.calendarId, tz, session.name, session.address, dt),
             CALENDAR_OP_TIMEOUT_MS,
             "calendar duplicate check"
           );
           session.duplicateEvent = dup;
-        } catch {}
+        } catch (error) {
+          console.error("CALENDAR_DUPLICATE_CHECK_ERROR", error);
+        }
       }
 
       if (session.duplicateEvent) {
@@ -3698,7 +3799,7 @@ app.post("/check-availability", async (req, res) => {
     const callSid = resolveCallSid(req);
     const fromNumber = (req.body.From || "").trim();
     const session = getSession(callSid, fromNumber);
-    if (!(tradie.calendarId && tradie.googleServiceJson)) {
+    if (!(tradie.calendarId && tradie.id)) {
       twiml.redirect({ method: "POST" }, "/confirm" + (req.query.tid ? `?tid=${encodeURIComponent(req.query.tid)}` : ""));
       return sendVoiceTwiml(res, twiml);
     }
