@@ -125,29 +125,90 @@ app.get('/health', (req, res) => {
   });
 });
 
+const BASE_URL = process.env.BASE_URL || "http://localhost:3000";
+const GOOGLE_REDIRECT_URI = `${BASE_URL}/google/callback`;
+
 const oauth2Client = new google.auth.OAuth2(
-process.env.GOOGLE_CLIENT_ID,
-process.env.GOOGLE_CLIENT_SECRET,
-process.env.GOOGLE_REDIRECT_URI
+  process.env.GOOGLE_CLIENT_ID,
+  process.env.GOOGLE_CLIENT_SECRET,
+  GOOGLE_REDIRECT_URI
 );
 
-app.get("/google/auth", (req, res) => {
-const url = oauth2Client.generateAuthUrl({
-access_type: "offline",
-scope: ["https://www.googleapis.com/auth/calendar"],
-prompt: "consent"
-});
-res.redirect(url);
+app.get("/google/auth", async (req, res) => {
+  try {
+    const tradieId = String(req.query.tradieId || "").trim();
+    if (!tradieId) {
+      return res.status(400).json({ error: "tradieId is required" });
+    }
+
+    if (!process.env.GOOGLE_CLIENT_ID || !process.env.GOOGLE_CLIENT_SECRET) {
+      console.error("GOOGLE_AUTH_ENV_MISSING", {
+        hasClientId: !!process.env.GOOGLE_CLIENT_ID,
+        hasClientSecret: !!process.env.GOOGLE_CLIENT_SECRET
+      });
+      return res.status(500).json({ error: "Google OAuth is not configured" });
+    }
+
+    const url = oauth2Client.generateAuthUrl({
+      access_type: "offline",
+      prompt: "consent",
+      scope: [
+        "https://www.googleapis.com/auth/calendar.readonly",
+        "https://www.googleapis.com/auth/calendar.events"
+      ],
+      state: tradieId
+    });
+
+    return res.redirect(url);
+  } catch (error) {
+    console.error("GOOGLE_AUTH_ROUTE_ERROR", error);
+    return res.status(500).json({ error: "Unable to start Google authorization" });
+  }
 });
 
 app.get("/google/callback", async (req, res) => {
-const { code } = req.query;
-const { tokens } = await oauth2Client.getToken(code);
-oauth2Client.setCredentials(tokens);
+  try {
+    const code = String(req.query.code || "").trim();
+    const tradieId = String(req.query.state || "").trim();
 
-// TODO: store tokens in Supabase linked to tradie account
+    if (!code || !tradieId) {
+      return res.status(400).json({ error: "Missing code or tradieId" });
+    }
 
-res.send("Google connected successfully.");
+    if (!supabase) {
+      console.error("GOOGLE_CALLBACK_SUPABASE_NOT_READY");
+      return res.status(500).json({ error: "Database not configured" });
+    }
+
+    const { tokens } = await oauth2Client.getToken(code);
+    const refreshToken = String(tokens?.refresh_token || "").trim();
+
+    const updatePayload = { google_connected: true };
+    if (refreshToken) {
+      updatePayload.google_refresh_token = refreshToken;
+    } else {
+      console.error("GOOGLE_CALLBACK_REFRESH_TOKEN_MISSING", { tradieId });
+    }
+
+    const { error } = await supabase
+      .from(SUPABASE_TRADIES_TABLE)
+      .update(updatePayload)
+      .eq("id", tradieId);
+
+    if (error) {
+      console.error("GOOGLE_CALLBACK_SUPABASE_UPDATE_ERROR", {
+        tradieId,
+        message: error.message,
+        code: error.code || null
+      });
+      return res.status(500).json({ error: "Unable to save Google connection" });
+    }
+
+    return res.status(200).send("Google connected successfully.");
+  } catch (error) {
+    console.error("GOOGLE_CALLBACK_ERROR", error);
+    return res.status(500).json({ error: "Google connection failed" });
+  }
 });
 
 const VoiceResponse = twilio.twiml.VoiceResponse;
