@@ -31,8 +31,6 @@
 // ADMIN_DASH_PASSWORD
 
 try { require("dotenv").config(); } catch {}
-// Start Claw bot in background
-require('./claw');
 const express = require("express");
 const twilio = require("twilio");
 const nodemailer = require("nodemailer");
@@ -42,6 +40,8 @@ const { DateTime } = require("luxon");
 const { google } = require("googleapis");
 const { createClient } = require("@supabase/supabase-js");
 const OpenAI = require("openai");
+// Start Claw bot in background
+require('./claw');
 // ----------------------------------------------------------------------------
 // App bootstrap
 // ----------------------------------------------------------------------------
@@ -76,6 +76,10 @@ app.use((req, res, next) => {
 app.use((req, res, next) => {
   if (req.originalUrl === "/stripe/webhook") return next();
   return express.json({ limit: "1mb" })(req, res, next);
+});
+
+app.get('/health', (req, res) => {
+res.json({ status: "ok", time: new Date().toISOString() });
 });
 
 const VoiceResponse = twilio.twiml.VoiceResponse;

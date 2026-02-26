@@ -1,3 +1,11 @@
+process.on('uncaughtException', (err) => {
+console.error('Claw uncaught exception:', err);
+});
+
+process.on('unhandledRejection', (err) => {
+console.error('Claw unhandled rejection:', err);
+});
+
 require('dotenv').config();
 const OpenAI = require("openai");
 const { createClient } = require('@supabase/supabase-js');
@@ -36,3 +44,25 @@ console.log("Claw decision:", completion.choices[0].message.content);
 }
 
 setInterval(runClaw, 30000); // every 30 seconds
+
+{
+async function clawCycle() {
+// TODO: place continuous testing/improvement logic here.
+// For now, just log a heartbeat so we can confirm it runs 24/7.
+console.log("Claw heartbeat:", new Date().toISOString());
+}
+
+async function runClaw() {
+console.log("Claw cycle started at", new Date().toISOString());
+
+try {
+await clawCycle();
+} catch (err) {
+console.error("Claw cycle error:", err);
+}
+
+setTimeout(runClaw, 60000);
+}
+
+runClaw();
+}
