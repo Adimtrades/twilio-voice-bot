@@ -23,52 +23,42 @@ const supabase = (process.env.SUPABASE_URL && supabaseServiceKey)
   ? createClient(process.env.SUPABASE_URL, supabaseServiceKey)
   : null;
 
-async function clawCycle() {
-  console.log('Claw heartbeat:', new Date().toISOString());
+async function scanMessages() {
+  try {
+    console.log('Claw scanning database...');
 
-  if (!supabase) {
-    console.warn('Claw skipped: missing Supabase env vars (SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY (or SUPABASE_SERVICE_KEY)).');
-    return;
-  }
+    // Try ordering by timestamp first
+    let { data, error } = await supabase
+      .from('messages')
+      .select('*')
+      .order('timestamp', { ascending: false })
+      .limit(20);
 
-  if (!openai) {
-    console.warn('Claw skipped: missing OPENAI_API_KEY.');
-    return;
-  }
+    // If timestamp column fails, fallback to created_at
+    if (error && error.message.includes('timestamp')) {
+      console.warn('Timestamp column missing. Falling back to created_at.');
 
-  console.log('Claw scanning database...');
-  const { data: messages, error } = await supabase
-    .from('messages')
-    .select('*')
-    .order('timestamp', { ascending: false })
-    .limit(1);
+      const fallback = await supabase
+        .from('messages')
+        .select('*')
+        .order('created_at', { ascending: false })
+        .limit(20);
 
-  if (error) throw error;
-  if (!messages || messages.length === 0) return;
-
-  const latest = messages[0];
-  const completion = await openai.chat.completions.create({
-    model: 'gpt-4o-mini',
-    messages: [
-      { role: 'system', content: 'You are Claw. Analyze and decide action.' },
-      { role: 'user', content: latest.message || '' }
-    ]
-  });
-
-  console.log('Claw decision:', completion.choices?.[0]?.message?.content || '(no response)');
-}
-
-async function runClawForever() {
-  console.log(`Claw loop started. Interval: ${CLAW_INTERVAL_MS}ms`);
-
-  while (true) {
-    try {
-      await clawCycle();
-    } catch (err) {
-      console.error('Claw cycle error:', err);
+      data = fallback.data;
+      error = fallback.error;
     }
 
-    await new Promise((resolve) => setTimeout(resolve, CLAW_INTERVAL_MS));
+    if (error) {
+      console.error('Claw query error:', error);
+      return;
+    }
+
+    console.log(`Claw fetched ${data.length} messages.`);
+
+    // Continue processing safely
+    return data;
+  } catch (err) {
+    console.error('Claw fatal cycle error:', err);
   }
 }
 async function improvementCycle() {
@@ -84,4 +74,11 @@ setTimeout(improvementCycle, 300000); // every 5 mins
 
 improvementCycle();
 
-runClawForever();
+setInterval(async () => {
+  try {
+    await scanMessages();
+    console.log('Claw heartbeat:', new Date().toISOString());
+  } catch (err) {
+    console.error('Claw loop survived error:', err);
+  }
+}, 60000);
