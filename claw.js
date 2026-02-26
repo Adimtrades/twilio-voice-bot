@@ -71,5 +71,17 @@ async function runClawForever() {
     await new Promise((resolve) => setTimeout(resolve, CLAW_INTERVAL_MS));
   }
 }
+async function improvementCycle() {
+console.log("Claw improvement cycle running...");
+
+// 1. Pull latest logs from Supabase
+// 2. Analyze errors
+// 3. Suggest patch
+// 4. Commit to claw-dev branch only
+
+setTimeout(improvementCycle, 300000); // every 5 mins
+}
+
+improvementCycle();
 
 runClawForever();
