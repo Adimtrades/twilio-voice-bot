@@ -4,7 +4,8 @@
 "main": "server.js",
 "private": true,
 "scripts": {
-"start": "node server.js"
+"start": "node server.js",
+"claw": "node claw.js"
 },
 "engines": {
 "node": "22.x"
