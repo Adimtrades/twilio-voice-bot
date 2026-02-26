@@ -79,8 +79,20 @@ app.set("strict routing", false);
 // Process-level safety
 // ----------------------------------------------------------------------------
 process.on("unhandledRejection", (reason) => console.error("UNHANDLED REJECTION:", reason));
-process.on("uncaughtException", (err) => {
+process.on("uncaughtException", async (err) => {
   console.error("UNCAUGHT EXCEPTION:", err);
+  try {
+    if (supabase) {
+      await supabase.from("error_logs").insert([{
+        error_type: "uncaughtException",
+        message: err?.message || String(err),
+        stack: err?.stack || null,
+        created_at: new Date().toISOString()
+      }]);
+    }
+  } catch (logErr) {
+    console.error("FAILED_TO_LOG_UNCAUGHT_EXCEPTION", logErr);
+  }
   process.exit(1);
 });
 
@@ -1794,7 +1806,7 @@ function logVoiceStep(req, { callSid = "unknown", step = "unknown", speech = "",
 }
 
 function voiceActionUrl(req) {
-  return "/process-speech" + (req.query.tid ? `?tid=${encodeURIComponent(req.query.tid)}` : "");
+  return "/process" + (req.query.tid ? `?tid=${encodeURIComponent(req.query.tid)}` : "");
 }
 
 function buildInitialVoiceTwiml(req, greetingText = "Hi. What would you like help with today?") {
@@ -2634,9 +2646,19 @@ Action: Call/text back ASAP.`;
 // ----------------------------------------------------------------------------
 // VOICE ROUTES
 // ----------------------------------------------------------------------------
-app.all("/voice", async (req, res) => {
+app.post("/voice", async (req, res) => {
   try {
     if (!validateTwilioSignature(req)) return res.status(403).send("Forbidden");
+
+    if (supabase) {
+      await supabase.from("calls").insert([{
+        call_sid: resolveCallSid(req),
+        from_number: String(req.body?.From || "").trim() || null,
+        to_number: String(req.body?.To || "").trim() || null,
+        created_at: new Date().toISOString()
+      }]).catch(() => {});
+    }
+
     return handleVoiceEntry(req, res);
   } catch (e) {
     console.error("/voice error", e);
@@ -2646,7 +2668,7 @@ app.all("/voice", async (req, res) => {
   }
 });
 
-app.post("/process-speech", async (req, res) => {
+app.post("/process", async (req, res) => {
   const twiml = new VoiceResponse();
 
   try {
@@ -2697,7 +2719,7 @@ app.post("/process-speech", async (req, res) => {
       session.step = "initial";
       session.lastNoSpeechFallback = false;
       session.retryCount = 0;
-      console.log(`INITIAL_CALL TID=${tradie.key} CALLSID=${callSid} FROM=${fromNumber} VIA=/process-speech`);
+      console.log(`INITIAL_CALL TID=${tradie.key} CALLSID=${callSid} FROM=${fromNumber} VIA=/process`);
       logVoiceStep(req, { callSid, step: session.step, speech, retryCount: session.silenceTries || 0 });
       return sendVoiceTwiml(res, buildInitialVoiceTwiml(req));
     }
@@ -2742,7 +2764,7 @@ app.post("/process-speech", async (req, res) => {
         const prompt = `${prefix} If you'd still like help, please tell me what you need.`;
         session.lastPrompt = prompt;
         addToHistory(session, "assistant", prompt);
-        ask(twiml, prompt, "/process-speech" + (req.query.tid ? `?tid=${encodeURIComponent(req.query.tid)}` : ""));
+        ask(twiml, prompt, "/process" + (req.query.tid ? `?tid=${encodeURIComponent(req.query.tid)}` : ""));
         return sendVoiceTwiml(res, twiml);
       }
 
@@ -2750,7 +2772,7 @@ app.post("/process-speech", async (req, res) => {
       session.lastPrompt = prompt;
       addToHistory(session, "assistant", prompt);
 
-      const actionUrl = "/process-speech" + (req.query.tid ? `?tid=${encodeURIComponent(req.query.tid)}` : "");
+      const actionUrl = "/process" + (req.query.tid ? `?tid=${encodeURIComponent(req.query.tid)}` : "");
       ask(twiml, prompt, actionUrl);
       return sendVoiceTwiml(res, twiml);
     }
@@ -2857,7 +2879,7 @@ app.post("/process-speech", async (req, res) => {
         // But we can gently nudge:
         if (llm.suggested_step && session.step === "intent") session.step = llm.suggested_step;
 
-        const actionUrl = "/process-speech" + (req.query.tid ? `?tid=${encodeURIComponent(req.query.tid)}` : "");
+        const actionUrl = "/process" + (req.query.tid ? `?tid=${encodeURIComponent(req.query.tid)}` : "");
         ask(twiml, mergedPrompt, actionUrl);
         return sendVoiceTwiml(res, twiml);
       }
@@ -2876,7 +2898,7 @@ app.post("/process-speech", async (req, res) => {
         : "No worries — what should I change? job, address, name, time, or access notes?";
       addToHistory(session, "assistant", session.lastPrompt);
 
-      const actionUrl = "/process-speech" + (req.query.tid ? `?tid=${encodeURIComponent(req.query.tid)}` : "");
+      const actionUrl = "/process" + (req.query.tid ? `?tid=${encodeURIComponent(req.query.tid)}` : "");
       ask(twiml, session.lastPrompt, actionUrl);
       return sendVoiceTwiml(res, twiml);
     }
@@ -2886,7 +2908,7 @@ app.post("/process-speech", async (req, res) => {
       session.lastPrompt = "No worries — what should I change? job, address, name, time, or access notes?";
       addToHistory(session, "assistant", session.lastPrompt);
 
-      const actionUrl = "/process-speech" + (req.query.tid ? `?tid=${encodeURIComponent(req.query.tid)}` : "");
+      const actionUrl = "/process" + (req.query.tid ? `?tid=${encodeURIComponent(req.query.tid)}` : "");
       ask(twiml, session.lastPrompt, actionUrl);
       return sendVoiceTwiml(res, twiml);
     }
@@ -2894,7 +2916,7 @@ app.post("/process-speech", async (req, res) => {
     // ------------------------------------------------------------------------
     // MAIN FLOW
     // ------------------------------------------------------------------------
-    const actionUrl = "/process-speech" + (req.query.tid ? `?tid=${encodeURIComponent(req.query.tid)}` : "");
+    const actionUrl = "/process" + (req.query.tid ? `?tid=${encodeURIComponent(req.query.tid)}` : "");
 
     // STEP: intent
     if (session.step === "intent") {
@@ -3300,20 +3322,6 @@ ${historyLine}${memoryLine}${accessLine2}`.trim()).catch(() => {});
   }
 });
 
-app.post("/process", (req, res) => {
-  const speech = req.body.SpeechResult;
-  const twiml = new twilio.twiml.VoiceResponse();
-
-  if (speech && speech.toLowerCase().includes("booking")) {
-    twiml.say("You want to book an appointment.");
-  } else {
-    twiml.say("I did not understand. Please try again.");
-  }
-
-  res.type("text/xml");
-  res.send(twiml.toString());
-});
-
 // ----------------------------------------------------------------------------
 // SMS ROUTE (customer replies Y/N + QUOTE photos)
 // ----------------------------------------------------------------------------
@@ -3331,6 +3339,16 @@ app.post("/sms", async (req, res) => {
     const from = (req.body.From || "").trim();
     const body = (req.body.Body || "").trim();
     const bodyLower = body.toLowerCase();
+
+    if (supabase) {
+      await supabase.from("messages").insert([{
+        from_number: from || null,
+        to_number: String(req.body.To || "").trim() || null,
+        message: body || null,
+        message_sid: String(req.body.MessageSid || "").trim() || null,
+        created_at: new Date().toISOString()
+      }]).catch(() => {});
+    }
 
     // If MMS photos are included, forward owner the media URLs
     const numMedia = Number(req.body.NumMedia || 0);
@@ -3453,14 +3471,14 @@ app.post("/next-step", async (req, res) => {
   try {
     if (!validateTwilioSignature(req)) return res.status(403).send("Forbidden");
     const twiml = new VoiceResponse();
-    const processUrl = "/process-speech" + (req.query.tid ? `?tid=${encodeURIComponent(req.query.tid)}` : "");
+    const processUrl = "/process" + (req.query.tid ? `?tid=${encodeURIComponent(req.query.tid)}` : "");
     twiml.redirect({ method: "POST" }, processUrl);
     return sendVoiceTwiml(res, twiml);
   } catch (e) {
     console.error("/next-step error", e);
     const twiml = new VoiceResponse();
     twiml.say("Sorry, there was a temporary issue. Please tell me what job you need help with.", { voice: "Polly.Amy", language: "en-AU" });
-    const processUrl = "/process-speech" + (req.query.tid ? `?tid=${encodeURIComponent(req.query.tid)}` : "");
+    const processUrl = "/process" + (req.query.tid ? `?tid=${encodeURIComponent(req.query.tid)}` : "");
     twiml.redirect({ method: "POST" }, processUrl);
     return sendVoiceTwiml(res, twiml);
   }
@@ -3710,18 +3728,13 @@ app.post("/debug/create-test-event", express.json({ limit: "256kb" }), async (re
   }
 });
 
-app.post('/voice', (req, res) => {
-  const twiml = new twilio.twiml.VoiceResponse();
-
-  twiml.gather({
-    input: 'speech',
-    action: '/process',
-    method: 'POST',
-    speechTimeout: 'auto'
-  }).say("Hello. This is your AI assistant. How can I help you today?");
-
-  res.type('text/xml');
-  res.send(twiml.toString());
+// ----------------------------------------------------------------------------
+// Error handler
+// ----------------------------------------------------------------------------
+app.use((err, req, res, next) => {
+  console.error("UNHANDLED_ROUTE_ERROR", err);
+  if (res.headersSent) return next(err);
+  return res.status(500).json({ error: "Internal Server Error" });
 });
 
 // ----------------------------------------------------------------------------
@@ -3730,4 +3743,8 @@ app.post('/voice', (req, res) => {
 const PORT = Number(process.env.PORT || 10000);
 if (!PORT || Number.isNaN(PORT)) throw new Error("PORT missing/invalid");
 
-app.listen(PORT, () => console.log("Server listening on", PORT));
+if (require.main === module) {
+  app.listen(PORT, () => console.log("Server listening on", PORT));
+}
+
+module.exports = app;
