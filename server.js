@@ -858,8 +858,8 @@ async function sendActivationEmailForTradie({ tradie, provisionedPhoneNumber = "
   const customerName = String(tradie?.customer_name || tradie?.name || tradie?.owner_name || tradie?.business_name || "there").trim();
   const businessName = String(tradie?.business_name || tradie?.biz_name || tradie?.bizName || "Your Business").trim();
   const fallbackBaseUrl = "https://twilio-voice-bot-w9gq.onrender.com";
-  const requestBaseUrl = reqForBaseUrl?.get ? `https://${reqForBaseUrl.get("host")}` : "";
-  const baseUrl = process.env.BASE_URL || requestBaseUrl || fallbackBaseUrl;
+  const reqBaseUrl = reqForBaseUrl?.get ? `https://${reqForBaseUrl.get("host")}` : fallbackBaseUrl;
+  const baseUrl = process.env.BASE_URL || reqBaseUrl || fallbackBaseUrl;
 
   console.log("activation email target", { to: recipient, source });
   console.log("activation email context", { tradie_id: tradie.id, stripe_customer_id: tradie.stripe_customer_id || "", source });
