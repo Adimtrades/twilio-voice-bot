@@ -125,6 +125,31 @@ app.get('/health', (req, res) => {
   });
 });
 
+const oauth2Client = new google.auth.OAuth2(
+process.env.GOOGLE_CLIENT_ID,
+process.env.GOOGLE_CLIENT_SECRET,
+process.env.GOOGLE_REDIRECT_URI
+);
+
+app.get("/google/auth", (req, res) => {
+const url = oauth2Client.generateAuthUrl({
+access_type: "offline",
+scope: ["https://www.googleapis.com/auth/calendar"],
+prompt: "consent"
+});
+res.redirect(url);
+});
+
+app.get("/google/callback", async (req, res) => {
+const { code } = req.query;
+const { tokens } = await oauth2Client.getToken(code);
+oauth2Client.setCredentials(tokens);
+
+// TODO: store tokens in Supabase linked to tradie account
+
+res.send("Google connected successfully.");
+});
+
 const VoiceResponse = twilio.twiml.VoiceResponse;
 const MessagingResponse = twilio.twiml.MessagingResponse;
 const MAX_NO_SPEECH_RETRIES = Number(process.env.MAX_NO_SPEECH_RETRIES || 2);
@@ -756,11 +781,13 @@ async function getLatestActiveTwilioNumberForTradie(tradieId) {
   return String(data?.[0]?.phone_number || "").trim();
 }
 
-function buildActivationEmailContent({ customerName, businessName, provisionedPhoneNumber }) {
+function buildActivationEmailContent({ customerName, businessName, provisionedPhoneNumber, baseUrl, tradieId }) {
   const safeCustomerName = customerName || "there";
   const safeBusinessName = businessName || "Your Business";
   const safePhoneNumber = provisionedPhoneNumber || "Not available";
   const serviceAccountEmail = "twilio-voice@twilio-voice-booking.iam.gserviceaccount.com";
+  const safeBaseUrl = String(baseUrl || "https://twilio-voice-bot-w9gq.onrender.com").replace(/\/+$/, "");
+  const connectGoogleCalendarLink = `${safeBaseUrl}/google/auth?tradieId=${encodeURIComponent(String(tradieId || ""))}`;
 
   const text =
 `Hi ${safeCustomerName},
@@ -786,6 +813,9 @@ ${serviceAccountEmail}
 
 Once done, your assistant will automatically create bookings in your calendar.
 
+Connect Google Calendar
+${connectGoogleCalendarLink}
+
 No other setup is required.
 
 If you need help, simply reply to this email and we’ll assist immediately.
@@ -808,6 +838,7 @@ AdimTrades Automation`;
   <li>Click Send</li>
 </ol>
 <p>Once done, your assistant will automatically create bookings in your calendar.</p>
+<p><strong>Connect Google Calendar</strong><br/><a href="${connectGoogleCalendarLink}">Connect Google Calendar</a></p>
 <p>No other setup is required.</p>
 <p>If you need help, simply reply to this email and we’ll assist immediately.</p>
 <p>Thanks,<br/>AdimTrades Automation</p>`;
@@ -815,7 +846,7 @@ AdimTrades Automation`;
   return { text, html };
 }
 
-async function sendActivationEmailForTradie({ tradie, provisionedPhoneNumber = "", emailFallback = "", source = "" }) {
+async function sendActivationEmailForTradie({ tradie, provisionedPhoneNumber = "", emailFallback = "", source = "", reqForBaseUrl = null }) {
   const recipient = String(tradie?.email || emailFallback || "").trim();
   if (!recipient) {
     console.warn("activation email skipped: missing recipient", { tradie_id: tradie?.id || "", source });
@@ -826,6 +857,9 @@ async function sendActivationEmailForTradie({ tradie, provisionedPhoneNumber = "
   const fallbackTriggered = !twilioNumber;
   const customerName = String(tradie?.customer_name || tradie?.name || tradie?.owner_name || tradie?.business_name || "there").trim();
   const businessName = String(tradie?.business_name || tradie?.biz_name || tradie?.bizName || "Your Business").trim();
+  const fallbackBaseUrl = "https://twilio-voice-bot-w9gq.onrender.com";
+  const requestBaseUrl = reqForBaseUrl?.get ? `https://${reqForBaseUrl.get("host")}` : "";
+  const baseUrl = process.env.BASE_URL || requestBaseUrl || fallbackBaseUrl;
 
   console.log("activation email target", { to: recipient, source });
   console.log("activation email context", { tradie_id: tradie.id, stripe_customer_id: tradie.stripe_customer_id || "", source });
@@ -834,7 +868,9 @@ async function sendActivationEmailForTradie({ tradie, provisionedPhoneNumber = "
   const { text, html } = buildActivationEmailContent({
     customerName,
     businessName,
-    provisionedPhoneNumber: twilioNumber
+    provisionedPhoneNumber: twilioNumber,
+    baseUrl,
+    tradieId: tradie?.id || ""
   });
   try {
     await sendTradieEmail(recipient, "Your Booking Number is Ready 🚀 (Action Required)", text, html);
@@ -1368,7 +1404,8 @@ async function ensureProvisioningForActiveSubscription({ customerId, subscriptio
     await sendActivationEmailForTradie({
       tradie,
       provisionedPhoneNumber: provisioned?.phoneNumber || "",
-      source: "ensureProvisioningForActiveSubscription"
+      source: "ensureProvisioningForActiveSubscription",
+      reqForBaseUrl
     });
   } catch (err) {
     await markProvisioningFailure(tradie, err?.message || err);
@@ -1411,7 +1448,8 @@ async function syncActiveSubscriptionAndProvision({ customerId, subscriptionId, 
     tradie: refreshedTradie || tradie,
     provisionedPhoneNumber: provisioned.phoneNumber || "",
     emailFallback: email,
-    source: "syncActiveSubscriptionAndProvision:new"
+    source: "syncActiveSubscriptionAndProvision:new",
+    reqForBaseUrl
   });
 }
 
