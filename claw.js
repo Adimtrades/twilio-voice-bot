@@ -24,42 +24,79 @@ const supabase = (process.env.SUPABASE_URL && supabaseServiceKey)
   : null;
 
 async function scanMessages() {
-  try {
-    console.log('Claw scanning database...');
+try {
+console.log("Claw scanning database...");
 
-    // Try ordering by timestamp first
-    let { data, error } = await supabase
-      .from('messages')
-      .select('*')
-      .order('timestamp', { ascending: false })
-      .limit(20);
+if (!supabase) {
+console.warn("Supabase not configured.");
+return;
+}
 
-    // If timestamp column fails, fallback to created_at
-    if (error && error.message.includes('timestamp')) {
-      console.warn('Timestamp column missing. Falling back to created_at.');
+if (!openai) {
+console.warn("OpenAI not configured.");
+return;
+}
 
-      const fallback = await supabase
-        .from('messages')
-        .select('*')
-        .order('created_at', { ascending: false })
-        .limit(20);
+const { data: messages, error } = await supabase
+.from("messages")
+.select("*")
+.eq("processed", false)
+.order("created_at", { ascending: false })
+.limit(1);
 
-      data = fallback.data;
-      error = fallback.error;
-    }
+if (error) {
+console.error("Supabase fetch error:", error);
+return;
+}
 
-    if (error) {
-      console.error('Claw query error:', error);
-      return;
-    }
+if (!messages || messages.length === 0) {
+console.log("No new messages.");
+return;
+}
 
-    console.log(`Claw fetched ${data.length} messages.`);
+const latest = messages[0];
 
-    // Continue processing safely
-    return data;
-  } catch (err) {
-    console.error('Claw fatal cycle error:', err);
-  }
+console.log("Processing message:", latest.id);
+
+const completion = await openai.chat.completions.create({
+model: "gpt-4o-mini",
+messages: [
+{ role: "system", content: "You are a professional AI receptionist." },
+{ role: "user", content: latest.message }
+]
+});
+
+const reply = completion.choices[0].message.content;
+
+// Insert response
+const { error: insertError } = await supabase
+.from("responses")
+.insert({
+message_id: latest.id,
+response: reply
+});
+
+if (insertError) {
+console.error("Failed to insert response:", insertError);
+return;
+}
+
+// Mark message as processed
+const { error: updateError } = await supabase
+.from("messages")
+.update({ processed: true })
+.eq("id", latest.id);
+
+if (updateError) {
+console.error("Failed to update message:", updateError);
+return;
+}
+
+console.log("Message processed successfully.");
+
+} catch (err) {
+console.error("Claw fatal cycle error:", err);
+}
 }
 async function improvementCycle() {
 console.log("Claw improvement cycle running...");
