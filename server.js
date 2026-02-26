@@ -41,25 +41,29 @@ const { google } = require("googleapis");
 const { createClient } = require("@supabase/supabase-js");
 const OpenAI = require("openai");
 
+const BOT_VERSION = process.env.BOT_VERSION || process.env.npm_package_version || "1.0.0";
+const LOG_TAG = `[bot:${BOT_VERSION}]`;
+
 const requiredEnv = [
+  "TWILIO_ACCOUNT_SID",
+  "TWILIO_AUTH_TOKEN",
   "SUPABASE_URL",
-  "SUPABASE_SERVICE_ROLE_KEY",
+  "SUPABASE_SERVICE_KEY",
   "OPENAI_API_KEY"
 ];
 
 requiredEnv.forEach((key) => {
   if (!process.env[key]) {
-    console.error(`Missing ENV variable: ${key}`);
+    console.warn(`${LOG_TAG} Missing ENV variable: ${key}`);
   }
 });
 
-const BOT_VERSION = "v1.0.0";
-console.log("Bot version:", BOT_VERSION);
+console.log(`${LOG_TAG} Server booting`);
 
 const DEV_MODE = process.env.DEV_MODE === "true";
 
 if (DEV_MODE) {
-  console.log("⚠️ Running in DEV_MODE");
+  console.log(`${LOG_TAG} ⚠️ Running in DEV_MODE`);
 }
 
 // Start Claw bot in background
@@ -101,7 +105,12 @@ app.use((req, res, next) => {
 });
 
 app.get('/health', (req, res) => {
-res.json({ status: "ok", time: new Date().toISOString() });
+  res.json({
+    status: 'ok',
+    version: BOT_VERSION,
+    time: new Date().toISOString(),
+    uptimeSeconds: Math.floor(process.uptime())
+  });
 });
 
 const VoiceResponse = twilio.twiml.VoiceResponse;
