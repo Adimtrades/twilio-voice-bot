@@ -779,7 +779,7 @@ function getSmtpTransporter() {
 }
 
 async function sendTradieEmail(to, subject, text, html = "") {
-  const from = String(process.env.FROM_EMAIL || "").trim();
+  const from = String(process.env.EMAIL_FROM || process.env.FROM_EMAIL || "").trim();
   if (!from || !to) {
     console.warn("Email skipped: sender/recipient missing", { to: to || "" });
     return false;
@@ -818,6 +818,56 @@ async function sendTradieEmail(to, subject, text, html = "") {
 
   await transporter.sendMail({ from, to, subject, text, ...(html ? { html } : {}) });
   return true;
+}
+
+async function sendGoogleCalendarConnectEmailForTradie({ tradie, source = "" }) {
+  const tradieId = String(tradie?.id || "").trim();
+  const recipient = String(tradie?.email || "").trim();
+  const googleConnected = tradie?.google_connected === true;
+
+  if (!tradieId) {
+    console.error("google connect email skipped: missing tradie id", { source });
+    return false;
+  }
+
+  if (!recipient) {
+    console.log("google connect email skipped: missing recipient", { tradie_id: tradieId, source });
+    return false;
+  }
+
+  if (googleConnected) {
+    console.log("google connect email skipped: already connected", { tradie_id: tradieId, source });
+    return false;
+  }
+
+  const connectLink = `${BASE_URL.replace(/\/+$/, "")}/google/auth?tradieId=${encodeURIComponent(tradieId)}`;
+  const subject = "Connect your Google Calendar";
+  const text =
+`Hi,
+
+Connect your Google Calendar so your AI phone bot can manage bookings for you.
+
+${connectLink}
+
+This lets the phone bot check availability and create bookings.`;
+  const html = `<p>Hi,</p>
+<p>Connect your Google Calendar so your AI phone bot can manage bookings for you.</p>
+<p><a href="${connectLink}" style="display:inline-block;padding:10px 16px;background:#2563eb;color:#fff;text-decoration:none;border-radius:6px;">Connect Google Calendar</a></p>
+<p>If the button doesn't work, copy and paste this link into your browser:<br/><a href="${connectLink}">${connectLink}</a></p>
+<p>This lets the phone bot check availability and create bookings.</p>`;
+
+  try {
+    const sent = await sendTradieEmail(recipient, subject, text, html);
+    if (sent) {
+      console.log("google connect email sent", { tradie_id: tradieId, to: recipient, source });
+      return true;
+    }
+    console.log("google connect email not sent (email transport unavailable)", { tradie_id: tradieId, source });
+    return false;
+  } catch (error) {
+    console.error("google connect email failed", { tradie_id: tradieId, source, error: error?.message || error });
+    return false;
+  }
 }
 
 async function getLatestActiveTwilioNumberForTradie(tradieId) {
@@ -1000,6 +1050,12 @@ async function ensureTradieByStripeCustomer({ customerId, subscriptionId, plan, 
     console.error("stripe provisioning step: create tradie failed", error);
     return null;
   }
+
+  await sendGoogleCalendarConnectEmailForTradie({
+    tradie: data,
+    source: "ensureTradieByStripeCustomer:create"
+  });
+
   return data;
 }
 
