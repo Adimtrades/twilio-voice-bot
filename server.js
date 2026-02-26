@@ -3674,6 +3674,20 @@ app.post("/debug/create-test-event", express.json({ limit: "256kb" }), async (re
   }
 });
 
+app.post('/voice', (req, res) => {
+  const twiml = new twilio.twiml.VoiceResponse();
+
+  twiml.gather({
+    input: 'speech',
+    action: '/process',
+    method: 'POST',
+    speechTimeout: 'auto'
+  }).say("Hello. This is your AI assistant. How can I help you today?");
+
+  res.type('text/xml');
+  res.send(twiml.toString());
+});
+
 // ----------------------------------------------------------------------------
 // Listen
 // ----------------------------------------------------------------------------
