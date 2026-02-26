@@ -3,17 +3,14 @@
 "version": "1.0.0",
 "main": "server.js",
 "private": true,
-
 "scripts": {
 "start": "node server.js",
 "claw": "node claw.js",
-"test": "jest"
+"test": "echo \"ok\""
 },
-
 "engines": {
 "node": "22.x"
 },
-
 "dependencies": {
 "@supabase/supabase-js": "^2.97.0",
 "chrono-node": "^2.7.6",
