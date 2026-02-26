@@ -31,7 +31,8 @@
 // ADMIN_DASH_PASSWORD
 
 try { require("dotenv").config(); } catch {}
-
+// Start Claw bot in background
+require('./claw');
 const express = require("express");
 const twilio = require("twilio");
 const nodemailer = require("nodemailer");
