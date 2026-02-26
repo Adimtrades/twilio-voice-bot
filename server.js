@@ -126,43 +126,33 @@ app.get('/health', (req, res) => {
 });
 
 const BASE_URL = process.env.BASE_URL || "http://localhost:3000";
-const GOOGLE_REDIRECT_URI = `${BASE_URL}/google/callback`;
+const GOOGLE_REDIRECT_URL = process.env.GOOGLE_REDIRECT_URL || `${BASE_URL}/google/callback`;
 
 const oauth2Client = new google.auth.OAuth2(
   process.env.GOOGLE_CLIENT_ID,
   process.env.GOOGLE_CLIENT_SECRET,
-  GOOGLE_REDIRECT_URI
+  GOOGLE_REDIRECT_URL
 );
 
 app.get("/google/auth", async (req, res) => {
   try {
-    const tradieId = String(req.query.tradieId || "").trim();
+    const tradieId = req.query.tradieId;
     if (!tradieId) {
-      return res.status(400).json({ error: "tradieId is required" });
+      return res.status(400).send("Missing tradieId");
     }
 
-    if (!process.env.GOOGLE_CLIENT_ID || !process.env.GOOGLE_CLIENT_SECRET) {
-      console.error("GOOGLE_AUTH_ENV_MISSING", {
-        hasClientId: !!process.env.GOOGLE_CLIENT_ID,
-        hasClientSecret: !!process.env.GOOGLE_CLIENT_SECRET
-      });
-      return res.status(500).json({ error: "Google OAuth is not configured" });
-    }
-
-    const url = oauth2Client.generateAuthUrl({
+    const authUrl = oauth2Client.generateAuthUrl({
       access_type: "offline",
       prompt: "consent",
-      scope: [
-        "https://www.googleapis.com/auth/calendar.readonly",
-        "https://www.googleapis.com/auth/calendar.events"
-      ],
+      scope: ["https://www.googleapis.com/auth/calendar"],
       state: tradieId
     });
 
-    return res.redirect(url);
-  } catch (error) {
-    console.error("GOOGLE_AUTH_ROUTE_ERROR", error);
-    return res.status(500).json({ error: "Unable to start Google authorization" });
+    return res.redirect(authUrl);
+
+  } catch (err) {
+    console.error("Google Auth Error:", err);
+    return res.status(500).send("Auth failed");
   }
 });
 
