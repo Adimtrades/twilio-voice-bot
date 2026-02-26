@@ -40,6 +40,7 @@ const chrono = require("chrono-node");
 const { DateTime } = require("luxon");
 const { google } = require("googleapis");
 const { createClient } = require("@supabase/supabase-js");
+const OpenAI = require("openai");
 // ----------------------------------------------------------------------------
 // App bootstrap
 // ----------------------------------------------------------------------------
@@ -113,6 +114,10 @@ const SUPABASE_TRADIE_ACCOUNTS_TABLE = process.env.SUPABASE_TRADIE_ACCOUNTS_TABL
 const supabase = (SUPABASE_URL && SUPABASE_SERVICE_KEY)
   ? createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY)
   : null;
+
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY
+});
 
 function supaReady() {
   return !!(SUPABASE_URL && SUPABASE_SERVICE_KEY);
@@ -3257,6 +3262,20 @@ ${historyLine}${memoryLine}${accessLine2}`.trim()).catch(() => {});
     twiml.say("Sorry, there was a system error. Please try again.", { voice: "Polly.Amy", language: "en-AU" });
     return sendVoiceTwiml(res, twiml);
   }
+});
+
+app.post("/process", (req, res) => {
+  const speech = req.body.SpeechResult;
+  const twiml = new twilio.twiml.VoiceResponse();
+
+  if (speech && speech.toLowerCase().includes("booking")) {
+    twiml.say("You want to book an appointment.");
+  } else {
+    twiml.say("I did not understand. Please try again.");
+  }
+
+  res.type("text/xml");
+  res.send(twiml.toString());
 });
 
 // ----------------------------------------------------------------------------
