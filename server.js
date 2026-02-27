@@ -75,6 +75,11 @@ const app = express();
 app.set("trust proxy", true);
 app.set("strict routing", false);
 
+app.use((req, res, next) => {
+  console.log("REQ", req.method, req.originalUrl);
+  next();
+});
+
 // ----------------------------------------------------------------------------
 // Process-level safety
 // ----------------------------------------------------------------------------
@@ -199,6 +204,42 @@ app.get("/google/callback", async (req, res) => {
     console.error("GOOGLE_CALLBACK_ERROR", error);
     return res.status(500).json({ error: "Google connection failed" });
   }
+});
+
+function collectRoutesFromStack(stack, basePath = "") {
+  const routes = [];
+
+  for (const layer of stack || []) {
+    if (layer.route?.path) {
+      const methods = Object.keys(layer.route.methods || {}).filter((method) => layer.route.methods[method]);
+      for (const method of methods) {
+        routes.push({
+          method: method.toUpperCase(),
+          path: `${basePath}${layer.route.path}`
+        });
+      }
+      continue;
+    }
+
+    if (layer.name === "router" && layer.handle?.stack) {
+      const mountPath = layer.path || "";
+      routes.push(...collectRoutesFromStack(layer.handle.stack, `${basePath}${mountPath}`));
+    }
+  }
+
+  return routes;
+}
+
+app.get("/debug/routes", (req, res) => {
+  const stack = app.router?.stack || app._router?.stack || [];
+  const routes = collectRoutesFromStack(stack)
+    .filter((route) => route.path)
+    .map((route) => ({
+      method: route.method,
+      path: route.path.startsWith("/") ? route.path : `/${route.path}`
+    }));
+
+  return res.json({ routes });
 });
 
 const VoiceResponse = twilio.twiml.VoiceResponse;
@@ -3981,6 +4022,11 @@ app.use((err, req, res, next) => {
   console.error("UNHANDLED_ROUTE_ERROR", err);
   if (res.headersSent) return next(err);
   return res.status(500).json({ error: "Internal Server Error" });
+});
+
+app.use((req, res) => {
+  console.log("404", req.method, req.originalUrl);
+  res.status(404).send("Not Found");
 });
 
 // ----------------------------------------------------------------------------
