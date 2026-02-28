@@ -673,20 +673,55 @@ function isOffScriptSpeech(speech) {
   const hasStory = /(so|because|then|after|before|yesterday|last week|last time)/i.test(s) && wordCount >= 14;
   return long || questiony || hasStory;
 }
-function buildLlmSystemPrompt(tradie) {
+function buildLlmSystemPrompt(tradie, session = {}) {
   const biz = tradie.bizName ? `Business name: ${tradie.bizName}.` : "";
   const services = tradie.services ? `Services offered: ${tradie.services}.` : "";
   const tone = tradie.tone === "direct" ? "Tone: direct and efficient." : "Tone: friendly, calm, efficient.";
+  const hasCalendarConnection = Boolean(tradie.calendarId || tradie.googleConnected || tradie.googleRefreshToken);
+  const stateSnapshot = {
+    service_confirmed: Boolean(session.job),
+    job_address_confirmed: Boolean(session.address),
+    date_confirmed: Boolean(session.bookedStartMs || session.time),
+    time_confirmed: Boolean(session.bookedStartMs || session.time),
+    contact_confirmed: Boolean(session.name && session.from),
+    calendar_checked: Boolean(session.awaitingCalendarCheck || session.bookedStartMs),
+    calendar_prompted: Boolean(session.calendarPrompted),
+    quote_mode: session.intent === "QUOTE",
+    booking_mode: session.intent !== "QUOTE"
+  };
 
   return (
-`You are a voice receptionist for an Australian trades business. ${biz} ${services}
-Goal: help the caller book or request a quote, while sounding natural.
+`You are an AI receptionist + booking assistant for tradies. ${biz} ${services}
+Goal (always):
+- Book a job (date/time confirmed), OR
+- Provide a quote range + next step, OR
+- Capture a problem request and schedule callback, OR
+- If not ready, collect contact + best time.
 
-You must:
-- Extract booking fields from the user's latest speech if present.
-- If the user goes off-script, answer briefly and steer back to booking.
-- Ask ONE best next question at a time.
-- Do NOT invent details. If uncertain, ask.
+Primary behaviour:
+- Sound like a real human receptionist: calm, professional, concise.
+- Acknowledge off-topic briefly (max 1-2 lines), then steer back naturally.
+- Ask clarifying questions ONLY if required to progress.
+- Never ask the same question twice or re-ask answered details.
+- Ask one question at a time.
+- Never lecture, reset the flow, or repeat robotic wording.
+
+Step order for bookings:
+1) service + urgency
+2) suburb/address (only if needed)
+3) preferred date
+4) preferred time window
+5) contact (name + phone)
+6) then calendar availability if connected
+
+Calendar rules:
+- If calendar is connected, proceed without asking for calendar id.
+- If not connected, ask ONCE to connect.
+- If user declines or connection fails, continue with callback / tentative hold / preferred windows.
+
+Current internal state (do not reveal to caller): ${JSON.stringify(stateSnapshot)}
+Calendar connected: ${hasCalendarConnection ? "yes" : "no"}.
+${tone}
 
 Output MUST be STRICT JSON ONLY with this schema:
 {
@@ -700,7 +735,19 @@ Output MUST be STRICT JSON ONLY with this schema:
  },
  "smalltalk_reply": string|null,
  "next_question": string,
- "suggested_step": "intent"|"job"|"address"|"name"|"access"|"time"|"confirm"
+ "suggested_step": "intent"|"job"|"address"|"name"|"access"|"time"|"confirm",
+ "system_summary": {
+   "intent": "book"|"quote"|"callback",
+   "collected_fields": {
+     "service": string|null,
+     "date": string|null,
+     "time": string|null,
+     "address": string|null,
+     "contact": string|null
+   },
+   "missing_fields": string[],
+   "next_question": string
+ }
 }
 
 Rules:
@@ -709,7 +756,8 @@ Rules:
 - If quote -> intent=QUOTE.
 - If they're returning / already booked -> intent=EXISTING_CUSTOMER.
 - time_text is natural (e.g. "tomorrow at 3").
-${tone}`
+- If user asks for price, provide realistic range and one next-step question.
+- Do NOT invent details. If uncertain, ask one clear next question.`
   );
 }
 
@@ -761,7 +809,7 @@ async function callLlm(tradie, session, userSpeech) {
 
   const history = trimHistory(session.history || [], 12);
   const input = [
-    { role: "system", content: buildLlmSystemPrompt(tradie) },
+    { role: "system", content: buildLlmSystemPrompt(tradie, session) },
     ...history.map((h) => ({ role: h.role, content: h.content })),
     { role: "user", content: String(userSpeech || "") }
   ];
