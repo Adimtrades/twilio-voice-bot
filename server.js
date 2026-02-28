@@ -673,12 +673,57 @@ function isOffScriptSpeech(speech) {
   const hasStory = /(so|because|then|after|before|yesterday|last week|last time)/i.test(s) && wordCount >= 14;
   return long || questiony || hasStory;
 }
-function buildLlmSystemPrompt(tradie) {
+function buildLlmSystemPrompt(tradie, session = {}) {
   const biz = tradie.bizName ? `Business name: ${tradie.bizName}.` : "";
   const services = tradie.services ? `Services offered: ${tradie.services}.` : "";
   const tone = tradie.tone === "direct" ? "Tone: direct and efficient." : "Tone: friendly, calm, efficient.";
+  const hasCalendarConnection = Boolean(tradie.calendarId || tradie.googleConnected || tradie.googleRefreshToken);
+  const stateSnapshot = {
+    service_confirmed: Boolean(session.job),
+    job_address_confirmed: Boolean(session.address),
+    date_confirmed: Boolean(session.bookedStartMs || session.time),
+    time_confirmed: Boolean(session.bookedStartMs || session.time),
+    contact_confirmed: Boolean(session.name && session.from),
+    calendar_checked: Boolean(session.awaitingCalendarCheck || session.bookedStartMs),
+    calendar_prompted: Boolean(session.calendarPrompted),
+    quote_mode: session.intent === "QUOTE",
+    booking_mode: session.intent !== "QUOTE"
+  };
 
   return (
+codex/implement-ai-receptionist-functionality
+`You are an AI receptionist + booking assistant for tradies. ${biz} ${services}
+Goal (always):
+- Book a job (date/time confirmed), OR
+- Provide a quote range + next step, OR
+- Capture a problem request and schedule callback, OR
+- If not ready, collect contact + best time.
+
+Primary behaviour:
+- Sound like a real human receptionist: calm, professional, concise.
+- Acknowledge off-topic briefly (max 1-2 lines), then steer back naturally.
+- Ask clarifying questions ONLY if required to progress.
+- Never ask the same question twice or re-ask answered details.
+- Ask one question at a time.
+- Never lecture, reset the flow, or repeat robotic wording.
+
+Step order for bookings:
+1) service + urgency
+2) suburb/address (only if needed)
+3) preferred date
+4) preferred time window
+5) contact (name + phone)
+6) then calendar availability if connected
+
+Calendar rules:
+- If calendar is connected, proceed without asking for calendar id.
+- If not connected, ask ONCE to connect.
+- If user declines or connection fails, continue with callback / tentative hold / preferred windows.
+
+Current internal state (do not reveal to caller): ${JSON.stringify(stateSnapshot)}
+Calendar connected: ${hasCalendarConnection ? "yes" : "no"}.
+${tone}
+
 `You are a voice receptionist for an Australian trades business. ${biz} ${services}
 Goal: help the caller book or request a quote, while sounding natural.
 
@@ -693,6 +738,7 @@ You must:
 - Move step-by-step logically without loops.
 - Be concise and structured.
 - Do NOT invent details. If uncertain, ask.
+ main
 
 Booking flow order:
 1) Confirm service
@@ -720,7 +766,19 @@ Output MUST be STRICT JSON ONLY with this schema:
  },
  "smalltalk_reply": string|null,
  "next_question": string,
- "suggested_step": "intent"|"job"|"address"|"name"|"access"|"time"|"confirm"
+ "suggested_step": "intent"|"job"|"address"|"name"|"access"|"time"|"confirm",
+ "system_summary": {
+   "intent": "book"|"quote"|"callback",
+   "collected_fields": {
+     "service": string|null,
+     "date": string|null,
+     "time": string|null,
+     "address": string|null,
+     "contact": string|null
+   },
+   "missing_fields": string[],
+   "next_question": string
+ }
 }
 
 Rules:
@@ -729,8 +787,13 @@ Rules:
 - If quote -> intent=QUOTE.
 - If they're returning / already booked -> intent=EXISTING_CUSTOMER.
 - time_text is natural (e.g. "tomorrow at 3").
+ codex/implement-ai-receptionist-functionality
+- If user asks for price, provide realistic range and one next-step question.
+- Do NOT invent details. If uncertain, ask one clear next question.`
+
 - If required information is missing, ask exactly ONE clear next question and wait for the answer.
 ${tone}`
+main
   );
 }
 
@@ -782,7 +845,7 @@ async function callLlm(tradie, session, userSpeech) {
 
   const history = trimHistory(session.history || [], 12);
   const input = [
-    { role: "system", content: buildLlmSystemPrompt(tradie) },
+    { role: "system", content: buildLlmSystemPrompt(tradie, session) },
     ...history.map((h) => ({ role: h.role, content: h.content })),
     { role: "user", content: String(userSpeech || "") }
   ];
@@ -806,9 +869,9 @@ async function callLlm(tradie, session, userSpeech) {
   }
 }
 
-// ----------------------------------------------------------------------------
+// 
 // Twilio helpers + SaaS number provisioning
-// ----------------------------------------------------------------------------
+// 
 function getTwilioClient({ accountSid, authToken } = {}) {
   const sid = accountSid || process.env.TWILIO_ACCOUNT_SID;
   const token = authToken || process.env.TWILIO_AUTH_TOKEN;
@@ -1292,9 +1355,9 @@ async function provisionTwilioNumberForTradie(tradie, reqForBaseUrl) {
   return { skipped: false, phoneNumber: allocated.phoneNumber, sid: allocated.sid, subaccountSid: "" };
 }
 
-// ----------------------------------------------------------------------------
+//
 // Twilio signature validation
-// ----------------------------------------------------------------------------
+// 
 function validateTwilioSignature(req) {
   if (!REQUIRE_TWILIO_SIG) return true;
   const token = process.env.TWILIO_AUTH_TOKEN;
@@ -1317,9 +1380,9 @@ function validateTwilioSignature(req) {
   }
 }
 
-// ----------------------------------------------------------------------------
+// 
 // Stripe SaaS: Checkout + Webhook + Portal + Onboarding
-// ----------------------------------------------------------------------------
+// 
 const STRIPE_PRICE_BASIC = process.env.STRIPE_PRICE_BASIC || "";
 const STRIPE_PRICE_PRO = process.env.STRIPE_PRICE_PRO || "";
 const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || "";
@@ -1857,9 +1920,9 @@ async function incMetric(tradie, partial) {
   return upsertRow(SUPABASE_METRICS_TABLE, row);
 }
 
-// ----------------------------------------------------------------------------
+// 
 // Quote flow (lead + SMS “send photos”)
-// ----------------------------------------------------------------------------
+// 
 function makeQuoteKey(tradieKey, from) {
   const s = `${tradieKey}:${from}:${Date.now()}`;
   return Buffer.from(s).toString("base64url").slice(0, 24);
@@ -1879,9 +1942,9 @@ async function createQuoteLead(tradie, session) {
   });
 }
 
-// ----------------------------------------------------------------------------
+// 
 // Admin: metrics
-// ----------------------------------------------------------------------------
+// 
 app.get("/admin/metrics", async (req, res) => {
   const pw = String(req.query.pw || "");
   if (!ADMIN_DASH_PASSWORD || pw !== ADMIN_DASH_PASSWORD) return res.status(403).json({ error: "Forbidden" });
@@ -1901,9 +1964,9 @@ app.get("/admin/metrics", async (req, res) => {
   return res.json({ ok: true, tradie_key: tradie.key, rows });
 });
 
-// ----------------------------------------------------------------------------
+// 
 // Conversation / session store (in-memory)
-// ----------------------------------------------------------------------------
+// 
 const sessions = new Map();
 const processSpeechLocks = new Map();
 
@@ -1983,9 +2046,9 @@ function addToHistory(session, role, content) {
   session.history = trimHistory([...(session.history || []), { role, content }], 12);
 }
 
-// ----------------------------------------------------------------------------
+// 
 // General helpers + validation
-// ----------------------------------------------------------------------------
+// 
 function cleanSpeech(text) {
   if (!text) return "";
   return String(text).trim().replace(/\s+/g, " ");
@@ -2249,9 +2312,9 @@ function shouldReject(step, speech, confidence) {
   return false;
 }
 
-// ----------------------------------------------------------------------------
+// 
 // Intent detection (heuristic fallback)
-// ----------------------------------------------------------------------------
+// 
 function detectIntent(text) {
   const t = (text || "").toLowerCase();
   const emergency = ["burst","flood","leak","gas","sparking","no power","smoke","fire","blocked","sewage","overflow","urgent","emergency","asap","now"];
@@ -2268,9 +2331,9 @@ function detectIntent(text) {
   return "NEW_BOOKING";
 }
 
-// ----------------------------------------------------------------------------
+// 
 // Time parsing
-// ----------------------------------------------------------------------------
+// 
 function normalizeTimeText(text, tz) {
   if (!text) return "";
   let t = String(text).toLowerCase().trim();
@@ -2356,9 +2419,9 @@ function nextBusinessOpenSlot(tradie) {
   return dt.set({ hour: tradie.businessStartHour, minute: 0, second: 0, millisecond: 0 });
 }
 
-// ----------------------------------------------------------------------------
+// 
 // Interruption + edits
-// ----------------------------------------------------------------------------
+// 
 function detectYesNoFromDigits(d) {
   if (!d) return null;
   if (d === "1") return "YES";
@@ -2412,9 +2475,9 @@ function wantsHuman(text) {
   return t.includes("human") || t.includes("person") || t.includes("owner") || t.includes("manager") || t.includes("someone real");
 }
 
-// ----------------------------------------------------------------------------
+// 
 // Access notes normaliser (fixes “stuck on access notes”)
-// ----------------------------------------------------------------------------
+// 
 function interpretAccessUtterance(rawSpeech) {
   const s = String(rawSpeech || "").trim();
   const sl = s.toLowerCase();
@@ -2432,9 +2495,9 @@ function interpretAccessUtterance(rawSpeech) {
   return { kind: "SET", mode, value: s };
 }
 
-// ----------------------------------------------------------------------------
+// 
 // Profanity/abuse handling
-// ----------------------------------------------------------------------------
+// 
 function detectAbuse(text) {
   const t = (text || "").toLowerCase();
   const abusive = ["retard","retarded","idiot","stupid","moron","dumb","fuck you","f*** you","cunt","bitch","slut","kill yourself"];
@@ -2446,9 +2509,9 @@ function abuseReply(strikes) {
   return "I can’t continue this call. Please call back when you’re ready. ";
 }
 
-// ----------------------------------------------------------------------------
+// 
 // Lightweight slot-fill (if caller blurts multiple fields)
-// ----------------------------------------------------------------------------
+// 
 function trySlotFill(session, speech, tz) {
   const raw = String(speech || "").trim();
   if (!raw) return;
@@ -2476,9 +2539,9 @@ function trySlotFill(session, speech, tz) {
   }
 }
 
-// ----------------------------------------------------------------------------
+// 
 // Google Calendar helpers
-// ----------------------------------------------------------------------------
+// 
 function parseGoogleServiceJson(raw) {
   if (!raw) throw new Error("Missing GOOGLE_SERVICE_JSON env/config");
   let parsed;
@@ -4036,9 +4099,9 @@ app.post("/debug/create-test-event", express.json({ limit: "256kb" }), async (re
   }
 });
 
-// ----------------------------------------------------------------------------
+// 
 // Error handler
-// ----------------------------------------------------------------------------
+// 
 app.use((err, req, res, next) => {
   console.error("UNHANDLED_ROUTE_ERROR", err);
   if (res.headersSent) return next(err);
@@ -4050,9 +4113,9 @@ app.use((req, res) => {
   res.status(404).send("Not Found");
 });
 
-// ----------------------------------------------------------------------------
+// 
 // Listen
-// ----------------------------------------------------------------------------
+// 
 const PORT = Number(process.env.PORT || 10000);
 if (!PORT || Number.isNaN(PORT)) throw new Error("PORT missing/invalid");
 
