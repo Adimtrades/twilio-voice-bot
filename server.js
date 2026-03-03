@@ -212,6 +212,11 @@ app.get("/google/callback", (req, res) => {
   const params = new URLSearchParams(req.query || {}).toString();
   return res.redirect(302, `/api/google/callback${params ? `?${params}` : ""}`);
 });
+app.get("/auth/google", (req, res) => res.redirect(302, `/api/google/connect?tradieId=${encodeURIComponent(String(req.query.tradieId || ""))}`));
+app.get("/auth/google/callback", (req, res) => {
+  const params = new URLSearchParams(req.query || {}).toString();
+  return res.redirect(302, `/api/google/callback${params ? `?${params}` : ""}`);
+});
 
 function collectRoutesFromStack(stack, basePath = "") {
   const routes = [];
@@ -2515,7 +2520,7 @@ async function getCalendarClient(identifier) {
     }
 
     if (!authDetails) throw new Error("Missing tradie identifier");
-    if (!authDetails.googleRefreshToken) throw new Error("Missing Google refresh token");
+    if (!authDetails.googleRefreshToken) throw new Error("Google OAuth not connected for this tradie");
 
     const auth = new google.auth.OAuth2(
       process.env.GOOGLE_CLIENT_ID,
