@@ -33,6 +33,7 @@ try { require("dotenv").config(); } catch {}
 const express = require("express");
 const twilio = require("twilio");
 const nodemailer = require("nodemailer");
+const fs = require("fs");
 const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY || "");
 const chrono = require("chrono-node");
 const { DateTime } = require("luxon");
@@ -437,6 +438,33 @@ function mapWebhookStatus(stripeStatus = "") {
   if (["past_due", "unpaid", "incomplete", "incomplete_expired"].includes(status)) return "past_due";
   if (["canceled"].includes(status)) return "cancelled";
   return "active";
+}
+
+function parseGoogleServiceJson() {
+  const rawValue = process.env.GOOGLE_SERVICE_JSON;
+  if (typeof rawValue !== "string" || !rawValue.trim()) {
+    throw new Error("Missing required env variable: GOOGLE_SERVICE_JSON");
+  }
+
+  const value = rawValue.trim();
+  const isInlineJson = value.startsWith("{");
+  let jsonText = value;
+
+  if (!isInlineJson) {
+    if (!fs.existsSync(value)) {
+      throw new Error(`GOOGLE_SERVICE_JSON file not found: ${value}`);
+    }
+
+    jsonText = fs.readFileSync(value, "utf8");
+  }
+
+  try {
+    return JSON.parse(jsonText);
+  } catch (err) {
+    const parseReason = err?.message || String(err);
+    const source = isInlineJson ? "GOOGLE_SERVICE_JSON env value" : `GOOGLE_SERVICE_JSON file (${value})`;
+    throw new Error(`Invalid JSON in ${source}: ${parseReason}`);
+  }
 }
 
 // ----------------------------------------------------------------------------
