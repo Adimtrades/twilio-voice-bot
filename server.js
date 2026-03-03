@@ -27,6 +27,7 @@
 // OWNER_SMS_TO (fallback), TWILIO_SMS_FROM (fallback),
 // REQUIRE_TWILIO_SIG=false,
 // LLM_ENABLED=false, OPENAI_API_KEY, LLM_BASE_URL, LLM_MODEL
+// GOOGLE_SERVICE_JSON, GOOGLE_SERVICE_JSON_FILE, GOOGLE_APPLICATION_CREDENTIALS
 // ADMIN_DASH_PASSWORD
 
 try { require("dotenv").config(); } catch {}
@@ -34,6 +35,9 @@ const express = require("express");
 const twilio = require("twilio");
 const nodemailer = require("nodemailer");
 const fs = require("fs");
+ codex/fix-parsegoogleservicejson-for-credentials
+const path = require("path");
+main
 const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY || "");
 const chrono = require("chrono-node");
 const { DateTime } = require("luxon");
@@ -43,6 +47,48 @@ const OpenAI = require("openai");
 
 const BOT_VERSION = process.env.BOT_VERSION || process.env.npm_package_version || "1.0.0";
 const LOG_TAG = `[bot:${BOT_VERSION}]`;
+
+function readGoogleServiceAccount() {
+  const parseServiceJson = (rawJson, sourceLabel) => {
+    try {
+      return JSON.parse(rawJson);
+    } catch (error) {
+      throw new Error(`Invalid Google service account JSON from ${sourceLabel}: ${error?.message || error}`);
+    }
+  };
+
+  const googleServiceJson = String(process.env.GOOGLE_SERVICE_JSON || "").trim();
+  if (googleServiceJson) {
+    if (googleServiceJson.startsWith("{")) {
+      console.log(`${LOG_TAG} Google service account loaded from GOOGLE_SERVICE_JSON inline JSON`);
+      return parseServiceJson(googleServiceJson, "GOOGLE_SERVICE_JSON");
+    }
+
+    const envPath = googleServiceJson;
+    const fileContents = fs.readFileSync(envPath, "utf8");
+    console.log(`${LOG_TAG} Google service account loaded from GOOGLE_SERVICE_JSON file path`);
+    return parseServiceJson(fileContents, `GOOGLE_SERVICE_JSON file (${envPath})`);
+  }
+
+  const googleServiceJsonFile = String(process.env.GOOGLE_SERVICE_JSON_FILE || "").trim();
+  if (googleServiceJsonFile) {
+    const resolvedPath = path.resolve(__dirname, googleServiceJsonFile);
+    const fileContents = fs.readFileSync(resolvedPath, "utf8");
+    console.log(`${LOG_TAG} Google service account loaded from GOOGLE_SERVICE_JSON_FILE`);
+    return parseServiceJson(fileContents, `GOOGLE_SERVICE_JSON_FILE (${resolvedPath})`);
+  }
+
+  const googleApplicationCredentials = String(process.env.GOOGLE_APPLICATION_CREDENTIALS || "").trim();
+  if (googleApplicationCredentials) {
+    const fileContents = fs.readFileSync(googleApplicationCredentials, "utf8");
+    console.log(`${LOG_TAG} Google service account loaded from GOOGLE_APPLICATION_CREDENTIALS`);
+    return parseServiceJson(fileContents, `GOOGLE_APPLICATION_CREDENTIALS (${googleApplicationCredentials})`);
+  }
+
+  throw new Error("Missing GOOGLE_SERVICE_JSON env/config");
+}
+
+readGoogleServiceAccount();
 
 const requiredEnv = [
   "TWILIO_ACCOUNT_SID",
