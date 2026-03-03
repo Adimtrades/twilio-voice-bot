@@ -26,7 +26,7 @@
 // TRADIES_JSON (fallback), TWILIO_BUY_COUNTRY=AU, TWILIO_BUY_AREA_CODE=2,
 // OWNER_SMS_TO (fallback), TWILIO_SMS_FROM (fallback),
 // REQUIRE_TWILIO_SIG=false,
-// GOOGLE_CALENDAR_ID / GOOGLE_SERVICE_JSON (fallback per-tenant)
+// GOOGLE_CALENDAR_ID (fallback per-tenant)
 // LLM_ENABLED=false, OPENAI_API_KEY, LLM_BASE_URL, LLM_MODEL
 // ADMIN_DASH_PASSWORD
 
@@ -131,15 +131,15 @@ app.get('/health', (req, res) => {
 });
 
 const BASE_URL = process.env.BASE_URL || "http://localhost:3000";
-const GOOGLE_REDIRECT_URL = process.env.GOOGLE_REDIRECT_URL || `${BASE_URL}/google/callback`;
+const GOOGLE_REDIRECT_URI = process.env.GOOGLE_REDIRECT_URI || `${BASE_URL}/api/google/callback`;
 
 const oauth2Client = new google.auth.OAuth2(
   process.env.GOOGLE_CLIENT_ID,
   process.env.GOOGLE_CLIENT_SECRET,
-  GOOGLE_REDIRECT_URL
+  GOOGLE_REDIRECT_URI
 );
 
-app.get("/google/auth", async (req, res) => {
+app.get("/api/google/connect", async (req, res) => {
   try {
     const tradieId = req.query.tradieId;
     if (!tradieId) {
@@ -149,7 +149,7 @@ app.get("/google/auth", async (req, res) => {
     const authUrl = oauth2Client.generateAuthUrl({
       access_type: "offline",
       prompt: "consent",
-      scope: ["https://www.googleapis.com/auth/calendar"],
+      scope: "https://www.googleapis.com/auth/calendar",
       state: tradieId
     });
 
@@ -161,7 +161,7 @@ app.get("/google/auth", async (req, res) => {
   }
 });
 
-app.get("/google/callback", async (req, res) => {
+app.get("/api/google/callback", async (req, res) => {
   try {
     const code = String(req.query.code || "").trim();
     const tradieId = String(req.query.state || "").trim();
@@ -177,26 +177,51 @@ app.get("/google/callback", async (req, res) => {
 
     const { tokens } = await oauth2Client.getToken(code);
     const refreshToken = String(tokens?.refresh_token || "").trim();
+    const accessToken = String(tokens?.access_token || "").trim();
+    const expiryDate = Number(tokens?.expiry_date || 0);
 
-    const updatePayload = { google_connected: true };
-    if (refreshToken) {
-      updatePayload.google_refresh_token = refreshToken;
-    } else {
-      console.error("GOOGLE_CALLBACK_REFRESH_TOKEN_MISSING", { tradieId });
-    }
+    const tradiesUpdate = {
+      google_connected: true,
+      google_refresh_token: refreshToken || null,
+      google_access_token: accessToken || null,
+      google_expiry_date: expiryDate ? new Date(expiryDate).toISOString() : null,
+      calendar_id: "primary",
+      updated_at: new Date().toISOString()
+    };
 
-    const { error } = await supabase
+    const { error: tradiesError } = await supabase
       .from(SUPABASE_TRADIES_TABLE)
-      .update(updatePayload)
+      .update(tradiesUpdate)
       .eq("id", tradieId);
 
-    if (error) {
-      console.error("GOOGLE_CALLBACK_SUPABASE_UPDATE_ERROR", {
+    if (tradiesError) {
+      console.error("GOOGLE_CALLBACK_TRADIES_UPDATE_ERROR", {
         tradieId,
-        message: error.message,
-        code: error.code || null
+        message: tradiesError.message,
+        code: tradiesError.code || null
       });
       return res.status(500).json({ error: "Unable to save Google connection" });
+    }
+
+    const { error: accountsError } = await supabase
+      .from(SUPABASE_TRADIE_ACCOUNTS_TABLE)
+      .upsert({
+        tradie_id: tradieId,
+        google_connected: true,
+        google_refresh_token: refreshToken || null,
+        google_access_token: accessToken || null,
+        google_expiry_date: expiryDate ? new Date(expiryDate).toISOString() : null,
+        calendar_id: "primary",
+        updated_at: new Date().toISOString()
+      }, { onConflict: "tradie_id" });
+
+    if (accountsError) {
+      console.error("GOOGLE_CALLBACK_ACCOUNTS_UPDATE_ERROR", {
+        tradieId,
+        message: accountsError.message,
+        code: accountsError.code || null
+      });
+      return res.status(500).json({ error: "Unable to save Google account connection" });
     }
 
     return res.status(200).send("Google connected successfully.");
@@ -204,6 +229,12 @@ app.get("/google/callback", async (req, res) => {
     console.error("GOOGLE_CALLBACK_ERROR", error);
     return res.status(500).json({ error: "Google connection failed" });
   }
+});
+
+app.get("/google/auth", (req, res) => res.redirect(302, `/api/google/connect?tradieId=${encodeURIComponent(String(req.query.tradieId || ""))}`));
+app.get("/google/callback", (req, res) => {
+  const params = new URLSearchParams(req.query || {}).toString();
+  return res.redirect(302, `/api/google/callback${params ? `?${params}` : ""}`);
 });
 
 function collectRoutesFromStack(stack, basePath = "") {
@@ -609,7 +640,6 @@ function normalizeTradieConfig(row) {
     businessEndHour: Number(t.businessEndHour ?? t.business_end_hour ?? process.env.BUSINESS_END_HOUR ?? 17),
 
     calendarId: String(t.calendarId || t.calendar_id || t.calendar_email || process.env.GOOGLE_CALENDAR_ID || ""),
-    googleServiceJson: String(t.googleServiceJson || t.google_service_json || process.env.GOOGLE_SERVICE_JSON || ""),
 
     avgJobValue: Number.isFinite(avgJobValue) ? avgJobValue : 250,
     closeRate: Number.isFinite(closeRate) ? closeRate : 0.6,
@@ -925,7 +955,7 @@ async function sendGoogleCalendarConnectEmailForTradie({ tradie, source = "" }) 
     return false;
   }
 
-  const connectLink = `${BASE_URL.replace(/\/+$/, "")}/google/auth?tradieId=${encodeURIComponent(tradieId)}`;
+  const connectLink = `${BASE_URL.replace(/\/+$/, "")}/api/google/connect?tradieId=${encodeURIComponent(tradieId)}`;
   const subject = "Connect your Google Calendar";
   const text =
 `Hi,
@@ -981,9 +1011,8 @@ function buildActivationEmailContent({ customerName, businessName, provisionedPh
   const safeCustomerName = customerName || "there";
   const safeBusinessName = businessName || "Your Business";
   const safePhoneNumber = provisionedPhoneNumber || "Not available";
-  const serviceAccountEmail = "twilio-voice@twilio-voice-booking.iam.gserviceaccount.com";
   const safeBaseUrl = String(baseUrl || "https://twilio-voice-bot-w9gq.onrender.com").replace(/\/+$/, "");
-  const connectGoogleCalendarLink = `${safeBaseUrl}/google/auth?tradieId=${encodeURIComponent(String(tradieId || ""))}`;
+  const connectGoogleCalendarLink = `${safeBaseUrl}/api/google/connect?tradieId=${encodeURIComponent(String(tradieId || ""))}`;
 
   const text =
 `Hi ${safeCustomerName},
@@ -995,22 +1024,12 @@ ${safePhoneNumber}
 
 Save this number as "${safeBusinessName} Bookings".
 
-To enable automatic bookings into your Google Calendar, please complete this quick step:
-
-1. Open Google Calendar
-2. Click Settings (⚙ icon, top right)
-3. Select your main calendar (left sidebar)
-4. Click “Share with specific people”
-5. Add this email:
-${serviceAccountEmail}
-6. Set permission to:
-"Make changes to events"
-7. Click Send
-
-Once done, your assistant will automatically create bookings in your calendar.
+To enable automatic bookings into your Google Calendar, connect your account using OAuth:
 
 Connect Google Calendar
 ${connectGoogleCalendarLink}
+
+Once connected, your assistant will automatically create bookings in your primary calendar.
 
 No other setup is required.
 
@@ -1023,18 +1042,9 @@ AdimTrades Automation`;
 <p>Your AI booking assistant is now live.</p>
 <p>📞 <strong>Your dedicated booking number:</strong><br/>${safePhoneNumber}</p>
 <p>Save this number as "${safeBusinessName} Bookings".</p>
-<p>To enable automatic bookings into your Google Calendar, please complete this quick step:</p>
-<ol>
-  <li>Open Google Calendar</li>
-  <li>Click Settings (⚙ icon, top right)</li>
-  <li>Select your main calendar (left sidebar)</li>
-  <li>Click “Share with specific people”</li>
-  <li>Add this email:<br/><strong>${serviceAccountEmail}</strong></li>
-  <li>Set permission to:<br/>"Make changes to events"</li>
-  <li>Click Send</li>
-</ol>
-<p>Once done, your assistant will automatically create bookings in your calendar.</p>
+<p>To enable automatic bookings into your Google Calendar, connect your account using OAuth:</p>
 <p><strong>Connect Google Calendar</strong><br/><a href="${connectGoogleCalendarLink}">Connect Google Calendar</a></p>
+<p>Once connected, your assistant will automatically create bookings in your primary calendar.</p>
 <p>No other setup is required.</p>
 <p>If you need help, simply reply to this email and we’ll assist immediately.</p>
 <p>Thanks,<br/>AdimTrades Automation</p>`;
@@ -1461,7 +1471,7 @@ app.get("/onboarding/verify", async (req, res) => {
   }
 });
 
-// POST /onboarding/submit { session_id, ownerSmsTo, calendarId, timezone, bizName, services, tone, businessDays, businessStartHour, businessEndHour, avgJobValue, closeRate, slotMinutes, bufferMinutes, googleServiceJson }
+// POST /onboarding/submit { session_id, ownerSmsTo, calendarId, timezone, bizName, services, tone, businessDays, businessStartHour, businessEndHour, avgJobValue, closeRate, slotMinutes, bufferMinutes }
 app.post("/onboarding/submit", async (req, res) => {
   try {
     if (!stripeReady()) return res.status(500).json({ ok: false, error: "Stripe not configured" });
@@ -1509,7 +1519,6 @@ app.post("/onboarding/submit", async (req, res) => {
       slot_minutes: Number(req.body.slotMinutes ?? 60),
       buffer_minutes: Number(req.body.bufferMinutes ?? 0),
 
-      google_service_json: String(req.body.googleServiceJson || "").trim(),
       updated_at: new Date().toISOString()
     };
 
@@ -2512,116 +2521,98 @@ function trySlotFill(session, speech, tz) {
 // 
 // Google Calendar helpers
 // 
-function parseGoogleServiceJson(raw) {
-  if (!raw) throw new Error("Missing GOOGLE_SERVICE_JSON env/config");
-  let parsed;
-  try { parsed = JSON.parse(raw); }
-  catch { parsed = JSON.parse(raw.replace(/\r?\n/g, "\\n")); }
-  if (typeof parsed === "string") parsed = JSON.parse(parsed);
-  return parsed;
+async function getTradieGoogleAuthByPhone(phone) {
+  const normalizedPhone = normalizePhoneE164AU(phone);
+  const digitsOnly = normalizedPhone.replace(/^\+/, "");
+
+  if (!supabase) throw new Error("Database not configured");
+  if (!normalizedPhone) throw new Error("Missing phone");
+
+  const { data: tradieByNumber, error: tradieError } = await supabase
+    .from(SUPABASE_TRADIES_TABLE)
+    .select("id,google_refresh_token")
+    .or([
+      `twilio_number.eq.${normalizedPhone}`,
+      `twilio_phone_number.eq.${normalizedPhone}`,
+      `twilio_number.eq.${digitsOnly}`,
+      `twilio_phone_number.eq.${digitsOnly}`
+    ].join(","))
+    .limit(1)
+    .maybeSingle();
+
+  if (tradieError) {
+    throw new Error(`TRADIE_PHONE_LOOKUP_FAILED: ${tradieError.message}`);
+  }
+
+  if (tradieByNumber?.id) {
+    return {
+      tradieId: String(tradieByNumber.id || "").trim(),
+      googleRefreshToken: String(tradieByNumber.google_refresh_token || "").trim()
+    };
+  }
+
+  const { account, normalizedCalledNumber } = await lookupTradieAccountByCalledNumber({
+    supabase,
+    calledNumber: normalizedPhone
+  });
+
+  if (!account?.tradie_id) {
+    throw new Error(`NO_TRADIE_FOR_PHONE: ${normalizedCalledNumber || normalizedPhone}`);
+  }
+
+  const tradieId = String(account.tradie_id || "").trim();
+  const { data: tradieById, error: tradieByIdError } = await supabase
+    .from(SUPABASE_TRADIES_TABLE)
+    .select("id,google_refresh_token")
+    .eq("id", tradieId)
+    .maybeSingle();
+
+  if (tradieByIdError) {
+    throw new Error(`TRADIE_ID_LOOKUP_FAILED: ${tradieByIdError.message}`);
+  }
+
+  return {
+    tradieId,
+    googleRefreshToken: String(tradieById?.google_refresh_token || "").trim()
+  };
 }
 
-async function getAuthorizedGoogleClientForTradie(tradieId) {
+async function getCalendarClient(identifier) {
   try {
-    if (!supabase) throw new Error("Database not configured");
-    if (!tradieId) throw new Error("Missing tradieId");
+    const rawIdentifier = String(identifier || "").trim();
+    let authDetails = null;
 
-    const { data, error } = await supabase
-      .from(SUPABASE_TRADIE_ACCOUNTS_TABLE)
-      .select("id,google_refresh_token,google_access_token,google_token_expiry,google_connected")
-      .eq("id", tradieId)
-      .single();
+    if (/^\+?\d{8,}$/.test(rawIdentifier.replace(/\s+/g, ""))) {
+      authDetails = await getTradieGoogleAuthByPhone(rawIdentifier);
+    } else if (rawIdentifier) {
+      const { data, error } = await supabase
+        .from(SUPABASE_TRADIES_TABLE)
+        .select("id,google_refresh_token")
+        .eq("id", rawIdentifier)
+        .maybeSingle();
+      if (error) throw new Error(`TRADIE_LOOKUP_FOR_AUTH_FAILED: ${error.message}`);
+      authDetails = {
+        tradieId: String(data?.id || rawIdentifier).trim(),
+        googleRefreshToken: String(data?.google_refresh_token || "").trim()
+      };
+    }
 
-    if (error) throw error;
-
-    const refreshToken = String(data?.google_refresh_token || "").trim();
-    if (!refreshToken) throw new Error("Google not connected");
+    if (!authDetails) throw new Error("Missing tradie identifier");
 
     const auth = new google.auth.OAuth2(
       process.env.GOOGLE_CLIENT_ID,
       process.env.GOOGLE_CLIENT_SECRET,
-      `${BASE_URL}/google/callback`
+      process.env.GOOGLE_REDIRECT_URI
     );
 
-    const accessToken = String(data?.google_access_token || "").trim();
-    const expiryMs = data?.google_token_expiry ? new Date(data.google_token_expiry).getTime() : 0;
-
     auth.setCredentials({
-      refresh_token: refreshToken,
-      ...(accessToken ? { access_token: accessToken } : {}),
-      ...(expiryMs ? { expiry_date: expiryMs } : {})
+      refresh_token: authDetails.googleRefreshToken
     });
 
-    const now = Date.now();
-    const needsRefresh = !accessToken || !expiryMs || expiryMs <= (now + 2 * 60 * 1000);
-
-    if (needsRefresh) {
-      let refreshedAccessToken = "";
-      let refreshedExpiryMs = 0;
-
-      try {
-        const refreshed = await auth.refreshAccessToken();
-        if (refreshed?.credentials) {
-          refreshedAccessToken = String(refreshed.credentials.access_token || "").trim();
-          refreshedExpiryMs = Number(refreshed.credentials.expiry_date || 0);
-        }
-      } catch (refreshErr) {
-        console.error("GOOGLE_TOKEN_REFRESH_ACCESS_TOKEN_ERROR", refreshErr);
-      }
-
-      if (!refreshedAccessToken) {
-        const tokenResp = await auth.getAccessToken();
-        refreshedAccessToken = String(tokenResp?.token || "").trim();
-      }
-
-      const finalAccessToken = refreshedAccessToken || String(auth.credentials?.access_token || "").trim();
-      const finalExpiryMs = Number(refreshedExpiryMs || auth.credentials?.expiry_date || 0);
-
-      if (finalAccessToken) {
-        auth.setCredentials({
-          ...auth.credentials,
-          access_token: finalAccessToken,
-          ...(finalExpiryMs ? { expiry_date: finalExpiryMs } : {})
-        });
-
-        const updatePayload = {
-          google_access_token: finalAccessToken,
-          google_token_expiry: finalExpiryMs ? new Date(finalExpiryMs).toISOString() : null,
-          google_connected: true
-        };
-
-        const { error: updateError } = await supabase
-          .from(SUPABASE_TRADIE_ACCOUNTS_TABLE)
-          .update(updatePayload)
-          .eq("id", tradieId);
-
-        if (updateError) {
-          console.error("GOOGLE_TOKEN_UPDATE_ERROR", {
-            tradieId,
-            message: updateError.message,
-            code: updateError.code || null
-          });
-        }
-      }
-    }
-
-    return auth;
-  } catch (error) {
-    console.error("GOOGLE_AUTH_CLIENT_ERROR", {
-      tradieId,
-      message: error?.message || String(error)
-    });
-    throw error;
-  }
-}
-
-async function getCalendarClient(tradieId) {
-  try {
-    const auth = await getAuthorizedGoogleClientForTradie(tradieId);
-    return google.calendar({ version: "v3", auth });
+    return { calendar: google.calendar({ version: "v3", auth }), tradieId: authDetails.tradieId };
   } catch (error) {
     console.error("GET_CALENDAR_CLIENT_ERROR", {
-      tradieId,
+      identifier,
       message: error?.message || String(error)
     });
     throw error;
@@ -2686,39 +2677,20 @@ async function resolveCalendarTarget(tradie, context = {}) {
 }
 
 async function createBookingCalendarEvent({ tradie, booking, context = {} }) {
-  let calendarId = "";
   const calledNumber = String(context.calledNumber || "").trim();
-
-  try {
-    if (supabase && calledNumber) {
-      calendarId = await resolveCalendarIdFromCalledNumber({ supabase, calledNumber });
-    } else {
-      const target = await resolveCalendarTarget(tradie, context);
-      calendarId = target.calendarId;
-    }
-  } catch (err) {
-    console.error("CALENDAR_ID_RESOLVE_ERROR", {
-      message: err?.message || String(err),
-      bookingId: booking.bookingId || context.bookingId || null,
-      callSid: context.callSid || booking.callSid || null,
-      calledNumber: calledNumber || null
-    });
-    return { ok: false, reason: "missing_calendar", error: err };
-  }
-
-  if (!calendarId) return { ok: false, reason: "missing_calendar" };
-  if (String(calendarId).toLowerCase().includes("adimtrades")) {
-    throw new Error(`SAFETY_BLOCK: Refusing to insert into admin calendar: ${calendarId}`);
-  }
+  const calendarId = "primary";
 
   let calendar;
   try {
-    calendar = await getCalendarClient(tradie.id);
+    const { calendar: calendarClient, tradieId } = await getCalendarClient(calledNumber || tradie?.twilioNumber || tradie?.twilio_number || tradie?.twilio_phone_number || "");
+    calendar = calendarClient;
+    if (!tradie.id && tradieId) tradie.id = tradieId;
   } catch (err) {
     console.error("CALENDAR_EVENT_CREATE_ERROR", {
       message: err?.message || String(err),
       stack: err?.stack || null,
-      calendarId
+      calendarId,
+      calledNumber: calledNumber || null
     });
     return { ok: false, reason: "insert_failed", error: err };
   }
@@ -2735,7 +2707,10 @@ async function createBookingCalendarEvent({ tradie, booking, context = {} }) {
   const requestBody = {
     summary: `${customerName} — ${job}`,
     location: address,
-    description: `Name: ${customerName}\nPhone: ${customerPhone}\nAddress: ${address}\nJob: ${job}`,
+    description: `Name: ${customerName}
+Phone: ${customerPhone}
+Address: ${address}
+Job: ${job}`,
     start: { dateTime: startISO, timeZone: "Australia/Sydney" },
     end: { dateTime: endISO, timeZone: "Australia/Sydney" }
   };
@@ -2890,7 +2865,7 @@ async function nextAvailableSlots(tradie, startSearchDt, count = 3) {
   if (!start || !DateTime.isDateTime(start) || !start.isValid) start = DateTime.now().setZone(tz).plus({ minutes: 10 }).startOf("minute");
   else start = start.setZone(tz);
 
-  const calendar = await getCalendarClient(tradie.id);
+  const { calendar } = await getCalendarClient(tradie.id);
   const searchEnd = start.plus({ days: 14 });
 
   const busy = await getBusy(
@@ -3356,7 +3331,7 @@ app.post("/process", async (req, res) => {
       // address history
       if (tradie.calendarId && tradie.id) {
         try {
-          const calendar = await getCalendarClient(tradie.id);
+          const { calendar } = await getCalendarClient(tradie.id);
           session.lastAtAddress = await getLastBookingAtAddress(calendar, tradie.calendarId, tz, session.address);
         } catch (error) { console.error("CALENDAR_ADDRESS_HISTORY_ERROR", error); }
       }
@@ -3461,7 +3436,7 @@ app.post("/process", async (req, res) => {
       // Duplicate detection (calendar)
       if (tradie.calendarId && tradie.id) {
         try {
-          const calendar = await getCalendarClient(tradie.id);
+          const { calendar } = await getCalendarClient(tradie.id);
           const dup = await withTimeout(
             findDuplicate(calendar, tradie.calendarId, tz, session.name, session.address, dt),
             CALENDAR_OP_TIMEOUT_MS,
