@@ -35,9 +35,7 @@ const express = require("express");
 const twilio = require("twilio");
 const nodemailer = require("nodemailer");
 const fs = require("fs");
- codex/fix-parsegoogleservicejson-for-credentials
 const path = require("path");
-main
 const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY || "");
 const chrono = require("chrono-node");
 const { DateTime } = require("luxon");
