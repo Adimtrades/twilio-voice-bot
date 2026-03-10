@@ -34,6 +34,7 @@ try { require("dotenv").config(); } catch {}
 const express = require("express");
 const twilio = require("twilio");
 const nodemailer = require("nodemailer");
+const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
 const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY || "");
@@ -408,6 +409,18 @@ function normalizePhoneE164AU(phone) {
   }
 
   return `+61${digits}`;
+}
+
+function isValidE164(phone) {
+  return /^\+[1-9]\d{7,14}$/.test(String(phone || "").trim());
+}
+
+function hashOnboardingToken(token) {
+  return crypto.createHash("sha256").update(String(token || "")).digest("hex");
+}
+
+function generateOnboardingToken() {
+  return crypto.randomBytes(32).toString("hex");
 }
 
 async function lookupTradieAccountByCalledNumber({ supabase, calledNumber }) {
@@ -1159,6 +1172,16 @@ async function getOrCreateTradieForStripeEvent({ customerId, subscriptionId, pla
 
 async function ensureTwilioNumberProvisionedForTradie(tradie, reqForBaseUrl) {
   if (!tradie?.id) return null;
+
+  const existingAssigned = await getExistingTwilioNumberForTradie(tradie.id).catch(() => null);
+  if (existingAssigned?.phoneNumber) {
+    return {
+      skipped: true,
+      phoneNumber: existingAssigned.phoneNumber,
+      sid: existingAssigned.sid || ""
+    };
+  }
+
   if (tradie.twilio_phone_number || tradie.twilio_number) {
     console.log("stripe provisioning step: existing twilio number found", {
       tradie_id: tradie.id,
@@ -1539,6 +1562,268 @@ app.post("/onboarding/submit", async (req, res) => {
   } catch (e) {
     console.error("onboarding submit error", e);
     return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
+
+const onboardingStartRateLimit = new Map();
+const ONBOARDING_START_RATE_LIMIT_WINDOW_MS = Number(process.env.ONBOARDING_START_RATE_LIMIT_WINDOW_MS || 10 * 60 * 1000);
+const ONBOARDING_START_RATE_LIMIT_MAX = Number(process.env.ONBOARDING_START_RATE_LIMIT_MAX || 5);
+const ONBOARDING_TOKEN_TTL_HOURS = Number(process.env.ONBOARDING_TOKEN_TTL_HOURS || 24);
+
+function getOnboardingStartRateLimitKey(req, email) {
+  const ip = String(req.ip || req.headers["x-forwarded-for"] || "unknown").split(",")[0].trim();
+  return `${ip}:${String(email || "").toLowerCase()}`;
+}
+
+function isOnboardingStartRateLimited(req, email) {
+  const now = Date.now();
+  const key = getOnboardingStartRateLimitKey(req, email);
+  const existing = onboardingStartRateLimit.get(key);
+  if (!existing || now > existing.resetAt) {
+    onboardingStartRateLimit.set(key, { count: 1, resetAt: now + ONBOARDING_START_RATE_LIMIT_WINDOW_MS });
+    return false;
+  }
+
+  existing.count += 1;
+  onboardingStartRateLimit.set(key, existing);
+  return existing.count > ONBOARDING_START_RATE_LIMIT_MAX;
+}
+
+async function getLeadByEmail(email) {
+  const normalizedEmail = String(email || "").trim().toLowerCase();
+  if (!normalizedEmail) return null;
+
+  const { data, error } = await supabase
+    .from("onboarding_leads")
+    .select("id,email,phone,onboarding_token_hash,token_expires_at,created_at,completed,onboarding_email_sent_at,tradie_id")
+    .eq("email", normalizedEmail)
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (error) throw new Error(`ONBOARDING_LEAD_LOOKUP_FAILED: ${error.message}`);
+  return data || null;
+}
+
+async function ensureTradieForOnboarding({ email, phone }) {
+  const normalizedEmail = String(email || "").trim().toLowerCase();
+  const { data: existing, error: existingError } = await supabase
+    .from(SUPABASE_TRADIES_TABLE)
+    .select("*")
+    .eq("email", normalizedEmail)
+    .order("updated_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (existingError) {
+    throw new Error(`TRADIE_LOOKUP_FOR_ONBOARDING_FAILED: ${existingError.message}`);
+  }
+
+  if (existing?.id) {
+    const updatePayload = {
+      owner_mobile: phone,
+      owner_sms_to: phone,
+      updated_at: new Date().toISOString()
+    };
+
+    const { data: updated, error: updateError } = await supabase
+      .from(SUPABASE_TRADIES_TABLE)
+      .update(updatePayload)
+      .eq("id", existing.id)
+      .select("*")
+      .single();
+
+    if (updateError) throw new Error(`TRADIE_UPDATE_FOR_ONBOARDING_FAILED: ${updateError.message}`);
+    return updated;
+  }
+
+  const generatedKey = `t_${crypto.randomUUID().replace(/-/g, "").slice(0, 12)}`;
+  const payload = {
+    tradie_key: generatedKey,
+    email: normalizedEmail,
+    owner_mobile: phone,
+    owner_sms_to: phone,
+    status: "PENDING_SETUP",
+    subscription_status: "pending",
+    updated_at: new Date().toISOString()
+  };
+
+  const { data, error } = await supabase
+    .from(SUPABASE_TRADIES_TABLE)
+    .insert(payload)
+    .select("*")
+    .single();
+
+  if (error) throw new Error(`TRADIE_CREATE_FOR_ONBOARDING_FAILED: ${error.message}`);
+  return data;
+}
+
+async function getExistingTwilioNumberForTradie(tradieId) {
+  if (!tradieId) return null;
+  const { data, error } = await supabase
+    .from("twilio_numbers")
+    .select("sid,phone_number,created_at")
+    .eq("assigned_tradie_id", tradieId)
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (error) throw new Error(`TWILIO_NUMBER_LOOKUP_FAILED: ${error.message}`);
+  if (!data?.phone_number) return null;
+  return { sid: data.sid || "", phoneNumber: data.phone_number };
+}
+
+async function ensureSingleTwilioNumberForTradie(tradie, reqForBaseUrl) {
+  const existing = await getExistingTwilioNumberForTradie(tradie?.id);
+  if (existing?.phoneNumber) {
+    return { skipped: true, phoneNumber: existing.phoneNumber, sid: existing.sid || "" };
+  }
+  return ensureTwilioNumberProvisionedForTradie(tradie, reqForBaseUrl);
+}
+
+function buildOnboardingEmail({ assignedNumber, frontendBaseUrl, rawToken }) {
+  const setupLink = `${String(frontendBaseUrl || BASE_URL).replace(/\/+$/, "")}/setup?token=${encodeURIComponent(rawToken)}`;
+  const subject = "Your AI Receptionist Setup Link";
+  const text = `Hi,
+
+Your AI receptionist system is almost ready.
+
+Phone number assigned:
+${assignedNumber}
+
+Complete your setup here:
+${setupLink}
+
+This link expires in 24 hours.
+
+If you did not request this setup, ignore this email.`;
+  const html = `<p>Hi,</p><p>Your AI receptionist system is almost ready.</p><p><strong>Phone number assigned:</strong><br/>${assignedNumber}</p><p>Complete your setup here:<br/><a href="${setupLink}">${setupLink}</a></p><p>This link expires in 24 hours.</p><p>If you did not request this setup, ignore this email.</p>`;
+  return { subject, text, html };
+}
+
+app.post("/onboarding/start", async (req, res) => {
+  try {
+    if (!supaReady() || !supabase) return res.status(500).json({ ok: false, error: "Supabase not configured" });
+
+    const email = String(req.body?.email || "").trim().toLowerCase();
+    const phone = normalizePhoneE164AU(req.body?.phone);
+
+    if (!email) return res.status(400).json({ ok: false, error: "Missing email" });
+    if (!phone || !isValidE164(phone)) return res.status(400).json({ ok: false, error: "Invalid phone. Use E.164 format." });
+
+    if (isOnboardingStartRateLimited(req, email)) {
+      return res.status(429).json({ ok: false, error: "Too many onboarding requests. Please retry later." });
+    }
+
+    const tradie = await ensureTradieForOnboarding({ email, phone });
+    const twilioProvision = await ensureSingleTwilioNumberForTradie(tradie, req);
+    const existingLead = await getLeadByEmail(email);
+
+    if (existingLead?.onboarding_email_sent_at) {
+      return res.status(200).json({ ok: true, message: "Onboarding email already sent.", twilio_number: twilioProvision.phoneNumber, email_sent: false });
+    }
+
+    const rawToken = generateOnboardingToken();
+    const tokenHash = hashOnboardingToken(rawToken);
+    const tokenExpiry = new Date(Date.now() + (ONBOARDING_TOKEN_TTL_HOURS * 60 * 60 * 1000)).toISOString();
+
+    const leadPayload = {
+      email,
+      phone,
+      onboarding_token_hash: tokenHash,
+      token_expires_at: tokenExpiry,
+      completed: false,
+      tradie_id: tradie.id,
+      onboarding_email_sent_at: null
+    };
+
+    let lead;
+    if (existingLead?.id) {
+      const { data, error } = await supabase
+        .from("onboarding_leads")
+        .update({ ...leadPayload, created_at: existingLead.created_at || new Date().toISOString() })
+        .eq("id", existingLead.id)
+        .select("id,email,phone,token_expires_at,completed")
+        .single();
+      if (error) throw new Error(`ONBOARDING_LEAD_UPDATE_FAILED: ${error.message}`);
+      lead = data;
+    } else {
+      const { data, error } = await supabase
+        .from("onboarding_leads")
+        .insert(leadPayload)
+        .select("id,email,phone,token_expires_at,completed")
+        .single();
+      if (error) throw new Error(`ONBOARDING_LEAD_CREATE_FAILED: ${error.message}`);
+      lead = data;
+    }
+
+    const frontendUrl = process.env.FRONTEND_URL || process.env.BASE_URL || BASE_URL;
+    const { subject, text, html } = buildOnboardingEmail({
+      assignedNumber: twilioProvision.phoneNumber || "Not available",
+      frontendBaseUrl: frontendUrl,
+      rawToken
+    });
+
+    const sent = await sendTradieEmail(email, subject, text, html);
+    if (!sent) {
+      return res.status(503).json({ ok: false, error: "Email transport unavailable" });
+    }
+
+    await supabase
+      .from("onboarding_leads")
+      .update({ onboarding_email_sent_at: new Date().toISOString() })
+      .eq("id", lead.id);
+
+    return res.status(200).json({ ok: true, lead_id: lead.id, twilio_number: twilioProvision.phoneNumber, expires_at: lead.token_expires_at, email_sent: true });
+  } catch (error) {
+    console.error("onboarding start error", error);
+    return res.status(500).json({ ok: false, error: String(error?.message || error) });
+  }
+});
+
+app.post("/onboarding/complete", async (req, res) => {
+  try {
+    if (!supaReady() || !supabase) return res.status(500).json({ ok: false, error: "Supabase not configured" });
+
+    const token = String(req.body?.token || "").trim();
+    if (!token) return res.status(400).json({ ok: false, error: "Missing token" });
+
+    const tokenHash = hashOnboardingToken(token);
+    const { data: lead, error: leadError } = await supabase
+      .from("onboarding_leads")
+      .select("id,email,tradie_id,token_expires_at,completed")
+      .eq("onboarding_token_hash", tokenHash)
+      .limit(1)
+      .maybeSingle();
+
+    if (leadError) throw new Error(`ONBOARDING_TOKEN_LOOKUP_FAILED: ${leadError.message}`);
+    if (!lead?.id) return res.status(400).json({ ok: false, error: "Invalid token" });
+    if (lead.completed) return res.status(400).json({ ok: false, error: "Token already used" });
+    if (new Date(lead.token_expires_at).getTime() < Date.now()) return res.status(400).json({ ok: false, error: "Token expired" });
+
+    const nowIso = new Date().toISOString();
+    const { data: completedLead, error: completeError } = await supabase
+      .from("onboarding_leads")
+      .update({ completed: true, completed_at: nowIso, onboarding_token_hash: null })
+      .eq("id", lead.id)
+      .eq("completed", false)
+      .select("id,email,tradie_id,completed")
+      .single();
+
+    if (completeError) throw new Error(`ONBOARDING_COMPLETE_UPDATE_FAILED: ${completeError.message}`);
+
+    const tradieTarget = completedLead.tradie_id
+      ? supabase.from(SUPABASE_TRADIES_TABLE).update({ status: "ACTIVE", subscription_status: "active", updated_at: nowIso }).eq("id", completedLead.tradie_id)
+      : supabase.from(SUPABASE_TRADIES_TABLE).update({ status: "ACTIVE", subscription_status: "active", updated_at: nowIso }).eq("email", completedLead.email);
+
+    const { error: tradieUpdateError } = await tradieTarget;
+    if (tradieUpdateError) throw new Error(`TRADIE_ACTIVATION_FAILED: ${tradieUpdateError.message}`);
+
+    return res.status(200).json({ ok: true, activated: true });
+  } catch (error) {
+    console.error("onboarding complete error", error);
+    return res.status(500).json({ ok: false, error: String(error?.message || error) });
   }
 });
 
