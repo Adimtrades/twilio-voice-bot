@@ -261,8 +261,17 @@ app.get("/api/google/callback", async (req, res) => {
 
     return res.status(200).send("Google connected successfully.");
   } catch (error) {
-    console.error("GOOGLE_CALLBACK_ERROR", error);
-    return res.status(500).json({ error: "Google connection failed" });
+    console.error("GOOGLE_CALLBACK_ERROR", {
+      message: error?.message || String(error),
+      stack: error?.stack || null,
+      code: error?.code || null,
+      status: error?.status || error?.response?.status || null,
+      data: error?.response?.data || null
+    });
+    return res.status(500).json({
+      error: "Google connection failed",
+      detail: error?.message || String(error)
+    });
   }
 });
 
