@@ -242,6 +242,8 @@ app.get("/api/google/callback", async (req, res) => {
       google_refresh_token: refreshToken || null,
       google_access_token: accessToken || null,
       google_expiry_date: expiryDate ? new Date(expiryDate).toISOString() : null,
+      google_connected: true,
+      calendar_id: "primary",
       updated_at: new Date().toISOString()
     };
 
@@ -649,7 +651,7 @@ function normalizeTradieConfig(row) {
   const tone = String(t.tone || process.env.BOT_TONE || "friendly"); // friendly | direct
   const services = String(t.services || process.env.BOT_SERVICES || "");
 
-  const twilioNumber = String(t.twilio_phone_number || t.twilio_number || t.twilioNumber || "");
+  const twilioNumber = String(t.twilio_phone_number || t.twilio_number || t.twilioNumber || t.twilio_to || "");
   const smsFrom = twilioNumber || String(t.smsFrom || process.env.TWILIO_SMS_FROM || "");
 
   return {
@@ -1160,6 +1162,8 @@ async function ensureTradieByStripeCustomer({ customerId, subscriptionId, plan, 
     plan: plan || "UNKNOWN",
     status: "active",
     subscription_status: "active",
+    calendar_id: "primary",
+    google_connected: false,
     updated_at: new Date().toISOString()
   };
 
@@ -1360,6 +1364,7 @@ async function provisionTwilioNumberForTradie(tradie, reqForBaseUrl) {
         twilio_phone_number: allocated.phoneNumber,
         twilio_phone_sid: allocated.sid,
         twilio_number: allocated.phoneNumber,
+        twilio_to: allocated.phoneNumber,
         twilio_incoming_sid: allocated.sid,
         updated_at: new Date().toISOString()
       })
@@ -1963,6 +1968,14 @@ async function syncActiveSubscriptionAndProvision({ customerId, subscriptionId, 
     source: "syncActiveSubscriptionAndProvision:new",
     reqForBaseUrl
   });
+
+  const tradieAfterProvision = await getTradieByStripeRefs({ customerId, subscriptionId: subscriptionId || tradie.stripe_subscription_id || "" });
+  if (tradieAfterProvision && !tradieAfterProvision.google_refresh_token) {
+    await sendGoogleCalendarConnectEmailForTradie({
+      tradie: tradieAfterProvision,
+      source: "syncActiveSubscriptionAndProvision:calendar-connect"
+    });
+  }
 }
 
 app.post("/stripe/webhook", express.raw({ type: "application/json" }), async (req, res) => {
@@ -2242,6 +2255,79 @@ app.get("/admin/metrics", async (req, res) => {
   );
 
   return res.json({ ok: true, tradie_key: tradie.key, rows });
+});
+
+app.post("/admin/provision", async (req, res) => {
+  try {
+    const pw = String(req.body?.pw || req.query?.pw || "");
+    if (!ADMIN_DASH_PASSWORD || pw !== ADMIN_DASH_PASSWORD) {
+      return res.status(403).json({ error: "Forbidden" });
+    }
+
+    if (!supabase) return res.status(500).json({ error: "Supabase not configured" });
+
+    const email = String(req.body?.email || "").trim().toLowerCase();
+    const tradieId = String(req.body?.tradie_id || "").trim();
+
+    let tradie = null;
+
+    if (tradieId) {
+      const { data } = await supabase.from(SUPABASE_TRADIES_TABLE).select("*").eq("id", tradieId).maybeSingle();
+      tradie = data;
+    } else if (email) {
+      const { data } = await supabase.from(SUPABASE_TRADIES_TABLE).select("*").eq("email", email).order("updated_at", { ascending: false }).limit(1).maybeSingle();
+      tradie = data;
+    }
+
+    if (!tradie?.id) return res.status(404).json({ error: "Tradie not found" });
+
+    await supabase.from(SUPABASE_TRADIES_TABLE).update({
+      status: "active",
+      subscription_status: "active",
+      calendar_id: tradie.calendar_id || "primary",
+      google_connected: tradie.google_connected || false,
+      updated_at: new Date().toISOString()
+    }).eq("id", tradie.id);
+
+    let phoneNumber = tradie.twilio_number || tradie.twilio_phone_number || "";
+    let provisioned = null;
+    if (!phoneNumber) {
+      provisioned = await provisionTwilioNumberForTradie(tradie, req);
+      phoneNumber = provisioned?.phoneNumber || "";
+    }
+
+    const { data: freshTradie } = await supabase.from(SUPABASE_TRADIES_TABLE).select("*").eq("id", tradie.id).maybeSingle();
+
+    if (freshTradie?.email) {
+      await sendActivationEmailForTradie({
+        tradie: freshTradie,
+        provisionedPhoneNumber: phoneNumber,
+        source: "admin/provision",
+        reqForBaseUrl: req
+      });
+    }
+
+    if (!freshTradie?.google_refresh_token) {
+      await sendGoogleCalendarConnectEmailForTradie({
+        tradie: freshTradie,
+        source: "admin/provision:calendar-connect"
+      });
+    }
+
+    return res.json({
+      ok: true,
+      tradie_id: tradie.id,
+      tradie_key: tradie.tradie_key,
+      email: tradie.email,
+      phone_number: phoneNumber,
+      provisioned_new: !!(provisioned && !provisioned.skipped),
+      google_connected: freshTradie?.google_connected || false,
+      calendar_id: freshTradie?.calendar_id || "primary"
+    });
+  } catch (err) {
+    console.error("ADMIN_PROVISION_ERROR", err);
+    return res.status(500).json({ error: err?.message || "failed" });
+  }
 });
 
 // 
@@ -2835,8 +2921,10 @@ async function getTradieGoogleAuthByPhone(phone) {
     .or([
       `twilio_number.eq.${normalizedPhone}`,
       `twilio_phone_number.eq.${normalizedPhone}`,
+      `twilio_to.eq.${normalizedPhone}`,
       `twilio_number.eq.${digitsOnly}`,
-      `twilio_phone_number.eq.${digitsOnly}`
+      `twilio_phone_number.eq.${digitsOnly}`,
+      `twilio_to.eq.${digitsOnly}`
     ].join(","))
     .limit(1)
     .maybeSingle();
