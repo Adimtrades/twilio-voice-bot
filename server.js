@@ -743,147 +743,73 @@ function buildLlmSystemPrompt(tradie, session = {}) {
     address: session.address || null,
     name: session.name || null,
     time: session.time || null,
-    access: session.accessNote || null,
-    intent: session.intent || "NEW_BOOKING"
+    access: session.accessNote || null
   };
 
-  const missing = Object.entries(collected)
-    .filter(([k, v]) => !v && k !== "access" && k !== "intent")
-    .map(([k]) => k);
-
-  const abuseStrikes = Number(session.abuseStrikes || 0);
   const offScriptCount = Number(session.offScriptCount || 0);
+  const abuseStrikes = Number(session.abuseStrikes || 0);
+  const currentStep = session.step || "intent";
 
-  return `You are an elite AI receptionist for a trades business. ${biz} ${services}
+  const stepQuestions = {
+    intent: "What do you need help with today?",
+    job: "What job do you need help with?",
+    address: "What is the address?",
+    name: "What is your name?",
+    access: "Any access notes like gate code, parking, or pets?",
+    time: "What time would you like?",
+    confirm: "Is that correct?"
+  };
 
-YOUR IDENTITY:
-You are a real, warm, experienced human receptionist named Alex.
-You never reveal you are an AI. If asked, say "I am the booking team".
-You speak in natural Australian English. Short sentences. Never robotic.
-You never repeat the same phrase twice in a conversation.
-You never use filler phrases like "Certainly", "Absolutely", "Of course", "I understand your frustration", "Great question", or "How can I assist you today".
+  const nextQuestion = stepQuestions[currentStep] || "How can I help you?";
 
-YOUR ONLY GOAL:
-Book the caller in. Move the conversation toward these fields in order:
-1. job (what needs doing)
-2. address (where)
-3. name (who)
-4. time (when)
-5. confirm
+  return `You are an AI assistant helping a human receptionist handle difficult callers for a trades business. ${biz} ${services}
 
-Never ask for a field already collected. Never ask two questions at once.
+YOUR ONLY JOB IN THIS FUNCTION:
+The main booking script is handled by separate code. You are ONLY called when a caller goes off-script, gets emotional, angry, confused, or starts rambling.
+Your job is to produce a SHORT acknowledgement (smalltalk_reply) that a real human receptionist would say to calm the caller and bring them back on track.
+After your acknowledgement the system will automatically ask the next booking question: "${nextQuestion}"
+So do NOT include the next booking question in your smalltalk_reply — it will be appended automatically.
 
 COLLECTED SO FAR: ${JSON.stringify(collected)}
-MISSING FIELDS: ${JSON.stringify(missing)}
-OFF SCRIPT ATTEMPTS THIS CALL: ${offScriptCount}
+CURRENT STEP: ${currentStep}
+OFF SCRIPT COUNT THIS CALL: ${offScriptCount}
 ABUSE STRIKES: ${abuseStrikes}
 
----
-
-OFF-SCRIPT MASTERY — THIS IS THE MOST IMPORTANT SECTION:
-
-A caller is "off-script" when they:
-- Vent, ramble, tell a long story, go on and on about something unrelated
-- Get angry, upset, frustrated, emotional
-- Ask random questions unrelated to booking
-- Talk about a previous bad experience
-- Complain about prices, other tradies, the industry
-- Start explaining their life situation in detail
-- Keep talking without letting you get a word in
-
-When this happens you MUST follow this exact 3-step technique every single time:
-
-STEP 1 — MIRROR (1 sentence max)
-Reflect back one specific detail they said using their own words.
-Do NOT use generic phrases. Use THEIR exact words.
-Examples:
-- They say "I've been waiting three weeks" → You say "Three weeks with no update — that's not on."
-- They say "the last tradie made it worse" → You say "Made it worse — yeah that's the last thing you need."
-- They say "I just need someone who actually shows up" → You say "Someone who actually shows up — completely fair."
-- They say "I'm so stressed about this" → You say "Sounds like this has been really stressful."
-- They rant for 30 seconds → Pick ONE thing they said and mirror just that.
-
-STEP 2 — VALIDATE (1 sentence max)
-Show you are on their side. Be genuine, not corporate.
-Examples:
-- "You deserve better than that."
-- "That should not have happened."
-- "Completely understandable."
-- "That is genuinely frustrating."
-Never say the same validation line twice in one call.
-
-STEP 3 — BRIDGE (1 sentence — move them forward)
-Pivot immediately back to the booking. Be natural and direct.
-Examples:
-- "Let me get this sorted for you right now — what is the job?"
-- "Right, let me fix that — what needs doing?"
-- "I have got you — what is the address?"
-- "Let us get someone out to you — what day works?"
-Always bridge to the NEXT MISSING FIELD specifically.
-
-CRITICAL RULES FOR OFF-SCRIPT:
+YOUR PERSONALITY:
+- Warm, calm, human, Australian
+- Never robotic or corporate
+- Never say "I understand your frustration" — mirror their words instead
 - Never apologise more than once per call
-- Never lecture or give advice
-- Never say "I understand" or "I hear you" — mirror instead
-- If they go off-script again after being bridged, use a shorter mirror and bridge faster
-- If offScriptCount >= 3, skip mirror and validate, go straight to bridge: "I really want to get this sorted for you — can I just grab [missing field]?"
-- If offScriptCount >= 5, say: "Let me get someone to call you back with all the details — can I grab your name?"
-- Never match their anger or frustration — stay calm and warm always
+- Keep smalltalk_reply to 1-2 short sentences maximum
 
-ANGRY CALLER TECHNIQUE:
-If caller is angry:
-- Lower your energy, slow down, be the calm in their storm
-- Mirror their specific complaint in 5 words or less
-- Validate in one short sentence
-- Bridge with "Let me fix this right now — [next question]"
-- Never argue, never defend, never explain policies
+OFF-SCRIPT TECHNIQUE:
+When caller is angry or upset:
+1. Mirror one specific thing they said using their own words (1 sentence)
+2. Validate briefly (1 sentence)
+Example: caller says "I have been waiting three weeks"
+smalltalk_reply: "Three weeks with no update — that is not on and I get why you are frustrated."
 
-RAMBLING CALLER TECHNIQUE:
-If caller keeps talking and not answering questions:
-- Wait for a natural pause
-- Mirror one word or phrase from what they said
-- Then ask your question clearly and simply
-- Keep your response under 2 sentences total
-- Example: "Sounds like it has been a rough week. What is the address for the job?"
+When caller is rambling:
+Pick one word or phrase from what they said and mirror it briefly.
+Example: smalltalk_reply: "Sounds like it has been a rough one."
 
-CONFUSED CALLER TECHNIQUE:
-If caller does not understand something or asks what you do:
-- Answer in one plain sentence
-- Immediately follow with the next booking question
-- Never over-explain
+When caller is confused:
+Clarify in one plain sentence only.
 
----
+When offScriptCount >= 3:
+Skip mirror and validation. Just say: "I really want to get this sorted for you."
 
-EMERGENCY DETECTION:
-If caller mentions: burst pipe, gas leak, no power, flooding, sparking, fire, sewage, smoke, overflowing
-Skip all other questions. Say: "That sounds urgent — I am getting someone to you now. What is the address?"
+When offScriptCount >= 5:
+Say: "Let me get someone to call you back — I just need a couple of details."
+
+When abuseStrikes >= 3:
+Say: "I want to help — let us keep it respectful and get this sorted."
+
+EMERGENCY — if caller mentions burst pipe, gas leak, flooding, sparking, fire, sewage, no power:
+smalltalk_reply: "That sounds urgent — I am getting someone to you now."
 Set intent to EMERGENCY.
 
-QUOTE HANDLING:
-If caller asks how much or wants a price:
-Give a realistic range in one sentence based on the job if known.
-Example: "For a blocked drain that is usually around 150 to 250 depending on access."
-Then immediately ask the next missing field.
-
-CANCEL OR RESCHEDULE:
-If caller wants to cancel or reschedule say:
-"No worries — what name is the booking under?"
-Then collect name and pass to owner via notes.
-
----
-
-CONVERSATION MEMORY RULES:
-- If job is already collected, never ask for it again
-- If address is already collected, never ask for it again
-- If name is already collected, never ask for it again
-- If time is already collected, never ask for it again
-- Always check COLLECTED SO FAR before asking any question
-
----
-
-OUTPUT FORMAT:
-Respond ONLY with valid JSON. No markdown. No explanation. No text outside the JSON object.
-
+OUTPUT FORMAT — respond ONLY with valid JSON, no markdown, no text outside JSON:
 {
   "intent": "NEW_BOOKING" | "QUOTE" | "EMERGENCY" | "CANCEL_RESCHEDULE" | "EXISTING_CUSTOMER" | "UNKNOWN",
   "fields": {
@@ -896,8 +822,7 @@ Respond ONLY with valid JSON. No markdown. No explanation. No text outside the J
   "emotion": "neutral" | "angry" | "confused" | "urgent" | "upset" | "rambling",
   "off_script": boolean,
   "smalltalk_reply": string|null,
-  "next_question": string,
-  "suggested_step": "intent"|"job"|"address"|"name"|"access"|"time"|"confirm"
+  "next_question": string
 }`;
 }
 
@@ -947,7 +872,7 @@ function extractResponseTextFromOpenAI(data) {
 async function callLlm(tradie, session, userSpeech) {
   if (!llmReady()) return null;
 
-  const history = trimHistory(session.history || [], 12);
+  const history = trimHistory(session.history || [], 8);
   const systemPrompt = buildLlmSystemPrompt(tradie, session);
 
   const messages = [
@@ -965,15 +890,14 @@ async function callLlm(tradie, session, userSpeech) {
       },
       body: JSON.stringify({
         model: "gpt-4o",
-        max_tokens: 320,
-        temperature: 0.65,
+        max_tokens: 200,
+        temperature: 0.6,
         messages
       })
     });
 
     if (!response.ok) {
-      const errText = await response.text().catch(() => "");
-      console.warn("LLM HTTP error:", response.status, errText.slice(0, 200));
+      console.warn("LLM HTTP error:", response.status);
       return null;
     }
 
@@ -983,9 +907,8 @@ async function callLlm(tradie, session, userSpeech) {
 
     let parsed = null;
     try { parsed = JSON.parse(clean); } catch { return null; }
-    if (!parsed?.next_question) return null;
+    if (!parsed) return null;
 
-    // Track emotion and off-script count in session
     if (parsed.off_script) {
       session.offScriptCount = Number(session.offScriptCount || 0) + 1;
     }
@@ -2548,7 +2471,7 @@ function voiceActionUrl(req) {
   return "/process" + (req.query.tid ? `?tid=${encodeURIComponent(req.query.tid)}` : "");
 }
 
-function buildInitialVoiceTwiml(req, greetingText = "Hi. What would you like help with today?") {
+function buildInitialVoiceTwiml(req, greetingText = "Hi, what do you need help with today?") {
   const twiml = new VoiceResponse();
   const gather = twiml.gather({
     input: "speech",
@@ -3505,10 +3428,9 @@ app.post("/process", async (req, res) => {
 
     if (!hasSpeechField && !session.awaitingCalendarCheck) {
       if (session.hasEnteredVoice) {
-        // Already greeted — do not repeat greeting, just re-ask last prompt
         const actionUrl = voiceActionUrl(req);
         const twimlRepeat = new VoiceResponse();
-        const repeatPrompt = session.lastPrompt || "What job do you need help with?";
+        const repeatPrompt = session.lastPrompt || "What do you need help with today?";
         ask(twimlRepeat, repeatPrompt, actionUrl, { input: "speech", timeout: 7, speechTimeout: "auto" });
         return sendVoiceTwiml(res, twimlRepeat);
       }
@@ -3644,10 +3566,15 @@ app.post("/process", async (req, res) => {
     }
 
     // LLM assist (optional, off-script only by default)
+    const isOffScript = isOffScriptSpeech(speech) ||
+      (session.lastEmotion && session.lastEmotion !== "neutral") ||
+      detectAbuse(speech);
+
     const shouldUseLlm =
       llmReady() &&
       session.llmTurns < LLM_MAX_TURNS &&
       !!speech &&
+      isOffScript &&
       !["confirm", "pickSlot"].includes(session.step);
 
     if (shouldUseLlm) {
@@ -3655,48 +3582,43 @@ app.post("/process", async (req, res) => {
       const llm = await callLlm(tradie, session, speech);
 
       if (llm) {
-        if (llm.intent && llm.intent !== "UNKNOWN") session.intent = llm.intent;
+        // LLM used for off-script acknowledgement only
+        // Combine LLM acknowledgement with the ORIGINAL next step question — never replace it
+        const originalStepPrompt = session.lastPrompt || "What do you need help with today?";
 
-        const f = llm.fields || {};
-        if (typeof f.job === "string" && f.job.trim().length >= 2 && !session.job) {
-          session.job = f.job.trim();
-          if (session.step === "intent") {
-            session.step = "address";
-            session.lastPrompt = `Got it — ${session.job}. What is the address for the job?`;
-          }
+        let mergedPrompt;
+        if (llm.smalltalk_reply) {
+          mergedPrompt = `${llm.smalltalk_reply} ${originalStepPrompt}`.trim();
+        } else {
+          mergedPrompt = originalStepPrompt;
         }
-        if (typeof f.address === "string" && f.address.trim().length >= 4 && validateAddress(f.address)) session.address = session.address || f.address.trim();
-        if (typeof f.name === "string" && validateName(f.name)) session.name = session.name || f.name.trim();
-        if (typeof f.access === "string" && validateAccess(f.access)) session.accessNote = session.accessNote || f.access.trim();
-        if (typeof f.time_text === "string" && f.time_text.trim().length >= 2) {
-          session.time = session.time || f.time_text.trim();
+
+        if (!mergedPrompt || mergedPrompt.trim().length < 3) {
+          mergedPrompt = originalStepPrompt;
+        }
+
+        session.lastPrompt = mergedPrompt;
+        addToHistory(session, "assistant", mergedPrompt);
+
+        // Update intent and fields from LLM if they add new info — but NEVER overwrite existing fields
+        if (llm.intent && llm.intent !== "UNKNOWN" && !session.intent) session.intent = llm.intent;
+        const f = llm.fields || {};
+        if (typeof f.job === "string" && f.job.trim().length >= 2 && !session.job) session.job = f.job.trim();
+        if (typeof f.address === "string" && validateAddress(f.address) && !session.address) session.address = f.address.trim();
+        if (typeof f.name === "string" && validateName(f.name) && !session.name) session.name = f.name.trim();
+        if (typeof f.access === "string" && validateAccess(f.access) && !session.accessNote) session.accessNote = f.access.trim();
+        if (typeof f.time_text === "string" && f.time_text.trim().length >= 2 && !session.time) {
+          session.time = f.time_text.trim();
           const dtTry = parseRequestedDateTime(session.time, tz);
           if (dtTry) session.bookedStartMs = session.bookedStartMs || dtTry.toMillis();
         }
 
-        // Use llm next_question to steer
-        let mergedPrompt;
-        if (llm.off_script && llm.smalltalk_reply) {
-          mergedPrompt = `${llm.smalltalk_reply} ${llm.next_question || ""}`.trim();
-        } else if (llm.smalltalk_reply && session.step === "intent") {
-          mergedPrompt = `${llm.smalltalk_reply} ${llm.next_question || ""}`.trim();
-        } else {
-          mergedPrompt = String(llm.next_question || session.lastPrompt || "What job do you need help with?");
-        }
-        if (!mergedPrompt || mergedPrompt.trim().length < 3) {
-          mergedPrompt = session.lastPrompt || "What job do you need help with?";
-        }
-        session.lastPrompt = mergedPrompt;
-        addToHistory(session, "assistant", mergedPrompt);
+        // Track emotion
+        if (llm.off_script) session.offScriptCount = Number(session.offScriptCount || 0) + 1;
+        if (llm.emotion && llm.emotion !== "neutral") session.lastEmotion = llm.emotion;
 
-        // We *do not* blindly set step from LLM if we already have a stricter flow.
-        // But we can gently nudge:
-        if (llm.suggested_step && session.step === "intent" && llm.suggested_step !== "job") {
-          session.step = llm.suggested_step;
-        }
-
-        const actionUrl = "/process" + (req.query.tid ? `?tid=${encodeURIComponent(req.query.tid)}` : "");
-        ask(twiml, mergedPrompt, actionUrl);
+        const actionUrl2 = "/process" + (req.query.tid ? `?tid=${encodeURIComponent(req.query.tid)}` : "");
+        ask(twiml, mergedPrompt, actionUrl2);
         return sendVoiceTwiml(res, twiml);
       }
     }
@@ -3769,11 +3691,11 @@ app.post("/process", async (req, res) => {
         return sendVoiceTwiml(res, twiml);
       }
 
-      // Otherwise treat first answer as the job description and continue.
+      // First speech treated as job description — move straight to address
       if (speech) session.job = speech;
       session.intent = "NEW_BOOKING";
       session.step = "address";
-      session.lastPrompt = `Got it — ${session.job}. What’s the address for the job?`;
+      session.lastPrompt = `Got it. What is the address for the job?`;
       addToHistory(session, "assistant", session.lastPrompt);
       ask(twiml, session.lastPrompt, actionUrl, { input: "speech" });
       return sendVoiceTwiml(res, twiml);
@@ -3963,8 +3885,7 @@ app.post("/process", async (req, res) => {
       const accessLine = session.accessNote ? `Access notes: ${session.accessNote}. ` : "";
 
       session.lastPrompt =
-`Great. I’ve got ${session.name}, ${session.address}, for ${session.job}, at ${whenText}. ${noteLine}${accessLine}
-Is that correct? Please say 'yes' to confirm or 'no' to change it.`;
+`I have got ${session.name}, ${session.address}, for ${session.job}, at ${whenText}. ${noteLine}${accessLine}Is that correct? Say yes to confirm or no to change it.`;
 
       addToHistory(session, "assistant", session.lastPrompt);
       ask(twiml, session.lastPrompt, actionUrl, { input: "speech", timeout: 7, speechTimeout: "auto" });
@@ -4011,8 +3932,7 @@ Is that correct? Please say 'yes' to confirm or 'no' to change it.`;
       const accessLine = session.accessNote ? `Access notes: ${session.accessNote}. ` : "";
 
       session.lastPrompt =
-`Great. I’ve got ${session.name}, ${session.address}, for ${session.job}, at ${whenText}. ${noteLine}${accessLine}
-Is that correct? Please say 'yes' to confirm or 'no' to change it.`;
+`I have got ${session.name}, ${session.address}, for ${session.job}, at ${whenText}. ${noteLine}${accessLine}Is that correct? Say yes to confirm or no to change it.`;
 
       addToHistory(session, "assistant", session.lastPrompt);
       ask(twiml, session.lastPrompt, actionUrl, { input: "speech", timeout: 7, speechTimeout: "auto" });
