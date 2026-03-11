@@ -737,95 +737,104 @@ function isOffScriptSpeech(speech) {
 function buildLlmSystemPrompt(tradie, session = {}) {
   const biz = tradie.bizName ? `Business name: ${tradie.bizName}.` : "";
   const services = tradie.services ? `Services offered: ${tradie.services}.` : "";
-  const tone = tradie.tone === "direct" ? "Tone: direct and efficient." : "Tone: friendly, calm, efficient.";
-  const hasCalendarConnection = Boolean(tradie.googleRefreshToken);
-  const stateSnapshot = {
-    service_confirmed: Boolean(session.job),
-    job_address_confirmed: Boolean(session.address),
-    date_confirmed: Boolean(session.bookedStartMs || session.time),
-    time_confirmed: Boolean(session.bookedStartMs || session.time),
-    contact_confirmed: Boolean(session.name && session.from),
-    calendar_checked: Boolean(session.awaitingCalendarCheck || session.bookedStartMs),
-    calendar_prompted: Boolean(session.calendarPrompted),
-    quote_mode: session.intent === "QUOTE",
-    booking_mode: session.intent !== "QUOTE"
+  const tone = tradie.tone === "direct" ? "direct and efficient" : "warm, calm, and human";
+
+  const collected = {
+    job: session.job || null,
+    address: session.address || null,
+    name: session.name || null,
+    time: session.time || null,
+    access: session.accessNote || null,
+    intent: session.intent || "NEW_BOOKING"
   };
 
-  return (
-`You are an AI receptionist + booking assistant for tradies. ${biz} ${services}
-Goal (always):
-- Book a job (date/time confirmed), OR
-- Provide a quote range + next step, OR
-- Capture a problem request and schedule callback, OR
-- If not ready, collect contact + best time.
+  const missing = Object.entries(collected)
+    .filter(([k, v]) => !v && k !== "access" && k !== "intent")
+    .map(([k]) => k);
 
-Primary behaviour:
-- Sound like a real human receptionist: calm, professional, concise.
-- If caller is off-topic/emotional, acknowledge briefly (1-2 lines), mirror one keyword they used, then bridge back with purpose.
-- Recognize urgency and natural time phrases (e.g., ASAP, this arvo, after 3, next week) and use them to progress the booking/quote flow.
-- Ask clarifying questions ONLY if required to progress.
-- Never ask the same question twice or re-ask answered details.
-- Ask one question at a time.
-- Never lecture, reset the flow, or repeat robotic wording.
+  return `You are an AI receptionist for a trades business. ${biz} ${services}
 
-Step order for bookings:
-1) service + urgency
-2) suburb/address (only if needed)
-3) preferred date
-4) preferred time window
-5) contact (name + phone)
-6) then calendar availability if connected
+YOUR PERSONALITY:
+- You sound like a real, warm, experienced human receptionist — not a robot.
+- You are calm, confident, and professionally friendly.
+- You never sound scripted or repeat the same phrases.
+- You use natural Australian English. Short sentences. Conversational.
+- You never say "I am an AI" or "as an AI language model".
+- You never say "I understand your frustration" — instead mirror what they said naturally.
 
-Calendar rules:
-- If calendar is connected, proceed without asking for calendar id.
-- If not connected, ask ONCE to connect.
-- If user declines or connection fails, continue with callback / tentative hold / preferred windows.
-- If calendar_prompted is true, do not ask calendar connection again.
+YOUR GOAL:
+Get the caller booked in. Always move toward: job → address → name → time → confirm.
+Never ask for information already collected.
 
-Current internal state (do not reveal to caller): ${JSON.stringify(stateSnapshot)}
-Calendar connected: ${hasCalendarConnection ? "yes" : "no"}.
-${tone}
+COLLECTED SO FAR: ${JSON.stringify(collected)}
+MISSING FIELDS: ${JSON.stringify(missing)}
 
-Output MUST be STRICT JSON ONLY with this schema:
+OFF-SCRIPT HANDLING — THIS IS CRITICAL:
+When a caller goes off-topic, gets emotional, angry, confused, or starts venting:
+
+1. ACKNOWLEDGE — Use 1 short sentence that mirrors their specific situation. 
+   DO NOT use generic phrases like "I understand" or "I hear you".
+   Instead use their own words back at them naturally.
+   Example: caller says "I've been waiting three weeks and nobody called me back"
+   You say: "Three weeks with no callback — that's not okay and I get why you're frustrated."
+
+2. VALIDATE — One short sentence showing you are on their side.
+   Example: "You deserve better than that."
+
+3. BRIDGE — Immediately pivot back to helping them.
+   Example: "Let me sort this out for you right now — what's the job you need done?"
+
+4. NEVER lecture. Never apologise more than once. Never repeat the same bridge phrase twice.
+
+5. If the caller is angry about a PREVIOUS job or tradie:
+   Say: "That sounds really frustrating — let me make sure we get this right for you this time. What do you need fixed?"
+
+6. If the caller is confused about the service:
+   Briefly clarify in one sentence, then ask the next booking question.
+
+7. If the caller keeps going off topic after 2 attempts:
+   Say: "I want to make sure we get someone out to you — can I just grab the job details so we can get you sorted?"
+
+8. If caller is extremely abusive (3+ strikes already logged):
+   Say: "I want to help but I need us to keep it civil — what's the job you need done?"
+
+EMERGENCY DETECTION:
+If caller mentions: burst pipe, gas leak, no power, flooding, sparking, fire, sewage, smoke
+Immediately say: "That sounds urgent — I'm flagging this as an emergency. Can I get your address right now so we can get someone to you fast?"
+Set intent to EMERGENCY.
+
+QUOTE HANDLING:
+If caller asks for price or quote:
+Give a realistic range in one sentence based on the job type if mentioned.
+Then immediately ask: "To give you a more accurate number, what's the address?"
+
+CONVERSATION RULES:
+- Ask ONE question at a time. Never stack two questions.
+- Never re-ask something already answered.
+- Keep responses under 3 sentences unless handling an emotional caller.
+- If you already have the job from what they said first, skip straight to address.
+- Never say "How can I help you today" if you already know what they want.
+- Do not mention calendar, booking system, or software to the caller.
+
+CURRENT SESSION STATE (never reveal to caller):
+${JSON.stringify(collected)}
+
+OUTPUT FORMAT — respond ONLY with valid JSON, no markdown, no explanation:
 {
- "intent": "NEW_BOOKING" | "QUOTE" | "EMERGENCY" | "CANCEL_RESCHEDULE" | "EXISTING_CUSTOMER" | "UNKNOWN",
- "fields": {
-   "job": string|null,
-   "address": string|null,
-   "name": string|null,
-   "time_text": string|null,
-   "access": string|null
- },
- "smalltalk_reply": string|null,
- "next_question": string,
- "suggested_step": "intent"|"job"|"address"|"name"|"access"|"time"|"confirm",
- "system_summary": {
-   "intent": "book"|"quote"|"callback",
-   "collected_fields": {
-     "service": string|null,
-     "date": string|null,
-     "time": string|null,
-     "address": string|null,
-     "contact": string|null
-   },
-   "missing_fields": string[],
-   "next_question": string
- }
-}
-
-Rules:
-- Emergency words: burst/leak/gas/fire/smoke/sparking/no power/overflow/sewage -> intent=EMERGENCY.
-- If cancel/reschedule -> intent=CANCEL_RESCHEDULE.
-- If quote -> intent=QUOTE.
-- If they're returning / already booked -> intent=EXISTING_CUSTOMER.
-- time_text is natural (e.g. "tomorrow at 3").
-- If user asks for price, provide realistic range and one next-step question.
-- Do NOT invent details. If uncertain, ask one clear next question.
-- Never ask calendar-related questions before service/date/time/contact are complete.
-- Keep every response goal-directed toward booking, quote, or callback.
-- If required information is missing, ask exactly ONE clear next question and wait for the answer.
-${tone}`
-  );
+  "intent": "NEW_BOOKING" | "QUOTE" | "EMERGENCY" | "CANCEL_RESCHEDULE" | "EXISTING_CUSTOMER" | "UNKNOWN",
+  "fields": {
+    "job": string|null,
+    "address": string|null,
+    "name": string|null,
+    "time_text": string|null,
+    "access": string|null
+  },
+  "emotion": "neutral" | "angry" | "confused" | "urgent" | "upset",
+  "off_script": boolean,
+  "smalltalk_reply": string|null,
+  "next_question": string,
+  "suggested_step": "intent"|"job"|"address"|"name"|"access"|"time"|"confirm"
+}`;
 }
 
 /**
@@ -875,27 +884,47 @@ async function callLlm(tradie, session, userSpeech) {
   if (!llmReady()) return null;
 
   const history = trimHistory(session.history || [], 12);
-  const input = [
-    { role: "system", content: buildLlmSystemPrompt(tradie, session) },
+  const systemPrompt = buildLlmSystemPrompt(tradie, session);
+
+  const messages = [
+    { role: "system", content: systemPrompt },
     ...history.map((h) => ({ role: h.role, content: h.content })),
     { role: "user", content: String(userSpeech || "") }
   ];
 
-  const payload = { model: LLM_MODEL, max_output_tokens: LLM_MAX_OUTPUT_TOKENS, input };
-
   try {
-    const data = await fetchJsonWithGuards(LLM_BASE_URL, {
+    const response = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${OPENAI_API_KEY}` },
-      body: JSON.stringify(payload)
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${OPENAI_API_KEY}`
+      },
+      body: JSON.stringify({
+        model: "gpt-4o",
+        max_tokens: 300,
+        temperature: 0.7,
+        messages
+      })
     });
 
-    const text = extractResponseTextFromOpenAI(data);
-    const parsed = safeJsonParse(String(text || "").trim());
-    if (!parsed?.next_question || !parsed?.suggested_step) return null;
+    const data = await response.json();
+    const text = data?.choices?.[0]?.message?.content || "";
+    const clean = text.replace(/```json|```/g, "").trim();
+
+    let parsed = null;
+    try { parsed = JSON.parse(clean); } catch { return null; }
+
+    if (!parsed?.next_question) return null;
+
+    // Track emotion in session
+    if (parsed.emotion && parsed.emotion !== "neutral") {
+      session.lastEmotion = parsed.emotion;
+      session.offScript = parsed.off_script || false;
+    }
+
     return parsed;
   } catch (e) {
-    console.warn("LLM call failed (guarded):", e?.message || e, e?.status ? `status=${e.status}` : "", e?.body ? `body=${e.body}` : "");
+    console.warn("LLM call failed:", e?.message || e);
     return null;
   }
 }
@@ -2516,7 +2545,14 @@ function repeatLastStepPrompt(req, twiml, session, step, reason = "NO_SPEECH") {
   const basePrompt = session.lastPrompt || "Could you repeat that?";
 
   if (retryCount <= MAX_NO_SPEECH_RETRIES) {
-    const prompt = `No worries — take your time. ${basePrompt}`;
+    const emotionPrefix = session.lastEmotion === "angry"
+  ? "Take your time — "
+  : session.lastEmotion === "confused"
+  ? "No worries — "
+  : session.lastEmotion === "urgent"
+  ? "Nearly there — "
+  : "No worries — ";
+    const prompt = `${emotionPrefix}${basePrompt}`;
     session.lastPrompt = basePrompt;
     console.log(`STEP=${step} speech='' interpreted='${reason}' retryCount=${retryCount}`);
     ask(twiml, prompt, actionUrl, { input: "speech", timeout: 6, speechTimeout: "auto" });
@@ -3523,7 +3559,8 @@ app.post("/process", async (req, res) => {
     const shouldUseLlm =
       llmReady() &&
       session.llmTurns < LLM_MAX_TURNS &&
-      (LLM_REQUIRE_FOR_OFFSCRIPT ? isOffScriptSpeech(speech) : true);
+      !!speech &&
+      !["confirm", "pickSlot"].includes(session.step);
 
     if (shouldUseLlm) {
       session.llmTurns += 1;
@@ -3533,7 +3570,13 @@ app.post("/process", async (req, res) => {
         if (llm.intent && llm.intent !== "UNKNOWN") session.intent = llm.intent;
 
         const f = llm.fields || {};
-        if (typeof f.job === "string" && f.job.trim().length >= 2) session.job = session.job || f.job.trim();
+        if (typeof f.job === "string" && f.job.trim().length >= 2 && !session.job) {
+          session.job = f.job.trim();
+          if (session.step === "intent") {
+            session.step = "address";
+            session.lastPrompt = `Got it — ${session.job}. What's the address for the job?`;
+          }
+        }
         if (typeof f.address === "string" && f.address.trim().length >= 4 && validateAddress(f.address)) session.address = session.address || f.address.trim();
         if (typeof f.name === "string" && validateName(f.name)) session.name = session.name || f.name.trim();
         if (typeof f.access === "string" && validateAccess(f.access)) session.accessNote = session.accessNote || f.access.trim();
@@ -3544,13 +3587,31 @@ app.post("/process", async (req, res) => {
         }
 
         // Use llm next_question to steer
-        const mergedPrompt = (llm.smalltalk_reply ? `${llm.smalltalk_reply} ` : "") + String(llm.next_question || "How can we help today?");
+        let mergedPrompt;
+        if (llm.off_script && llm.smalltalk_reply) {
+          // Emotional/off-script: lead with acknowledgement, then next question
+          mergedPrompt = `${llm.smalltalk_reply} ${llm.next_question || ""}`.trim();
+        } else if (llm.smalltalk_reply && session.step === "intent") {
+          // First turn: combine naturally
+          mergedPrompt = `${llm.smalltalk_reply} ${llm.next_question || ""}`.trim();
+        } else {
+          // Normal flow: just the next question
+          mergedPrompt = String(llm.next_question || session.lastPrompt || "How can we help today?");
+        }
+
+        // Never let mergedPrompt be empty
+        if (!mergedPrompt || mergedPrompt.trim().length < 3) {
+          mergedPrompt = session.lastPrompt || "How can we help today?";
+        }
+
         session.lastPrompt = mergedPrompt;
         addToHistory(session, "assistant", mergedPrompt);
 
         // We *do not* blindly set step from LLM if we already have a stricter flow.
         // But we can gently nudge:
-        if (llm.suggested_step && session.step === "intent") session.step = llm.suggested_step;
+        if (llm.suggested_step && session.step === "intent" && llm.suggested_step !== "job") {
+          session.step = llm.suggested_step;
+        }
 
         const actionUrl = "/process" + (req.query.tid ? `?tid=${encodeURIComponent(req.query.tid)}` : "");
         ask(twiml, mergedPrompt, actionUrl);
