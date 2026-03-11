@@ -175,6 +175,19 @@ app.get('/health', (req, res) => {
   });
 });
 
+app.get("/debug/google-config", (req, res) => {
+  const secret = String(req.query.secret || "").trim();
+  if (secret !== process.env.DEBUG_CALENDAR_SECRET) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+  return res.json({
+    hasClientId: !!process.env.GOOGLE_CLIENT_ID,
+    hasClientSecret: !!process.env.GOOGLE_CLIENT_SECRET,
+    redirectUri: process.env.GOOGLE_REDIRECT_URI || process.env.GOOGLE_REDIRECT_URL || null,
+    clientIdPrefix: (process.env.GOOGLE_CLIENT_ID || "").slice(0, 12),
+  });
+});
+
 const BASE_URL = process.env.BASE_URL || "http://localhost:3000";
 const GOOGLE_REDIRECT_URI = process.env.GOOGLE_REDIRECT_URI || `${BASE_URL}/api/google/callback`;
 
