@@ -1200,17 +1200,23 @@ async function sendActivationEmailForTradie({ tradie, provisionedPhoneNumber = "
     return;
   }
 
-  // Check if activation email already sent for this tradie
-  const { data: alreadySent } = await supabase
+  // Hard stop — never send activation email twice
+  const { data: sentCheck } = await supabase
     .from(SUPABASE_TRADIES_TABLE)
     .select("activation_email_sent")
     .eq("id", tradie.id)
     .single();
 
-  if (alreadySent?.activation_email_sent) {
+  if (sentCheck?.activation_email_sent === true) {
     console.log("activation email skipped: already sent", { tradie_id: tradie.id, source });
     return;
   }
+
+  // Mark as sent immediately before sending to prevent race condition
+  await supabase
+    .from(SUPABASE_TRADIES_TABLE)
+    .update({ activation_email_sent: true, updated_at: new Date().toISOString() })
+    .eq("id", tradie.id);
 
   const twilioNumber = String(provisionedPhoneNumber || "").trim() || await getLatestActiveTwilioNumberForTradie(tradie.id);
   const fallbackTriggered = !twilioNumber;
@@ -1238,11 +1244,6 @@ async function sendActivationEmailForTradie({ tradie, provisionedPhoneNumber = "
       source
     });
 
-    // Mark activation email as sent so it never fires twice
-    await supabase
-      .from(SUPABASE_TRADIES_TABLE)
-      .update({ activation_email_sent: true, updated_at: new Date().toISOString() })
-      .eq("id", tradie.id);
   } catch (err) {
     console.error("activation email send failed", { tradie_id: tradie.id, source, error: err?.message || err });
   }
@@ -2105,6 +2106,15 @@ async function ensureProvisioningForActiveSubscription({ customerId, subscriptio
 // IMPORTANT: must be raw JSON or signature breaks
 async function syncActiveSubscriptionAndProvision({ customerId, subscriptionId, plan, email, reqForBaseUrl, sourceEvent }) {
   if (!customerId) return;
+
+  // Hard lock — prevent double provisioning from concurrent webhooks
+  const lockKey = `provisioning_lock_${customerId}`;
+  if (global[lockKey]) {
+    console.log(`PROVISION_LOCK_SKIP customerId=${customerId} already provisioning`);
+    return;
+  }
+  global[lockKey] = true;
+  setTimeout(() => { delete global[lockKey]; }, 30000);
 
   console.log("stripe provisioning step: begin", { sourceEvent, customerId, subscriptionId: subscriptionId || "", plan: plan || "UNKNOWN" });
   const tradie = await getOrCreateTradieForStripeEvent({ customerId, subscriptionId, plan, email });
