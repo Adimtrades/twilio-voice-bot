@@ -2408,6 +2408,8 @@ function getSession(callSid, fromNumber = "") {
       calendarCheckAnnounced: false,
       confirmPromptSent: false,
 
+      lastTwimlXml: null,
+
       accessEditMode: "replace"
     });
   } else {
@@ -2616,6 +2618,14 @@ function sendVoiceTwiml(res, twiml, fallbackMessage = "Sorry, still here with yo
     gather.say(fallbackMessage, { voice: "Polly.Amy", language: "en-AU" });
     xml = fallback.toString();
   }
+
+  // Cache last response for idempotency replay
+  try {
+    const callSid = res.locals?.callSid;
+    if (callSid && sessions.has(callSid)) {
+      sessions.get(callSid).lastTwimlXml = xml;
+    }
+  } catch {}
 
   return res.type("text/xml").send(xml);
 }
@@ -3437,14 +3447,14 @@ app.post("/process", async (req, res) => {
 
     const callSid = resolveCallSid(req);
     const fromNumber = (req.body.From || "").trim();
+    res.locals.callSid = callSid;
 
-    // If session was already completed and reset, do not re-process
+    // Block any POST that arrives after session was reset on confirmed booking
     const existingSession = sessions.get(callSid);
     if (!existingSession && req.body?.SpeechResult) {
       const doneTwiml = new VoiceResponse();
-      doneTwiml.say("Thanks for calling. Goodbye.", { voice: "Polly.Amy", language: "en-AU" });
       doneTwiml.hangup();
-      return sendVoiceTwiml(res, doneTwiml);
+      return res.type("text/xml").send(doneTwiml.toString());
     }
 
     const hasSpeechField = Object.prototype.hasOwnProperty.call(req.body || {}, "SpeechResult") ||
@@ -3463,9 +3473,10 @@ app.post("/process", async (req, res) => {
     // idempotency lock: ignore duplicate webhooks for the same CallSid+step within a short TTL
     if (hasSpeechField && !acquireProcessSpeechLock(callSid, authoritativeStep)) {
       console.log(`IDEMPOTENT_DUPLICATE TID=${tradie.key} CALLSID=${callSid} STEP=${authoritativeStep}`);
-      const replayPrompt = session.lastPrompt || "No worries — take your time. Please say that again.";
-      ask(twiml, replayPrompt, voiceActionUrl(req), { input: "speech", timeout: 6, speechTimeout: "auto" });
-      return sendVoiceTwiml(res, twiml);
+      if (session.lastTwimlXml) {
+        return res.type("text/xml").send(session.lastTwimlXml);
+      }
+      return sendVoiceTwiml(res, new VoiceResponse());
     }
 
     // Count inbound call once for analytics
@@ -3681,13 +3692,16 @@ app.post("/process", async (req, res) => {
     const yn = detectYesNoFromDigits(digits) || detectYesNo(speech);
     const corrected = speech ? detectCorrection(speech) : false;
     const changeField = detectChangeFieldFromDigits(digits) || detectChangeFieldFromSpeech(speech);
-    const canGlobalInterrupt = !["intent", "clarify", "confirm", "pickSlot", "access"].includes(session.step);
+    const canGlobalInterrupt = !["intent", "confirm", "pickSlot", "access"].includes(session.step);
 
     if (canGlobalInterrupt && (corrected || changeField)) {
-      session.step = "clarify";
-      session.lastPrompt = changeField
-        ? `Sure — what’s the correct ${changeField}?`
-        : "No worries — what should I change? job, address, name, time, or access notes?";
+      if (changeField) {
+        session.step = changeField;
+        session.lastPrompt = `Sure — what’s the correct ${changeField}?`;
+      } else {
+        session.step = "access";
+        session.lastPrompt = "Any access notes like gate code, parking, or pets? Say none if not.";
+      }
       addToHistory(session, "assistant", session.lastPrompt);
 
       const actionUrl = "/process" + (req.query.tid ? `?tid=${encodeURIComponent(req.query.tid)}` : "");
@@ -3696,8 +3710,8 @@ app.post("/process", async (req, res) => {
     }
 
     if (canGlobalInterrupt && yn === "NO") {
-      session.step = "clarify";
-      session.lastPrompt = "No worries — what should I change? job, address, name, time, or access notes?";
+      session.step = "access";
+      session.lastPrompt = "Any access notes like gate code, parking, or pets? Say none if not.";
       addToHistory(session, "assistant", session.lastPrompt);
 
       const actionUrl = "/process" + (req.query.tid ? `?tid=${encodeURIComponent(req.query.tid)}` : "");
@@ -3760,28 +3774,6 @@ app.post("/process", async (req, res) => {
       session.lastPrompt = `Got it. What is the address for the job?`;
       addToHistory(session, "assistant", session.lastPrompt);
       ask(twiml, session.lastPrompt, actionUrl, { input: "speech" });
-      return sendVoiceTwiml(res, twiml);
-    }
-
-    // STEP: clarify (edit any field)
-    if (session.step === "clarify") {
-      const target = detectChangeFieldFromDigits(digits) || detectChangeFieldFromSpeech(speech);
-      if (target) {
-        session.step = target;
-        session.lastPrompt =
-          target === "job" ? "Sure — what’s the job?"
-          : target === "address" ? "Sure — what’s the correct address?"
-          : target === "name" ? "Sure — what name should I use?"
-          : target === "access" ? "Sure — what access notes should I add or update?"
-          : "Sure — what time would you like?";
-        addToHistory(session, "assistant", session.lastPrompt);
-        ask(twiml, session.lastPrompt, actionUrl);
-        return sendVoiceTwiml(res, twiml);
-      }
-
-      session.lastPrompt = "Sorry — what should I change? job, address, name, time, or access notes?";
-      addToHistory(session, "assistant", session.lastPrompt);
-      ask(twiml, session.lastPrompt, actionUrl, { input: "speech", timeout: 7, speechTimeout: "auto" });
       return sendVoiceTwiml(res, twiml);
     }
 
@@ -4032,8 +4024,8 @@ app.post("/process", async (req, res) => {
       resetRetryCountForStep(session, "confirm");
       if (yn2 === "NO") {
         console.log(`STEP=confirm speech='${speech}' interpreted='NO' retryCount=${getRetryCountForStep(session, "confirm")}`);
-        session.step = "clarify";
-        session.lastPrompt = "No worries — what should I change? job, address, name, time, or access notes?";
+        session.step = "access";
+        session.lastPrompt = "Any access notes like gate code, parking, or pets? Say none if not.";
         addToHistory(session, "assistant", session.lastPrompt);
         ask(twiml, session.lastPrompt, actionUrl, { input: "speech", timeout: 7, speechTimeout: "auto" });
         return sendVoiceTwiml(res, twiml);
@@ -4124,7 +4116,12 @@ ${historyLine}${memoryLine}${accessLine2}`.trim()).catch(() => {});
         ).catch(() => {});
       }
 
-      twiml.say(`All set. We have sent you a text to confirm. Thanks for calling.`, { voice: "Polly.Amy", language: "en-AU" });
+      const summaryJob = session.job || "your job";
+      const summaryName = session.name || "you";
+      const summaryAddress = session.address || "your address";
+      const summaryTime = session.time || "your requested time";
+      const summaryText = `All set ${summaryName}. To confirm — we have booked ${summaryJob} at ${summaryAddress} for ${summaryTime}. We have sent you a text to confirm. Thanks for calling, speak soon.`;
+      twiml.say(summaryText, { voice: "Polly.Amy", language: "en-AU" });
       twiml.hangup();
       resetSession(callSid);
       return sendVoiceTwiml(res, twiml);
