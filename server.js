@@ -332,7 +332,7 @@ const CALENDAR_CHECK_TIMEOUT_MS = Number(process.env.CALENDAR_CHECK_TIMEOUT_MS |
 const VOICE_GATHER_TIMEOUT_SECONDS = Number(process.env.VOICE_GATHER_TIMEOUT_SECONDS || 6);
 const SESSION_TTL_MS = Number(process.env.VOICE_SESSION_TTL_MS || 30 * 60 * 1000);
 const WEBHOOK_IDEMPOTENCY_TTL_MS = Number(process.env.WEBHOOK_IDEMPOTENCY_TTL_MS || 7000);
-const MIN_SPEECH_CONFIDENCE = Number(process.env.MIN_SPEECH_CONFIDENCE || 0.45);
+const MIN_SPEECH_CONFIDENCE = Number(process.env.MIN_SPEECH_CONFIDENCE || 0.15);
 
 // ----------------------------------------------------------------------------
 // Helpers: Base URL
@@ -2480,7 +2480,10 @@ function buildInitialVoiceTwiml(req, greetingText = "Hi, what do you need help w
     speechTimeout: "auto",
     action: voiceActionUrl(req),
     method: "POST",
-    language: "en-AU"
+    language: "en-AU",
+    speechModel: "phone_call",
+    enhanced: true,
+    hints: "plumber, electrician, carpenter, tiler, painter, roofer, concreter, fencer, landscaper, handyman, air conditioning, hot water, blocked drain, leaking tap, leaking roof, broken pipe, no hot water, burst pipe, gas leak, rewire, switchboard, deck, pergola, bathroom, kitchen, quote, urgent, emergency, yes, no, confirm, cancel, reschedule, Monday, Tuesday, Wednesday, Thursday, Friday, Saturday, Sunday, morning, afternoon, today, tomorrow, next week, Street, Road, Avenue, Drive, Close, Court, Place, Lane, Crescent, Boulevard, Way"
   });
   gather.say(greetingText, { voice: "Polly.Amy", language: "en-AU" });
   return twiml;
@@ -2508,6 +2511,9 @@ function ask(twiml, prompt, actionUrl, options = {}) {
     method: "POST",
     language: "en-AU",
     timeout: VOICE_GATHER_TIMEOUT_SECONDS,
+    speechModel: "phone_call",
+    enhanced: true,
+    hints: "plumber, electrician, carpenter, tiler, painter, roofer, concreter, fencer, landscaper, handyman, air conditioning, hot water, blocked drain, leaking tap, leaking roof, broken pipe, no hot water, burst pipe, gas leak, rewire, switchboard, deck, pergola, bathroom, kitchen, quote, urgent, emergency, yes, no, confirm, cancel, reschedule, Monday, Tuesday, Wednesday, Thursday, Friday, Saturday, Sunday, morning, afternoon, today, tomorrow, next week, Street, Road, Avenue, Drive, Close, Court, Place, Lane, Crescent, Boulevard, Way",
     ...options
   });
 
@@ -2722,10 +2728,20 @@ function validateAccess(speech) {
 // confidence gating: only reject when speech is empty, low confidence, or invalid for the current step
 function shouldReject(step, speech, confidence) {
   if (!speech || speech.length < 2) return true;
+
+  // For address and time steps never reject on confidence alone
+  // as these fields contain numbers and street names that score low
+  if (step === "address" || step === "time") {
+    return !speech || speech.trim().length < 3;
+  }
+
+  // For name step only reject if completely empty
+  if (step === "name") {
+    return !speech || speech.trim().length < 2;
+  }
+
   if (isLowConfidence(confidence)) return true;
 
-  if (step === "address") return !validateAddress(speech);
-  if (step === "name") return !validateName(speech);
   if (step === "job") return !validateJob(speech);
   if (step === "access") return !validateAccess(speech);
 
