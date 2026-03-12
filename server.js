@@ -1414,12 +1414,15 @@ async function provisionTwilioNumberForTradie(tradie, reqForBaseUrl) {
 
   if (supaReady() && supabase) {
     const phoneNumber = allocated.phoneNumber;
-    const { data: existingNumber } = await supabase
-      .from("twilio_numbers")
-      .select("id")
-      .eq("phone_number", phoneNumber)
-      .single()
-      .catch(() => ({ data: null }));
+    let existingNumber = null;
+    try {
+      const { data: numRow } = await supabase
+        .from("twilio_numbers")
+        .select("id")
+        .eq("phone_number", phoneNumber)
+        .single();
+      existingNumber = numRow;
+    } catch {}
 
     if (!existingNumber) {
       await supabase
