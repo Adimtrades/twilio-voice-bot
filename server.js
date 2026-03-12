@@ -2032,6 +2032,12 @@ async function syncActiveSubscriptionAndProvision({ customerId, subscriptionId, 
   const tradie = await getOrCreateTradieForStripeEvent({ customerId, subscriptionId, plan, email });
   if (!tradie?.id) return;
 
+  // Prevent double provisioning — if number already assigned skip
+  if (tradie.twilio_number) {
+    console.log(`PROVISION_SKIP tradie=${tradie.id} already provisioned with ${tradie.twilio_number}`);
+    return;
+  }
+
   const finalPlan = plan || tradie.plan || "UNKNOWN";
   await supabase
     .from(SUPABASE_TRADIES_TABLE)
@@ -2199,30 +2205,7 @@ app.post("/stripe/webhook", express.raw({ type: "application/json" }), async (re
     }
 
     if (event.type === "customer.subscription.created") {
-      const subscription = stripeObj;
-      const customerId = String(subscription?.customer || "").trim();
-      const subscriptionId = String(subscription?.id || "").trim();
-      const plan =
-        subscription?.metadata?.plan ||
-        subscription?.metadata?.tier ||
-        subscription?.items?.data?.[0]?.price?.lookup_key ||
-        subscription?.items?.data?.[0]?.price?.nickname ||
-        subscription?.items?.data?.[0]?.plan?.nickname ||
-        "starter";
-      const email = subscription?.customer_email || "";
-
-      try {
-        await syncActiveSubscriptionAndProvision({
-          customerId,
-          subscriptionId,
-          plan,
-          email,
-          reqForBaseUrl: req,
-          sourceEvent: event.type
-        });
-      } catch (provisionErr) {
-        console.error("PROVISION_ERROR", provisionErr?.message || provisionErr);
-      }
+      console.log("SUBSCRIPTION_CREATED_SKIP provisioning handled by checkout.session.completed");
     }
 
     if (event.type === "invoice.payment_succeeded") {
