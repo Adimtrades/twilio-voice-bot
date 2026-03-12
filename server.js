@@ -1098,37 +1098,97 @@ function buildActivationEmailContent({ customerName, businessName, provisionedPh
   const text =
 `Hi ${safeCustomerName},
 
-Your AI booking assistant is now live.
+Your AI booking assistant is now live and ready to take calls.
 
-📞 Your dedicated booking number:
+YOUR DEDICATED BOOKING NUMBER:
 ${safePhoneNumber}
 
-Save this number as "${safeBusinessName} Bookings".
+Share this number with your customers so they can book jobs directly.
+Save it as "${safeBusinessName} Bookings".
 
-To enable automatic bookings into your Google Calendar, connect your account using OAuth:
+CONNECT YOUR GOOGLE CALENDAR:
+Your phone bot needs access to your Google Calendar to check
+availability and create bookings automatically.
 
-Connect Google Calendar
+Click here to connect:
 ${connectGoogleCalendarLink}
 
-Once connected, your assistant will automatically create bookings in your primary calendar.
+Once connected your assistant will automatically manage bookings
+in your primary calendar with no extra setup needed.
 
-No other setup is required.
-
-If you need help, simply reply to this email and we’ll assist immediately.
+If you need any further assistance please email us at:
+adimtrades@gmail.com
 
 Thanks,
 AdimTrades Automation`;
 
-  const html = `<p>Hi ${safeCustomerName},</p>
-<p>Your AI booking assistant is now live.</p>
-<p>📞 <strong>Your dedicated booking number:</strong><br/>${safePhoneNumber}</p>
-<p>Save this number as "${safeBusinessName} Bookings".</p>
-<p>To enable automatic bookings into your Google Calendar, connect your account using OAuth:</p>
-<p><strong>Connect Google Calendar</strong><br/><a href="${connectGoogleCalendarLink}">Connect Google Calendar</a></p>
-<p>Once connected, your assistant will automatically create bookings in your primary calendar.</p>
-<p>No other setup is required.</p>
-<p>If you need help, simply reply to this email and we’ll assist immediately.</p>
-<p>Thanks,<br/>AdimTrades Automation</p>`;
+  const html = `
+<!DOCTYPE html>
+<html>
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="margin:0;padding:0;background:#f4f4f5;font-family:sans-serif;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="background:#f4f4f5;padding:32px 0;">
+    <tr><td align="center">
+      <table width="560" cellpadding="0" cellspacing="0" style="background:#ffffff;border-radius:12px;overflow:hidden;box-shadow:0 4px 24px rgba(0,0,0,0.08);">
+        
+        <!-- Header -->
+        <tr><td style="background:#2563eb;padding:32px;text-align:center;">
+          <h1 style="margin:0;color:#ffffff;font-size:22px;">Your AI Booking Assistant is Live 🚀</h1>
+        </td></tr>
+
+        <!-- Body -->
+        <tr><td style="padding:32px;">
+          <p style="margin:0 0 16px;color:#374151;font-size:16px;">Hi ${safeCustomerName},</p>
+          <p style="margin:0 0 24px;color:#374151;font-size:15px;">
+            Your AI phone bot is set up and ready to take bookings for <strong>${safeBusinessName}</strong>.
+          </p>
+
+          <!-- Phone number box -->
+          <table width="100%" cellpadding="0" cellspacing="0" style="background:#f0fdf4;border:2px solid #16a34a;border-radius:10px;margin-bottom:28px;">
+            <tr><td style="padding:20px;text-align:center;">
+              <p style="margin:0 0 6px;color:#16a34a;font-size:13px;font-weight:bold;text-transform:uppercase;letter-spacing:1px;">Your Dedicated Booking Number</p>
+              <p style="margin:0;color:#111827;font-size:28px;font-weight:bold;letter-spacing:2px;">${safePhoneNumber}</p>
+              <p style="margin:8px 0 0;color:#6b7280;font-size:13px;">Share this with your customers — save it as "<strong>${safeBusinessName} Bookings</strong>"</p>
+            </td></tr>
+          </table>
+
+          <!-- Calendar connect -->
+          <p style="margin:0 0 8px;color:#111827;font-size:15px;font-weight:bold;">Connect Your Google Calendar</p>
+          <p style="margin:0 0 16px;color:#6b7280;font-size:14px;">
+            Your bot needs access to your Google Calendar to check availability and create bookings automatically.
+          </p>
+          <table width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:28px;">
+            <tr><td align="center">
+              <a href="${connectGoogleCalendarLink}" style="display:inline-block;padding:14px 32px;background:#2563eb;color:#ffffff;border-radius:8px;text-decoration:none;font-weight:bold;font-size:15px;">
+                Connect Google Calendar
+              </a>
+            </td></tr>
+          </table>
+          <p style="margin:0 0 24px;color:#9ca3af;font-size:13px;text-align:center;">
+            If the button does not work, copy and paste this link:<br>
+            <a href="${connectGoogleCalendarLink}" style="color:#2563eb;word-break:break-all;">${connectGoogleCalendarLink}</a>
+          </p>
+
+          <!-- Divider -->
+          <hr style="border:none;border-top:1px solid #e5e7eb;margin:0 0 24px;">
+
+          <!-- Support -->
+          <p style="margin:0;color:#6b7280;font-size:14px;text-align:center;">
+            Need further assistance? Email us at<br>
+            <a href="mailto:adimtrades@gmail.com" style="color:#2563eb;font-weight:bold;">adimtrades@gmail.com</a>
+          </p>
+        </td></tr>
+
+        <!-- Footer -->
+        <tr><td style="background:#f9fafb;padding:20px;text-align:center;">
+          <p style="margin:0;color:#9ca3af;font-size:12px;">AdimTrades Automation</p>
+        </td></tr>
+
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>`;
 
   return { text, html };
 }
@@ -1137,6 +1197,18 @@ async function sendActivationEmailForTradie({ tradie, provisionedPhoneNumber = "
   const recipient = String(tradie?.email || emailFallback || "").trim();
   if (!recipient) {
     console.warn("activation email skipped: missing recipient", { tradie_id: tradie?.id || "", source });
+    return;
+  }
+
+  // Check if activation email already sent for this tradie
+  const { data: alreadySent } = await supabase
+    .from(SUPABASE_TRADIES_TABLE)
+    .select("activation_email_sent")
+    .eq("id", tradie.id)
+    .single();
+
+  if (alreadySent?.activation_email_sent) {
+    console.log("activation email skipped: already sent", { tradie_id: tradie.id, source });
     return;
   }
 
@@ -1165,6 +1237,12 @@ async function sendActivationEmailForTradie({ tradie, provisionedPhoneNumber = "
       tradie_id: tradie.id,
       source
     });
+
+    // Mark activation email as sent so it never fires twice
+    await supabase
+      .from(SUPABASE_TRADIES_TABLE)
+      .update({ activation_email_sent: true, updated_at: new Date().toISOString() })
+      .eq("id", tradie.id);
   } catch (err) {
     console.error("activation email send failed", { tradie_id: tradie.id, source, error: err?.message || err });
   }
@@ -2069,27 +2147,6 @@ async function syncActiveSubscriptionAndProvision({ customerId, subscriptionId, 
     reqForBaseUrl
   });
 
-  // Send Google Calendar connect email after provisioning
-  if (!tradie.googleRefreshToken) {
-    try {
-      const connectUrl = `${process.env.BASE_URL}/api/google/connect?tradieId=${tradie.id}`;
-      await sendEmail({
-        to: tradie.email,
-        subject: "Connect your Google Calendar",
-        html: `
-        <p>Hi,</p>
-        <p>Connect your Google Calendar so your AI phone bot can manage bookings for you.</p>
-        <a href="${connectUrl}" style="display:inline-block;padding:12px 24px;background:#2563eb;color:#fff;border-radius:6px;text-decoration:none;font-weight:bold;">Connect Google Calendar</a>
-        <p>If the button doesn't work, copy and paste this link into your browser:<br>
-        <a href="${connectUrl}">${connectUrl}</a></p>
-        <p>This lets the phone bot check availability and create bookings.</p>
-      `
-      });
-      console.log(`GOOGLE_CONNECT_EMAIL_SENT tradieId=${tradie.id} email=${tradie.email}`);
-    } catch (emailErr) {
-      console.error("GOOGLE_CONNECT_EMAIL_ERROR", emailErr?.message || emailErr);
-    }
-  }
 }
 
 app.post("/stripe/webhook", express.raw({ type: "application/json" }), async (req, res) => {
