@@ -2491,12 +2491,12 @@ function handleVoiceEntry(req, res) {
   const callSid = resolveCallSid(req);
   const fromNumber = (req.body?.From || req.query?.From || "").trim();
   const session = getSession(callSid, fromNumber);
-  session.step = "initial";
+  session.step = "intent";
   session.retryCount = 0;
   session.hasEnteredVoice = true;
   session.lastNoSpeechFallback = false;
   session.silenceTries = 0;
-  logVoiceStep(req, { callSid, step: "initial", speech: "", retryCount: 0 });
+  logVoiceStep(req, { callSid, step: "intent", speech: "", retryCount: 0 });
   return sendVoiceTwiml(res, twiml);
 }
 
@@ -3458,7 +3458,7 @@ app.post("/process", async (req, res) => {
         return sendVoiceTwiml(res, twimlRepeat);
       }
       session.hasEnteredVoice = true;
-      session.step = "initial";
+      session.step = "intent";
       session.lastNoSpeechFallback = false;
       session.retryCount = 0;
       console.log(`INITIAL_CALL TID=${tradie.key} CALLSID=${callSid} FROM=${fromNumber} VIA=/process`);
@@ -3977,6 +3977,12 @@ app.post("/process", async (req, res) => {
       const noteLine = session.customerNote ? `I see a note on your file. ` : "";
       const accessLine = session.accessNote ? `Access notes: ${session.accessNote}. ` : "";
 
+      if (session.confirmPromptSent) {
+        ask(twiml, session.lastPrompt, actionUrl, { input: "speech", timeout: 7, speechTimeout: "auto" });
+        return sendVoiceTwiml(res, twiml);
+      }
+      session.confirmPromptSent = true;
+
       session.lastPrompt =
 `I have got ${session.name}, ${session.address}, for ${session.job}, at ${whenText}. ${noteLine}${accessLine}Is that correct? Say yes to confirm or no to change it.`;
 
@@ -4329,15 +4335,7 @@ app.post("/confirm", async (req, res) => {
     if (!validateTwilioSignature(req)) return res.status(403).send("Forbidden");
     const twiml = new VoiceResponse();
     const actionUrl = voiceActionUrl(req);
-    const gather = twiml.gather({
-      input: "speech",
-      timeout: 7,
-      speechTimeout: "auto",
-      action: actionUrl,
-      method: "POST",
-      language: "en-AU"
-    });
-    gather.say("Good news — that time is available. Would you like me to book it?", { voice: "Polly.Amy", language: "en-AU" });
+    twiml.redirect({ method: "POST" }, actionUrl);
     return sendVoiceTwiml(res, twiml);
   } catch (e) {
     console.error("/confirm error", e);
