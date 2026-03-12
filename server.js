@@ -3422,6 +3422,15 @@ app.post("/process", async (req, res) => {
     const callSid = resolveCallSid(req);
     const fromNumber = (req.body.From || "").trim();
 
+    // If session was already completed and reset, do not re-process
+    const existingSession = sessions.get(callSid);
+    if (!existingSession && req.body?.SpeechResult) {
+      const doneTwiml = new VoiceResponse();
+      doneTwiml.say("Thanks for calling. Goodbye.", { voice: "Polly.Amy", language: "en-AU" });
+      doneTwiml.hangup();
+      return sendVoiceTwiml(res, doneTwiml);
+    }
+
     const hasSpeechField = Object.prototype.hasOwnProperty.call(req.body || {}, "SpeechResult") ||
       Object.prototype.hasOwnProperty.call(req.body || {}, "speechResult");
     const speech = cleanSpeech(req.body.SpeechResult || req.body.speechResult || "");
@@ -4099,7 +4108,7 @@ ${historyLine}${memoryLine}${accessLine2}`.trim()).catch(() => {});
         ).catch(() => {});
       }
 
-      twiml.say(`All set. We’ve sent you a text to confirm. Thanks!${customerCalendarNotice}`, { voice: "Polly.Amy", language: "en-AU" });
+      twiml.say(`All set. We have sent you a text to confirm. Thanks for calling.`, { voice: "Polly.Amy", language: "en-AU" });
       twiml.hangup();
       resetSession(callSid);
       return sendVoiceTwiml(res, twiml);
