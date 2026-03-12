@@ -261,7 +261,34 @@ app.get("/api/google/callback", async (req, res) => {
       return res.status(500).json({ error: "Unable to save Google connection" });
     }
 
-    return res.status(200).send("Google connected successfully.");
+    return res.send(`
+  <!DOCTYPE html>
+  <html>
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Calendar Connected</title>
+    <style>
+      body { font-family: sans-serif; display: flex; align-items: center;
+             justify-content: center; min-height: 100vh; margin: 0;
+             background: #f0fdf4; }
+      .card { background: white; border-radius: 12px; padding: 40px;
+              text-align: center; max-width: 400px; box-shadow: 0 4px 24px rgba(0,0,0,0.08); }
+      .tick { font-size: 48px; margin-bottom: 16px; }
+      h1 { color: #16a34a; font-size: 24px; margin: 0 0 12px; }
+      p { color: #555; line-height: 1.6; margin: 0; }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <div class="tick">✅</div>
+      <h1>Calendar Connected!</h1>
+      <p>Your AI phone bot is now set up and ready to take bookings.<br><br>
+      Callers can now book jobs directly through your phone number.</p>
+    </div>
+  </body>
+  </html>
+`);
   } catch (error) {
     console.error("GOOGLE_CALLBACK_ERROR", {
       message: error?.message || String(error),
@@ -1183,10 +1210,11 @@ async function ensureTradieByStripeCustomer({ customerId, subscriptionId, plan, 
     stripe_customer_id: customerId,
     stripe_subscription_id: subscriptionId || null,
     plan: plan || "UNKNOWN",
-    status: "active",
-    subscription_status: "active",
+    status: "ACTIVE",
+    subscription_status: "ACTIVE",
     calendar_id: "primary",
     google_connected: false,
+    is_active: true,
     updated_at: new Date().toISOString()
   };
 
@@ -1392,6 +1420,13 @@ async function provisionTwilioNumberForTradie(tradie, reqForBaseUrl) {
         updated_at: new Date().toISOString()
       })
       .eq("id", tradieId);
+
+    await supabase
+      .from("tradies")
+      .update({ twilio_to: allocated.phoneNumber, updated_at: new Date().toISOString() })
+      .eq("id", tradieId);
+
+    console.log(`TWILIO_TO_SYNCED tradieId=${tradieId} number=${allocated.phoneNumber}`);
   }
 
   if (tradieKey) {
@@ -1992,12 +2027,26 @@ async function syncActiveSubscriptionAndProvision({ customerId, subscriptionId, 
     reqForBaseUrl
   });
 
-  const tradieAfterProvision = await getTradieByStripeRefs({ customerId, subscriptionId: subscriptionId || tradie.stripe_subscription_id || "" });
-  if (tradieAfterProvision && !tradieAfterProvision.google_refresh_token) {
-    await sendGoogleCalendarConnectEmailForTradie({
-      tradie: tradieAfterProvision,
-      source: "syncActiveSubscriptionAndProvision:calendar-connect"
-    });
+  // Send Google Calendar connect email after provisioning
+  if (!tradie.googleRefreshToken) {
+    try {
+      const connectUrl = `${process.env.BASE_URL}/api/google/connect?tradieId=${tradie.id}`;
+      await sendEmail({
+        to: tradie.email,
+        subject: "Connect your Google Calendar",
+        html: `
+        <p>Hi,</p>
+        <p>Connect your Google Calendar so your AI phone bot can manage bookings for you.</p>
+        <a href="${connectUrl}" style="display:inline-block;padding:12px 24px;background:#2563eb;color:#fff;border-radius:6px;text-decoration:none;font-weight:bold;">Connect Google Calendar</a>
+        <p>If the button doesn't work, copy and paste this link into your browser:<br>
+        <a href="${connectUrl}">${connectUrl}</a></p>
+        <p>This lets the phone bot check availability and create bookings.</p>
+      `
+      });
+      console.log(`GOOGLE_CONNECT_EMAIL_SENT tradieId=${tradie.id} email=${tradie.email}`);
+    } catch (emailErr) {
+      console.error("GOOGLE_CONNECT_EMAIL_ERROR", emailErr?.message || emailErr);
+    }
   }
 }
 
@@ -3440,6 +3489,14 @@ app.post("/process", async (req, res) => {
     // Hard stop if disabled
     if (tradie.status && tradie.status !== "ACTIVE") {
       twiml.say("This service is currently unavailable.", { voice: "Polly.Amy", language: "en-AU" });
+      return sendVoiceTwiml(res, twiml);
+    }
+
+    // If tradie is active but Google Calendar not connected yet
+    // give caller a friendly setup message instead of crashing
+    if (!tradie.googleRefreshToken || tradie.googleConnected === false) {
+      twiml.say("Hi, thanks for calling. We are just setting up your booking system — please try again in a few minutes and we will be ready to take your booking.", { voice: "Polly.Amy", language: "en-AU" });
+      twiml.hangup();
       return sendVoiceTwiml(res, twiml);
     }
 
