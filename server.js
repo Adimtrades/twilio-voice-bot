@@ -2406,6 +2406,7 @@ function getSession(callSid, fromNumber = "") {
       offScriptCount: 0,
       lastEmotion: "neutral",
       calendarCheckAnnounced: false,
+      confirmPromptSent: false,
 
       accessEditMode: "replace"
     });
@@ -3575,7 +3576,7 @@ app.post("/process", async (req, res) => {
       session.llmTurns < LLM_MAX_TURNS &&
       !!speech &&
       isOffScript &&
-      !["confirm", "pickSlot"].includes(session.step);
+      !["confirm", "pickSlot", "intent", "initial"].includes(session.step);
 
     if (shouldUseLlm) {
       session.llmTurns += 1;
@@ -3883,6 +3884,12 @@ app.post("/process", async (req, res) => {
 
       const noteLine = session.customerNote ? `I see a note on your file. ` : "";
       const accessLine = session.accessNote ? `Access notes: ${session.accessNote}. ` : "";
+
+      if (session.confirmPromptSent) {
+        ask(twiml, session.lastPrompt, actionUrl, { input: "speech", timeout: 7, speechTimeout: "auto" });
+        return sendVoiceTwiml(res, twiml);
+      }
+      session.confirmPromptSent = true;
 
       session.lastPrompt =
 `I have got ${session.name}, ${session.address}, for ${session.job}, at ${whenText}. ${noteLine}${accessLine}Is that correct? Say yes to confirm or no to change it.`;
