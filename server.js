@@ -2690,7 +2690,10 @@ function resolveCallSid(req) {
 
 function validateName(speech) {
   const s = String(speech || "").trim();
-  return s.length >= 2;
+  if (!s) return false;
+  // Accept any single word of 2+ chars as a valid name
+  // Short names like "Tim", "Jo", "Al" are all valid
+  return s.length >= 2 && !/^(yes|no|yeah|nope|correct|wrong|none|skip)$/i.test(s);
 }
 function validateAddress(speech) {
   const s = String(speech || "").trim();
@@ -3684,6 +3687,14 @@ app.post("/process", async (req, res) => {
 
     // STEP: intent
     if (session.step === "intent") {
+      // If job was already captured in initial step skip straight to address
+      if (session.job) {
+        session.step = "address";
+        session.lastPrompt = "What is the address for the job?";
+        addToHistory(session, "assistant", session.lastPrompt);
+        ask(twiml, session.lastPrompt, actionUrl);
+        return sendVoiceTwiml(res, twiml);
+      }
       const normalized = normalizeIntentSpeech(speech);
       const mappedIntent = ALLOWED_INITIAL_INTENTS.get(normalized);
 
@@ -3797,7 +3808,10 @@ app.post("/process", async (req, res) => {
     if (session.step === "name") {
       if (speech) session.name = speech;
 
-      if (shouldReject("name", session.name, confidence)) {
+      // For names, only reject if completely empty — short names like
+      // "Tim" or "Jo" often get low confidence scores from Twilio
+      const nameIsEmpty = !session.name || session.name.trim().length < 2;
+      if (nameIsEmpty) {
         session.lastPrompt = "Sorry — what name should I put the booking under?";
         addToHistory(session, "assistant", session.lastPrompt);
         ask(twiml, session.lastPrompt, actionUrl);
