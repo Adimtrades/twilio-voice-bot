@@ -4411,7 +4411,6 @@ app.post("/check-availability", async (req, res) => {
       session.bookedStartMs = first.toMillis();
       session.step = "confirm";
       session.lastPrompt = "Good news — that time is available. Would you like me to book it?";
-      twiml.say("Good news — that time is available. Would you like me to book it?", { voice: "Polly.Amy", language: "en-AU" });
       twiml.redirect({ method: "POST" }, "/confirm" + (req.query.tid ? `?tid=${encodeURIComponent(req.query.tid)}` : ""));
       return sendVoiceTwiml(res, twiml);
     }
