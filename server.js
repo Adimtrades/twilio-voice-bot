@@ -2572,7 +2572,10 @@ function repeatLastStepPrompt(req, twiml, session, step, reason = "NO_SPEECH") {
   }
 
   console.log(`STEP=${step} speech='' interpreted='${reason}' retryCount=${retryCount}`);
-  ask(twiml, `No worries — take your time. ${basePrompt}`, actionUrl, { input: "speech", timeout: 6, speechTimeout: "auto" });
+  const silenceRecovery = session.from
+    ? "Still there? Take your time — I am here when you are ready."
+    : "No worries — I am still here. What do you need help with today?";
+  ask(twiml, silenceRecovery, actionUrl, { input: "speech", timeout: 10, speechTimeout: "auto" });
   return { handled: true };
 }
 
@@ -2584,7 +2587,7 @@ function keepCallAliveForProcessing(req, twiml, message = "") {
   twiml.redirect({ method: "POST" }, checkUrl);
 }
 
-function sendVoiceTwiml(res, twiml, fallbackMessage = "Sorry, there was a temporary issue. Please try again.") {
+function sendVoiceTwiml(res, twiml, fallbackMessage = "Sorry, still here with you. What do you need help with today?") {
   const responseTwiml = twiml instanceof VoiceResponse ? twiml : new VoiceResponse();
   let xml = "";
 
@@ -2594,9 +2597,17 @@ function sendVoiceTwiml(res, twiml, fallbackMessage = "Sorry, there was a tempor
     xml = "";
   }
 
-  if (!xml) {
+  if (!xml || xml === '<?xml version="1.0" encoding="UTF-8"?><Response/>') {
     const fallback = new VoiceResponse();
-    fallback.say(fallbackMessage, { voice: "Polly.Amy", language: "en-AU" });
+    const gather = fallback.gather({
+      input: "speech",
+      timeout: 8,
+      speechTimeout: "auto",
+      action: "/process",
+      method: "POST",
+      language: "en-AU"
+    });
+    gather.say(fallbackMessage, { voice: "Polly.Amy", language: "en-AU" });
     xml = fallback.toString();
   }
 
@@ -3376,7 +3387,15 @@ app.post("/voice", async (req, res) => {
   } catch (e) {
     console.error("/voice error", e);
     const twiml = new VoiceResponse();
-    twiml.say("Sorry, there was a temporary issue. Please try again.", { voice: "Polly.Amy", language: "en-AU" });
+    const gather = twiml.gather({
+      input: "speech",
+      timeout: 8,
+      speechTimeout: "auto",
+      action: "/process",
+      method: "POST",
+      language: "en-AU"
+    });
+    gather.say("Hi — still here with you. What do you need help with today?", { voice: "Polly.Amy", language: "en-AU" });
     return sendVoiceTwiml(res, twiml);
   }
 });
@@ -3488,12 +3507,18 @@ app.post("/process", async (req, res) => {
         return sendVoiceTwiml(res, twiml);
       }
 
-      const prompt = prefix + (session.lastPrompt || "How can we help today?");
-      session.lastPrompt = prompt;
-      addToHistory(session, "assistant", prompt);
+      if (session.abuseStrikes >= 5) {
+        twiml.say("I am going to have to end this call now. Please call back when you are ready and we will be happy to help.", { voice: "Polly.Amy", language: "en-AU" });
+        twiml.hangup();
+        resetSession(callSid);
+        return sendVoiceTwiml(res, twiml);
+      }
 
-      const actionUrl = "/process" + (req.query.tid ? `?tid=${encodeURIComponent(req.query.tid)}` : "");
-      ask(twiml, prompt, actionUrl);
+      const abuseActionUrl = "/process" + (req.query.tid ? `?tid=${encodeURIComponent(req.query.tid)}` : "");
+      const abusePrompt = prefix + (session.lastPrompt || "How can we help today?");
+      session.lastPrompt = abusePrompt;
+      addToHistory(session, "assistant", abusePrompt);
+      ask(twiml, abusePrompt, abuseActionUrl);
       return sendVoiceTwiml(res, twiml);
     }
 
@@ -4055,6 +4080,7 @@ ${historyLine}${memoryLine}${accessLine2}`.trim()).catch(() => {});
       }
 
       twiml.say(`All set. We’ve sent you a text to confirm. Thanks!${customerCalendarNotice}`, { voice: "Polly.Amy", language: "en-AU" });
+      twiml.hangup();
       resetSession(callSid);
       return sendVoiceTwiml(res, twiml);
     }
@@ -4067,8 +4093,26 @@ ${historyLine}${memoryLine}${accessLine2}`.trim()).catch(() => {});
     return sendVoiceTwiml(res, twiml);
   } catch (err) {
     console.error("VOICE ERROR:", err);
-    twiml.say("Sorry, there was a system error. Please try again.", { voice: "Polly.Amy", language: "en-AU" });
-    return sendVoiceTwiml(res, twiml);
+    try {
+      const recoveryTwiml = new VoiceResponse();
+      const recoveryActionUrl = "/process" + (req.query.tid ? `?tid=${encodeURIComponent(req.query.tid)}` : "");
+      recoveryTwiml.say("Sorry about that — still here with you. Let me get your details.", { voice: "Polly.Amy", language: "en-AU" });
+      const recoverGather = recoveryTwiml.gather({
+        input: "speech",
+        timeout: 8,
+        speechTimeout: "auto",
+        action: recoveryActionUrl,
+        method: "POST",
+        language: "en-AU"
+      });
+      recoverGather.say("What do you need help with today?", { voice: "Polly.Amy", language: "en-AU" });
+      return sendVoiceTwiml(res, recoveryTwiml);
+    } catch (fatalErr) {
+      console.error("FATAL VOICE RECOVERY ERROR:", fatalErr);
+      const lastResort = new VoiceResponse();
+      lastResort.say("Sorry — please call back and we will get you sorted.", { voice: "Polly.Amy", language: "en-AU" });
+      return sendVoiceTwiml(res, lastResort);
+    }
   }
 });
 
@@ -4194,7 +4238,15 @@ app.post("/twilio/voice", async (req, res) => {
   } catch (e) {
     console.error("/twilio/voice error", e);
     const twiml = new VoiceResponse();
-    twiml.say("Sorry, we hit a temporary issue. Please try again.", { voice: "Polly.Amy", language: "en-AU" });
+    const gather = twiml.gather({
+      input: "speech",
+      timeout: 8,
+      speechTimeout: "auto",
+      action: "/process",
+      method: "POST",
+      language: "en-AU"
+    });
+    gather.say("Hi, sorry about that — still here. What do you need help with today?", { voice: "Polly.Amy", language: "en-AU" });
     return sendVoiceTwiml(res, twiml);
   }
 });
@@ -4350,13 +4402,16 @@ app.post("/check-availability", async (req, res) => {
     }
 
     session.calendarCheck = null;
-    twiml.say("Please try again later or reply to our SMS confirmation.", { voice: "Polly.Amy", language: "en-AU" });
-    twiml.hangup();
+    twiml.say("I had trouble checking the calendar just then — no worries though, I have saved your details and we will confirm by SMS shortly.", { voice: "Polly.Amy", language: "en-AU" });
+    const fallbackActionUrl = "/process" + (req.query.tid ? `?tid=${encodeURIComponent(req.query.tid)}` : "");
+    session.step = "confirm";
+    twiml.redirect({ method: "POST" }, fallbackActionUrl);
     return sendVoiceTwiml(res, twiml);
   } catch (e) {
     console.error("/check-availability error", e);
-    twiml.say("Please try again later or reply to our SMS confirmation.", { voice: "Polly.Amy", language: "en-AU" });
-    twiml.hangup();
+    const recoveryUrl = "/process" + (req.query.tid ? `?tid=${encodeURIComponent(req.query.tid)}` : "");
+    twiml.say("I had a little trouble checking the calendar just then — no worries, I have saved your details and we will confirm the time by SMS shortly.", { voice: "Polly.Amy", language: "en-AU" });
+    twiml.redirect({ method: "POST" }, recoveryUrl);
     return sendVoiceTwiml(res, twiml);
   }
 });
