@@ -834,6 +834,21 @@ Example: smalltalk_reply: "Sounds like it has been a rough one."
 When caller is confused:
 Clarify in one plain sentence only.
 
+COMPETITOR AND PRICE OBJECTION HANDLING:
+If caller mentions a competitor by name or says phrases like
+"the last guy charged less", "I can get it cheaper elsewhere",
+"another company quoted me less", "your prices are too high":
+- Never mention or badmouth any competitor
+- Acknowledge briefly in one sentence: "Totally fair to shop around."
+- Pivot immediately to booking: "What sets us apart is we show up
+  on time and get it done right. Let me get you locked in."
+- Never get into a price debate on the call
+- If they keep pushing on price say exactly:
+  "I can note that for the tradie and they can discuss pricing
+  options with you when they arrive."
+- Always bridge back to the next missing booking field immediately
+  after acknowledging the objection
+
 When offScriptCount >= 3:
 Skip mirror and validation. Just say: "I really want to get this sorted for you."
 
@@ -2373,6 +2388,33 @@ app.post("/stripe/webhook", express.raw({ type: "application/json" }), async (re
           stripe_subscription_id: subscriptionId || undefined,
           status: "cancelled"
         });
+
+        // Win-back SMS 24 hours after cancellation
+        setTimeout(async () => {
+          try {
+            const cancelledTradie = await getTradieByStripeRefs({ customerId, subscriptionId });
+            if (!cancelledTradie) return;
+            const t = normalizeTradieConfig(cancelledTradie);
+            if (!t.ownerSmsTo) return;
+            // Check they have not resubscribed
+            const fresh = await getOne(
+              SUPABASE_TRADIES_TABLE,
+              `stripe_customer_id=eq.${encodeURIComponent(customerId)}&select=status,subscription_status`
+            );
+            if (
+              String(fresh?.status || "").toUpperCase() === "ACTIVE" ||
+              String(fresh?.subscription_status || "").toUpperCase() === "ACTIVE"
+            ) return;
+            await sendSms({
+              from: t.smsFrom || process.env.TWILIO_SMS_FROM || "",
+              to: t.ownerSmsTo,
+              body: `Hi — we noticed you cancelled your AI booking assistant. We would love to have you back. Use code COMEBACK20 for 20% off your first month when you resubscribe: ${process.env.BASE_URL || "https://twilio-voice-bot-w9gq.onrender.com"}/pricing`
+            });
+            console.log(`WIN_BACK_SMS_SENT customerId=${customerId}`);
+          } catch (wbErr) {
+            console.error("WIN_BACK_SMS_ERROR", wbErr?.message || wbErr);
+          }
+        }, 24 * 60 * 60 * 1000);
       }
     }
 
@@ -2386,6 +2428,31 @@ app.post("/stripe/webhook", express.raw({ type: "application/json" }), async (re
           stripe_subscription_id: subscriptionId || undefined,
           status: "past_due"
         });
+
+        try {
+          const failedTradie = await getTradieByStripeRefs({ customerId, subscriptionId });
+          if (failedTradie) {
+            const t = normalizeTradieConfig(failedTradie);
+            if (t.ownerSmsTo) {
+              await sendSms({
+                from: t.smsFrom || process.env.TWILIO_SMS_FROM || "",
+                to: t.ownerSmsTo,
+                body: `⚠️ Payment failed for your AI booking assistant. Please update your payment details to keep your booking number active. Contact us at adimtrades@gmail.com if you need help.`
+              }).catch(() => {});
+            }
+            if (t.email) {
+              await sendTradieEmail(
+                t.email,
+                "⚠️ Payment failed — action required",
+                `Your payment failed. Please update your billing details to keep your AI booking number active. Contact us at adimtrades@gmail.com`,
+                `<p>Your payment failed. Please update your billing details to keep your AI booking number active.</p><p>Contact us at <a href="mailto:adimtrades@gmail.com">adimtrades@gmail.com</a> if you need help.</p>`
+              ).catch(() => {});
+            }
+            console.log(`PAYMENT_FAILED_ALERT_SENT customerId=${customerId}`);
+          }
+        } catch (pfErr) {
+          console.error("PAYMENT_FAILED_ALERT_ERROR", pfErr?.message || pfErr);
+        }
       }
     }
 
@@ -2586,6 +2653,9 @@ app.post("/admin/provision", async (req, res) => {
 // Conversation / session store (in-memory)
 // 
 const sessions = new Map();
+// In-memory caller blacklist — persists for life of server process
+// Owner SMSes "BLOCK +61xxxxxxxxx" to add, "UNBLOCK +61xxxxxxxxx" to remove
+const callerBlacklist = new Map(); // key: "tradieKey::phoneNumber" -> true
 const processSpeechLocks = new Map();
 
 function cleanupMaps() {
@@ -2690,7 +2760,8 @@ function getSession(callSid, fromNumber = "") {
       suburb: "",
       addressReadBack: false,
 
-      accessEditMode: "replace"
+      accessEditMode: "replace",
+      callbackRequested: false
     });
   } else {
     const s = sessions.get(callSid);
@@ -3909,12 +3980,46 @@ app.post("/process", async (req, res) => {
       return sendVoiceTwiml(res, twiml);
     }
 
+    // Check in-memory blacklist
+    const callerNumber = String(req.body?.From || "").trim();
+    if (callerNumber) {
+      const blCheckKey = `${tradie.key}::${callerNumber}`;
+      if (callerBlacklist.has(blCheckKey)) {
+        console.log(`BLACKLISTED_CALLER_BLOCKED tradie=${tradie.key} number=${callerNumber}`);
+        twiml.say("Sorry, we are unable to take your call at this time.", { voice: "Polly.Amy", language: "en-AU" });
+        twiml.hangup();
+        return sendVoiceTwiml(res, twiml);
+      }
+    }
+
     // If tradie is active but Google Calendar not connected yet
     // give caller a friendly setup message instead of crashing
     if (!tradie.googleRefreshToken || tradie.googleConnected === false) {
       twiml.say("Hi, thanks for calling. We are just setting up your booking system — please try again in a few minutes and we will be ready to take your booking.", { voice: "Polly.Amy", language: "en-AU" });
       twiml.hangup();
       return sendVoiceTwiml(res, twiml);
+    }
+
+    // After hours detection — log and alert owner but keep bot running
+    const nowForHours = DateTime.now().setZone(tradie.timezone || "Australia/Sydney");
+    const callHour = nowForHours.hour;
+    const callDay = nowForHours.weekday; // 1=Mon 7=Sun
+    const bizDays = tradie.businessDays || [1, 2, 3, 4, 5];
+    const bizStart = tradie.businessStartHour || 7;
+    const bizEnd = tradie.businessEndHour || 17;
+    const isInBizHours = bizDays.includes(callDay) &&
+                         callHour >= bizStart &&
+                         callHour < bizEnd;
+    if (!isInBizHours) {
+      const afterHoursFrom = String(req.body?.From || "").trim();
+      console.log(`AFTER_HOURS_CALL tradie=${tradie.key} from=${afterHoursFrom} hour=${callHour}`);
+      try {
+        await incMetric(tradie, { after_hours_calls: 1 }).catch(() => {});
+        await sendOwnerSms(tradie,
+          `🌙 AFTER HOURS CALL\nCaller: ${afterHoursFrom}\nTime: ${nowForHours.toFormat("HH:mm")} (${tradie.timezone || "AEST"})\nBot is still attempting to take the booking.`
+        ).catch(() => {});
+      } catch {}
+      // Do NOT hang up — bot continues to take the booking after hours
     }
 
     const tz = tradie.timezone;
@@ -4086,6 +4191,22 @@ app.post("/process", async (req, res) => {
       }
 
       const repeatedFallback = await repeatLastStepPrompt(req, res, twiml, session, "sms_fallback_offer", speech ? "UNCLEAR" : "NO_SPEECH", tradie);
+      return sendVoiceTwiml(res, twiml);
+    }
+
+    // Callback request detection
+    const wantsCallback = /\b(call me back|ring me back|call me later|get someone to call|have someone call|callback|call back)\b/i.test(speech || "");
+    if (wantsCallback && !session.callbackRequested) {
+      session.callbackRequested = true;
+      const callbackTime = session.time || "as soon as possible";
+      await sendOwnerSms(tradie,
+        `📞 CALLBACK REQUEST\nCaller: ${session.from || "unknown"}\nName: ${session.name || "unknown"}\nTime: ${callbackTime}\nJob: ${session.job || "unknown"}\nPlease call them back.`
+      ).catch(() => {});
+      twiml.say(
+        "No worries — I will let the team know to call you back. Is there a good time that suits you?",
+        { voice: "Polly.Amy", language: "en-AU" }
+      );
+      ask(twiml, "What time works best for a callback?", voiceActionUrl(req));
       return sendVoiceTwiml(res, twiml);
     }
 
@@ -4620,6 +4741,21 @@ app.post("/process", async (req, res) => {
       const memoryLine = session.customerNote ? `\nCustomer note (existing): ${session.customerNote}` : "";
       const accessLine2 = session.accessNote ? `\nAccess note (new): ${session.accessNote}` : "";
 
+      function estimateJobValue(job, avgValue) {
+        const j = String(job || "").toLowerCase();
+        if (/burst pipe|gas leak|emergency|flooding|no power|sparking/.test(j))
+          return Math.round(avgValue * 2.5);
+        if (/rewire|switchboard|hot water system|bathroom reno|new deck|pergola/.test(j))
+          return Math.round(avgValue * 2);
+        if (/blocked drain|leaking tap|light fitting|power point|fence panel|painting/.test(j))
+          return Math.round(avgValue * 0.8);
+        return avgValue;
+      }
+      const estimatedValue = estimateJobValue(session.job, tradie.avgJobValue || 250);
+      const urgencyLine = (session.urgencyScore || 0) >= 7
+        ? `\n🚨 Urgency: ${session.urgencyScore}/10 — respond fast` : "";
+      const valueLine = `\nEst. job value: $${estimatedValue}`;
+
       await sendOwnerSms(tradie,
 `NEW BOOKING ✅
 Name: ${session.name}
@@ -4628,7 +4764,7 @@ Address: ${session.address}
 Job: ${session.job}
 Time: ${formatForVoice(startDt)}
 Confirm: customer will reply Y/N
-${historyLine}${memoryLine}${accessLine2}`.trim()).catch(() => {});
+${historyLine}${memoryLine}${accessLine2}${valueLine}${urgencyLine}`.trim()).catch(() => {});
 
       const eventResult = await createBookingCalendarEvent({
         tradie,
@@ -4665,6 +4801,55 @@ ${historyLine}${memoryLine}${accessLine2}`.trim()).catch(() => {});
       }
 
       session.bookingConfirmed = true;
+
+      // Rating SMS 1 hour after booking end — fire and forget
+      const ratingDelayMs = endDt
+        ? Math.max((endDt.toMillis() + 60 * 60 * 1000) - Date.now(), 5 * 60 * 1000)
+        : 60 * 60 * 1000;
+      const ratingFrom = session.from || "";
+      const ratingName = session.name || "";
+      const ratingNumber = tradie.twilioNumber || tradie.smsFrom || "";
+      const ratingTradieKey = tradie.key || "";
+      if (ratingFrom && ratingNumber) {
+        setTimeout(async () => {
+          try {
+            await sendSms({
+              from: ratingNumber,
+              to: ratingFrom,
+              body: `Hi ${ratingName ? ratingName + " — " : ""}how did we go today? Reply with a number 1 to 5 to rate your experience. 5 = excellent. Your feedback helps us improve.`
+            });
+            console.log(`RATING_SMS_SENT to=${ratingFrom} tradie=${ratingTradieKey}`);
+          } catch (rErr) {
+            console.error("RATING_SMS_ERROR", rErr?.message || rErr);
+          }
+        }, ratingDelayMs);
+      }
+
+      // Pre-appointment checklist SMS 2 hours before start
+      const checklistDelayMs = startDt
+        ? Math.max((startDt.toMillis() - 2 * 60 * 60 * 1000) - Date.now(), 10 * 60 * 1000)
+        : null;
+      const checklistFrom = session.from || "";
+      const checklistName = session.name || "";
+      const checklistJob = session.job || "your job";
+      const checklistAccess = session.accessNote || "";
+      const checklistNumber = tradie.twilioNumber || tradie.smsFrom || "";
+      if (checklistFrom && checklistNumber && checklistDelayMs) {
+        setTimeout(async () => {
+          try {
+            const accessLine = checklistAccess && !/^none$/i.test(checklistAccess.trim())
+              ? `\n• Access note: ${checklistAccess}` : "";
+            await sendSms({
+              from: checklistNumber,
+              to: checklistFrom,
+              body: `Hi ${checklistName ? checklistName + " — " : ""}your tradie is on the way soon for: ${checklistJob}.\n\nQuick checklist:\n• Ensure access is clear\n• Pets secured if needed${accessLine}\n• Someone home to let them in\n\nReply CANCEL to cancel.`
+            });
+            console.log(`CHECKLIST_SMS_SENT to=${checklistFrom} tradie=${tradie.key}`);
+          } catch (chkErr) {
+            console.error("CHECKLIST_SMS_ERROR", chkErr?.message || chkErr);
+          }
+        }, checklistDelayMs);
+      }
 
       // Generate one line AI summary and SMS to owner
       if (llmReady()) {
@@ -4816,6 +5001,24 @@ app.post("/sms", async (req, res) => {
           }
         });
 
+        // Star rating reply — customer replies 1 to 5
+        const ratingMatch = (body || "").trim().match(/^([1-5])$/);
+        if (ratingMatch) {
+          const rating = Number(ratingMatch[1]);
+          const ratingEmoji = rating >= 4 ? "🌟" : rating === 3 ? "👍" : "📝";
+          await sendOwnerSms(tradie,
+            `${ratingEmoji} RATING RECEIVED\nFrom: ${from}\nRating: ${rating}/5${rating <= 2 ? "\n⚠️ Low rating — consider following up." : ""}`
+          ).catch(() => {});
+          const replyMsg = rating >= 4
+            ? "Thanks so much for the great rating! We really appreciate it. 😊"
+            : rating === 3
+            ? "Thanks for your feedback — we will use it to keep improving."
+            : "Thanks for letting us know. We are sorry it did not meet expectations — someone will be in touch.";
+          await sendSms({ from: tradie.smsFrom, to: from, body: replyMsg }).catch(() => {});
+          console.log(`RATING_RECEIVED tradie=${tradie.key} from=${from} rating=${rating}`);
+          return res.sendStatus(200);
+        }
+
         await sendOwnerSms(tradie, `CUSTOMER CONFIRMED ✅
 ${nice}`).catch(() => {});
 
@@ -4849,6 +5052,38 @@ ${nice}`).catch(() => {});
     }
 
     // No pending confirmation: treat as inbound quote / general message
+    // BLOCK command — owner SMSes "BLOCK +61412345678"
+    if (from === tradie.ownerSmsTo && /^BLOCK\s+\+?\d+/i.test(body || "")) {
+      const numberToBlock = (body.match(/\+?\d[\d\s\-]{7,}/)?.[0] || "").replace(/\s/g, "").trim();
+      if (numberToBlock) {
+        const blKey = `${tradie.key}::${numberToBlock}`;
+        callerBlacklist.set(blKey, true);
+        await sendSms({
+          from: tradie.smsFrom,
+          to: from,
+          body: `✅ Number ${numberToBlock} has been blocked. They can no longer book.`
+        }).catch(() => {});
+        console.log(`BLACKLIST_ADDED tradie=${tradie.key} number=${numberToBlock}`);
+        return res.sendStatus(200);
+      }
+    }
+
+    // UNBLOCK command — owner SMSes "UNBLOCK +61412345678"
+    if (from === tradie.ownerSmsTo && /^UNBLOCK\s+\+?\d+/i.test(body || "")) {
+      const numberToUnblock = (body.match(/\+?\d[\d\s\-]{7,}/)?.[0] || "").replace(/\s/g, "").trim();
+      if (numberToUnblock) {
+        const ubKey = `${tradie.key}::${numberToUnblock}`;
+        callerBlacklist.delete(ubKey);
+        await sendSms({
+          from: tradie.smsFrom,
+          to: from,
+          body: `✅ Number ${numberToUnblock} has been unblocked.`
+        }).catch(() => {});
+        console.log(`BLACKLIST_REMOVED tradie=${tradie.key} number=${numberToUnblock}`);
+        return res.sendStatus(200);
+      }
+    }
+
     await sendOwnerSms(tradie, `INBOUND SMS 💬\nFrom: ${from}\nMessage: ${body || "(no text)"}${numMedia ? `\nMedia: ${numMedia} attached` : ""}`).catch(() => {});
     twiml.message("Thanks — we’ve received your message.");
     return res.type("text/xml").send(twiml.toString());
@@ -5174,6 +5409,56 @@ app.use((req, res) => {
 // 
 const PORT = Number(process.env.PORT || 10000);
 if (!PORT || Number.isNaN(PORT)) throw new Error("PORT missing/invalid");
+
+// Weekly revenue forecast — runs every hour, fires only Monday ~8am AEST (22:00 UTC Sunday)
+setInterval(async () => {
+  try {
+    const now = new Date();
+    if (now.getUTCDay() !== 1 || now.getUTCHours() !== 22) return;
+
+    if (!supabase) return;
+    const { data: allTradies } = await supabase
+      .from(SUPABASE_TRADIES_TABLE)
+      .select("*")
+      .eq("status", "ACTIVE");
+
+    if (!allTradies?.length) return;
+
+    for (const row of allTradies) {
+      try {
+        const t = normalizeTradieConfig(row);
+        if (!t.ownerSmsTo) continue;
+
+        const weekAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000)
+          .toISOString().split("T")[0];
+
+        const { data: metrics } = await supabase
+          .from(SUPABASE_METRICS_TABLE)
+          .select("bookings_created,est_revenue,calls_total")
+          .eq("tradie_key", t.key)
+          .gte("day", weekAgo);
+
+        if (!metrics?.length) continue;
+
+        const totalBookings = metrics.reduce((s, m) => s + Number(m.bookings_created || 0), 0);
+        const totalRevenue = metrics.reduce((s, m) => s + Number(m.est_revenue || 0), 0);
+        const totalCalls = metrics.reduce((s, m) => s + Number(m.calls_total || 0), 0);
+        const projectedMonthly = Math.round(totalRevenue * 4.3);
+
+        await sendSms({
+          from: t.smsFrom || process.env.TWILIO_SMS_FROM || "",
+          to: t.ownerSmsTo,
+          body: `📊 WEEKLY SUMMARY\nCalls: ${totalCalls}\nBookings: ${totalBookings}\nEst. revenue: $${Math.round(totalRevenue)}\nProjected monthly: $${projectedMonthly}\n\nHave a great week! 💪`
+        });
+        console.log(`WEEKLY_FORECAST_SENT tradie=${t.key}`);
+      } catch (tErr) {
+        console.error("WEEKLY_FORECAST_TRADIE_ERROR", tErr?.message || tErr);
+      }
+    }
+  } catch (schedErr) {
+    console.error("WEEKLY_FORECAST_ERROR", schedErr?.message || schedErr);
+  }
+}, 60 * 60 * 1000);
 
 if (require.main === module) {
   app.listen(PORT, () => console.log("Server listening on", PORT));
