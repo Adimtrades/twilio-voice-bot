@@ -2674,6 +2674,7 @@ function getSession(callSid, fromNumber = "") {
       lastEmotion: "neutral",
       calendarCheckAnnounced: false,
       confirmPromptSent: false,
+      _usedAffirmations: [],
 
       lastTwimlXml: null,
       totalFailedAttempts: 0,
@@ -2684,6 +2685,10 @@ function getSession(callSid, fromNumber = "") {
       urgencyScore: 0,
       urgencyAlertSent: false,
       detectedTone: "casual",
+      addressConfirmed: false,
+      pendingStep: "",
+      suburb: "",
+      addressReadBack: false,
 
       accessEditMode: "replace"
     });
@@ -2770,12 +2775,13 @@ function handleVoiceEntry(req, res) {
   const rawTradie = req._tradieConfig || {};
   const bizName = rawTradie?.bizName || "";
   const botName = rawTradie?.botName || "Alex";
-  let greeting;
-  if (bizName) {
-    greeting = `Hi, thanks for calling ${bizName}. This is ${botName}. What do you need help with today?`;
-  } else {
-    greeting = `Hi, what do you need help with today?`;
-  }
+  const tradieTimezone = rawTradie?.timezone || "Australia/Sydney";
+  const timeGreeting = getTimeOfDayGreeting(tradieTimezone);
+  const isHoliday = isAustralianPublicHoliday(tradieTimezone);
+  const holidayNote = isHoliday ? " Hope you are enjoying the public holiday." : "";
+  const greeting = bizName
+    ? `${timeGreeting}, thanks for calling ${bizName}. This is ${botName}.${holidayNote} What do you need help with today?`
+    : `${timeGreeting}.${holidayNote} What do you need help with today?`;
   const twiml = buildInitialVoiceTwiml(req, greeting, rawTradie);
   const callSid = resolveCallSid(req);
   const fromNumber = (req.body?.From || req.query?.From || "").trim();
@@ -3127,9 +3133,114 @@ function detectIntent(text) {
 // 
 // Time parsing
 // 
+function pickRandom(arr) {
+  return arr[Math.floor(Math.random() * arr.length)];
+}
+
+function getAffirmation(session) {
+  const used = session._usedAffirmations || [];
+  const all = ["Perfect.", "Got it.", "Lovely.", "No worries.", "Brilliant.", "Good one.", "Great stuff.", "Noted."];
+  const available = all.filter(a => !used.includes(a));
+  const pool = available.length > 0 ? available : all;
+  const pick = pickRandom(pool);
+  session._usedAffirmations = [...used.slice(-4), pick];
+  return pick;
+}
+
+function getTimeOfDayGreeting(tz) {
+  const hour = DateTime.now().setZone(tz || "Australia/Sydney").hour;
+  if (hour < 12) return "Good morning";
+  if (hour < 17) return "Good afternoon";
+  return "Thanks for calling this evening";
+}
+
+function getJobEmpathy(job) {
+  const j = String(job || "").toLowerCase();
+  if (/burst pipe|flooding|leak.*bad|emergency|gas leak|sparking|no power/.test(j))
+    return "Oh no — let us get that sorted fast.";
+  if (/blocked drain|blocked toilet|overflow/.test(j))
+    return "That is never fun — let us get someone out to you.";
+  if (/hot water|no hot water/.test(j))
+    return "No hot water is rough — let us fix that quickly.";
+  if (/broken|not working|damaged/.test(j))
+    return "That sounds frustrating — let us get it sorted.";
+  return "";
+}
+
+function getCalendarWaitMessage() {
+  return pickRandom([
+    "Just checking the calendar — won't be a moment.",
+    "Bear with me one sec while I check availability.",
+    "Let me just check that time for you.",
+    "One moment — just pulling up the calendar.",
+    "Just a sec — checking that now."
+  ]);
+}
+
+function isAustralianPublicHoliday(tz) {
+  const now = DateTime.now().setZone(tz || "Australia/Sydney");
+  const month = now.month;
+  const day = now.day;
+  // Fixed Australian public holidays
+  const fixed = [
+    [1, 1],   // New Year's Day
+    [1, 26],  // Australia Day
+    [4, 25],  // Anzac Day
+    [12, 25], // Christmas Day
+    [12, 26], // Boxing Day
+  ];
+  return fixed.some(([m, d]) => m === month && d === day);
+}
+
+function normaliseSpokenNumber(text) {
+  if (!text) return text;
+  const words = {
+    "zero": "0", "one": "1", "two": "2", "three": "3", "four": "4",
+    "five": "5", "six": "6", "seven": "7", "eight": "8", "nine": "9",
+    "ten": "10", "eleven": "11", "twelve": "12", "thirteen": "13",
+    "fourteen": "14", "fifteen": "15", "sixteen": "16", "seventeen": "17",
+    "eighteen": "18", "nineteen": "19", "twenty": "20", "thirty": "30",
+    "forty": "40", "fifty": "50", "sixty": "60", "seventy": "70",
+    "eighty": "80", "ninety": "90", "hundred": "100"
+  };
+  let t = String(text).toLowerCase();
+  for (const [word, num] of Object.entries(words)) {
+    t = t.replace(new RegExp(`\\b${word}\\b`, "g"), num);
+  }
+  return t;
+}
+
+function normaliseAussieSlang(text, tz) {
+  if (!text) return text;
+  let t = String(text).toLowerCase();
+  // Time slang
+  t = t.replace(/\bthis arvo\b/g, "this afternoon");
+  t = t.replace(/\barvo\b/g, "afternoon");
+  t = t.replace(/\bsmoko\b/g, "10am");
+  t = t.replace(/\bhalf two\b/g, "2:30pm");
+  t = t.replace(/\bhalf three\b/g, "3:30pm");
+  t = t.replace(/\bhalf four\b/g, "4:30pm");
+  t = t.replace(/\bhalf five\b/g, "5:30pm");
+  t = t.replace(/\bhalf six\b/g, "6:30pm");
+  t = t.replace(/\bhalf seven\b/g, "7:30am");
+  t = t.replace(/\bhalf eight\b/g, "8:30am");
+  t = t.replace(/\bhalf nine\b/g, "9:30am");
+  t = t.replace(/\bhalf ten\b/g, "10:30am");
+  t = t.replace(/\bhalf eleven\b/g, "11:30am");
+  t = t.replace(/\bhalf twelve\b/g, "12:30pm");
+  t = t.replace(/\barvie\b/g, "afternoon");
+  t = t.replace(/\btomoz\b/g, "tomorrow");
+  t = t.replace(/\bnext week sometime\b/g, "next week");
+  return t;
+}
+
 function normalizeTimeText(text, tz) {
   if (!text) return "";
   let t = String(text).toLowerCase().trim();
+
+  // Normalise Australian slang and spoken numbers first
+  t = normaliseAussieSlang(t, tz);
+  t = normaliseSpokenNumber(t);
 
   t = t.replace(/\b(\d{1,2})\s*:\s*(\d{2})\s*p\.?\s*m\.?\b/g, "$1:$2pm");
   t = t.replace(/\b(\d{1,2})\s*:\s*(\d{2})\s*a\.?\s*m\.?\b/g, "$1:$2am");
@@ -3223,7 +3334,7 @@ function detectYesNoFromDigits(d) {
 }
 function detectYesNo(text) {
   const t = (text || "").toLowerCase().trim();
-  const yes = ["yes","yeah","yep","correct","that's right","that’s right","sounds good","ok","okay","confirm"];
+  const yes = ["yes","yeah","yep","yup","sure","ok","okay","correct","that's right","thats right","sounds good","absolutely","for sure","definitely","go ahead","go for it","that’s right","confirm"];
   const no = ["no","nope","nah","wrong","not right","don’t","dont","change","edit"];
 
   if (yes.some((w) => t === w || t.includes(w))) return "YES";
@@ -3316,6 +3427,14 @@ function trySlotFill(session, speech, tz) {
   }
 
   if (validateAddress(raw)) session.address = session.address || raw;
+
+  // Extract suburb mentioned in passing during other steps
+  if (!session.suburb) {
+    const suburbMatch = raw.match(/\bin\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\b/);
+    if (suburbMatch?.[1] && suburbMatch[1].length > 3) {
+      session.suburb = suburbMatch[1];
+    }
+  }
 
   const m = raw.match(/my name is\s+(.+)/i);
   if (m?.[1]) {
@@ -4084,8 +4203,10 @@ app.post("/process", async (req, res) => {
     if (session.step === "intent") {
       // If job was already captured in initial step skip straight to address
       if (session.job) {
+        const jobEmpathy = getJobEmpathy(session.job);
+        const affirmJob = jobEmpathy || getAffirmation(session);
         session.step = "address";
-        session.lastPrompt = "What is the address for the job?";
+        session.lastPrompt = `${affirmJob} And whereabouts is the job? What is the address?`;
         addToHistory(session, "assistant", session.lastPrompt);
         ask(twiml, session.lastPrompt, actionUrl);
         return sendVoiceTwiml(res, twiml);
@@ -4126,8 +4247,10 @@ app.post("/process", async (req, res) => {
       // First speech treated as job description — move straight to address
       if (speech) session.job = speech;
       session.intent = "NEW_BOOKING";
+      const jobEmpathy = getJobEmpathy(session.job);
+      const affirmJob = jobEmpathy || getAffirmation(session);
       session.step = "address";
-      session.lastPrompt = `Got it. What is the address for the job?`;
+      session.lastPrompt = `${affirmJob} And whereabouts is the job? What is the address?`;
       addToHistory(session, "assistant", session.lastPrompt);
       ask(twiml, session.lastPrompt, actionUrl, { input: "speech" });
       return sendVoiceTwiml(res, twiml);
@@ -4144,8 +4267,10 @@ app.post("/process", async (req, res) => {
         return sendVoiceTwiml(res, twiml);
       }
 
+      const jobEmpathy2 = getJobEmpathy(session.job);
+      const affirmJob2 = jobEmpathy2 || getAffirmation(session);
       session.step = "address";
-      session.lastPrompt = "What is the address?";
+      session.lastPrompt = `${affirmJob2} And whereabouts is the job? What is the full address?`;
       addToHistory(session, "assistant", session.lastPrompt);
       ask(twiml, session.lastPrompt, actionUrl);
       return sendVoiceTwiml(res, twiml);
@@ -4155,12 +4280,43 @@ app.post("/process", async (req, res) => {
     if (session.step === "address") {
       if (speech) session.address = speech;
 
-      if (shouldReject("address", session.address, confidence)) {
-        session.lastPrompt = "Sorry — what is the full address?";
+      // Low confidence but not empty — read it back to confirm
+      if (
+        session.address &&
+        session.address.trim().length > 3 &&
+        typeof confidence === "number" &&
+        confidence > 0 &&
+        confidence < 0.5 &&
+        !session.addressReadBack
+      ) {
+        session.addressReadBack = true;
+        session.lastPrompt = `Sorry — just to confirm, I heard "${session.address}". Is that right?`;
         addToHistory(session, "assistant", session.lastPrompt);
         ask(twiml, session.lastPrompt, actionUrl);
         return sendVoiceTwiml(res, twiml);
       }
+
+      if (shouldReject("address", session.address, confidence)) {
+        const suburbHint = session.suburb ? ` Is it in ${session.suburb}?` : "";
+        session.lastPrompt = `Sorry — what is the full street address?${suburbHint}`;
+        addToHistory(session, "assistant", session.lastPrompt);
+        ask(twiml, session.lastPrompt, actionUrl);
+        return sendVoiceTwiml(res, twiml);
+      }
+
+      // Read back address if it contains a high number to confirm
+      const addrNumberMatch = (session.address || "").match(/\b(\d{3,})\b/);
+      if (addrNumberMatch && !session.addressConfirmed) {
+        session.addressConfirmed = true;
+        const readBack = `Just to confirm — I have got ${session.address}. Is that right?`;
+        session.lastPrompt = readBack;
+        session.pendingStep = "name";
+        session.step = "address_confirm";
+        addToHistory(session, "assistant", session.lastPrompt);
+        ask(twiml, session.lastPrompt, actionUrl);
+        return sendVoiceTwiml(res, twiml);
+      }
+      session.addressConfirmed = true;
 
       // address history
       if (tradie.googleRefreshToken && tradie.id && tradie.calendarId) {
@@ -4170,11 +4326,33 @@ app.post("/process", async (req, res) => {
         } catch (error) { console.error("CALENDAR_ADDRESS_HISTORY_ERROR", error); }
       }
 
+      const affirmAddr = getAffirmation(session);
       session.step = "name";
-      session.lastPrompt = "What is your name?";
+      session.lastPrompt = `${affirmAddr} And what name should I put the booking under?`;
       addToHistory(session, "assistant", session.lastPrompt);
       ask(twiml, session.lastPrompt, actionUrl);
       return sendVoiceTwiml(res, twiml);
+    }
+
+    // STEP: address_confirm
+    if (session.step === "address_confirm") {
+      const yn = detectYesNo(speech);
+      if (yn === "YES") {
+        const affirmAddrConfirm = getAffirmation(session);
+        session.step = "name";
+        session.lastPrompt = `${affirmAddrConfirm} And what name should I put the booking under?`;
+        addToHistory(session, "assistant", session.lastPrompt);
+        ask(twiml, session.lastPrompt, actionUrl);
+        return sendVoiceTwiml(res, twiml);
+      } else {
+        session.address = "";
+        session.addressConfirmed = false;
+        session.step = "address";
+        session.lastPrompt = "No worries — what is the correct address?";
+        addToHistory(session, "assistant", session.lastPrompt);
+        ask(twiml, session.lastPrompt, actionUrl);
+        return sendVoiceTwiml(res, twiml);
+      }
     }
 
     // STEP: name
@@ -4191,8 +4369,9 @@ app.post("/process", async (req, res) => {
         return sendVoiceTwiml(res, twiml);
       }
 
+      const affirmName = getAffirmation(session);
       session.step = "access";
-      session.lastPrompt = "Any access notes like gate code, parking, or pets? Say none if not.";
+      session.lastPrompt = `${affirmName} ${session.name ? session.name + " — " : ""}any access notes like a gate code, parking, or pets? Just say none if not.`;
       addToHistory(session, "assistant", session.lastPrompt);
       ask(twiml, session.lastPrompt, actionUrl);
       return sendVoiceTwiml(res, twiml);
@@ -4231,8 +4410,9 @@ app.post("/process", async (req, res) => {
         return sendVoiceTwiml(res, twiml);
       }
 
+      const affirmAccess = getAffirmation(session);
       session.step = "time";
-      session.lastPrompt = "What time would you like?";
+      session.lastPrompt = `${affirmAccess} And what day and time works best for you?`;
       addToHistory(session, "assistant", session.lastPrompt);
       ask(twiml, session.lastPrompt, actionUrl);
       return sendVoiceTwiml(res, twiml);
@@ -4263,7 +4443,7 @@ app.post("/process", async (req, res) => {
         };
         if (!session.calendarCheckAnnounced) {
           session.calendarCheckAnnounced = true;
-          keepCallAliveForProcessing(req, twiml, "Okay, just a moment while I check that for you.");
+          keepCallAliveForProcessing(req, twiml, getCalendarWaitMessage());
         } else {
           keepCallAliveForProcessing(req, twiml);
         }
@@ -4304,7 +4484,7 @@ app.post("/process", async (req, res) => {
       session.confirmPromptSent = true;
 
       session.lastPrompt =
-`I have got ${session.name}, ${session.address}, for ${session.job}, at ${whenText}. ${noteLine}${accessLine}Is that correct? Say yes to confirm or no to change it.`;
+`${session.name ? "Perfect " + session.name.split(" ")[0] + " — " : ""}just to confirm — ${session.job} at ${session.address}, ${whenText}. ${noteLine}${accessLine}Does that all sound right? Say yes to confirm or no to change something.`;
 
       addToHistory(session, "assistant", session.lastPrompt);
       ask(twiml, session.lastPrompt, actionUrl, { input: "speech", timeout: 7, speechTimeout: "auto" });
@@ -4357,7 +4537,7 @@ app.post("/process", async (req, res) => {
       session.confirmPromptSent = true;
 
       session.lastPrompt =
-`I have got ${session.name}, ${session.address}, for ${session.job}, at ${whenText}. ${noteLine}${accessLine}Is that correct? Say yes to confirm or no to change it.`;
+`${session.name ? "Perfect " + session.name.split(" ")[0] + " — " : ""}just to confirm — ${session.job} at ${session.address}, ${whenText}. ${noteLine}${accessLine}Does that all sound right? Say yes to confirm or no to change something.`;
 
       addToHistory(session, "assistant", session.lastPrompt);
       ask(twiml, session.lastPrompt, actionUrl, { input: "speech", timeout: 7, speechTimeout: "auto" });
@@ -4378,6 +4558,18 @@ app.post("/process", async (req, res) => {
       }
 
       resetRetryCountForStep(session, "confirm");
+      // Detect correction attempt — "no no" "wrong" "actually"
+      const isCorrecting = /\b(no no|wrong|actually|wait|hang on|sorry that|not right)\b/i.test(speech || "");
+      if (isCorrecting) {
+        resetRetryCountForStep(session, "confirm");
+        session.confirmPromptSent = false;
+        session.step = "job";
+        session.lastPrompt = "My apologies — let us start from the top. What is the job?";
+        addToHistory(session, "assistant", session.lastPrompt);
+        ask(twiml, session.lastPrompt, actionUrl);
+        return sendVoiceTwiml(res, twiml);
+      }
+
       if (yn2 === "NO") {
         console.log(`STEP=confirm speech='${speech}' interpreted='NO' retryCount=${getRetryCountForStep(session, "confirm")}`);
         session.step = "access";
