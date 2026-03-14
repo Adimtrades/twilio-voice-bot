@@ -705,6 +705,7 @@ function normalizeTradieConfig(row) {
     bufferMinutes: Number.isFinite(bufferMinutes) ? bufferMinutes : 0,
 
     bizName,
+    botName: String(t.botName || t.bot_name || process.env.BOT_NAME || "Alex"),
     tone,
     services,
 
@@ -774,6 +775,10 @@ function buildLlmSystemPrompt(tradie, session = {}) {
   };
 
   const offScriptCount = Number(session.offScriptCount || 0);
+  const callerTone = session.detectedTone || "casual";
+  const toneInstruction = callerTone === "formal"
+    ? "The caller is speaking formally. Be professional, precise, use full sentences, avoid contractions."
+    : "The caller is casual. Be warm, conversational, use contractions, keep it natural and relaxed.";
   const abuseStrikes = Number(session.abuseStrikes || 0);
   const currentStep = session.step || "intent";
 
@@ -808,6 +813,12 @@ YOUR PERSONALITY:
 - Never say "I understand your frustration" — mirror their words instead
 - Never apologise more than once per call
 - Keep smalltalk_reply to 1-2 short sentences maximum
+
+TONE MATCHING:
+${toneInstruction}
+Never use a tone that conflicts with how the caller is speaking.
+If caller uses formal language like "I would like to enquire" match that register.
+If caller is casual like "yeah mate" or "heaps good" match that energy.
 
 OFF-SCRIPT TECHNIQUE:
 When caller is angry or upset:
@@ -849,8 +860,19 @@ OUTPUT FORMAT — respond ONLY with valid JSON, no markdown, no text outside JSO
   "emotion": "neutral" | "angry" | "confused" | "urgent" | "upset" | "rambling",
   "off_script": boolean,
   "smalltalk_reply": string|null,
+  "suggested_step": "intent"|"job"|"address"|"name"|"access"|"time"|"confirm",
+  "urgency_score": number from 1 to 10,
   "next_question": string
-}`;
+}
+
+URGENCY SCORING GUIDE:
+Rate every call from 1 to 10:
+1-3: General enquiry, future booking, quote request
+4-6: Needs booking this week, some inconvenience mentioned
+7-8: Urgent job, significant problem, customer stressed
+9-10: Emergency — burst pipe, gas leak, flooding, no power,
+      fire risk, sewage, sparking, customer in crisis
+Always include urgency_score in your JSON response.`;
 }
 
 /**
@@ -938,6 +960,37 @@ async function callLlm(tradie, session, userSpeech) {
 
     if (parsed.off_script) {
       session.offScriptCount = Number(session.offScriptCount || 0) + 1;
+    }
+
+    // Detect caller tone from speech
+    const formalSignals = /\b(would like|I wish to|enquire|regarding|furthermore|I require|please advise)\b/i;
+    if (formalSignals.test(String(userSpeech || ""))) {
+      session.detectedTone = "formal";
+    } else if (!session.detectedTone || session.detectedTone === "casual") {
+      session.detectedTone = "casual";
+    }
+
+    // Process urgency score
+    if (typeof parsed.urgency_score === "number") {
+      session.urgencyScore = parsed.urgency_score;
+      if (parsed.urgency_score >= 8 && !session.urgencyAlertSent) {
+        session.urgencyAlertSent = true;
+        const capturedKey = session.tradieKey || "";
+        const capturedFrom = session.from || "";
+        const capturedJob = session.job || "unknown";
+        const capturedAddress = session.address || "unknown";
+        const score = parsed.urgency_score;
+        (async () => {
+          try {
+            const t = await getTradieConfig({ query: { tid: capturedKey }, body: {} });
+            if (t) {
+              await sendOwnerSms(t,
+                `🚨 URGENT CALL (${score}/10)\nCaller: ${capturedFrom}\nJob: ${capturedJob}\nAddress: ${capturedAddress}\nAnswer ASAP.`
+              ).catch(() => {});
+            }
+          } catch {}
+        })();
+      }
     }
     if (parsed.emotion && parsed.emotion !== "neutral") {
       session.lastEmotion = parsed.emotion;
@@ -2538,7 +2591,45 @@ const processSpeechLocks = new Map();
 function cleanupMaps() {
   const now = Date.now();
   for (const [sid, data] of sessions.entries()) {
-    if (!data?.updatedAt || (now - data.updatedAt) > SESSION_TTL_MS) sessions.delete(sid);
+    if (!data?.updatedAt || (now - data.updatedAt) > SESSION_TTL_MS) {
+      // Send recovery SMS if call had data but never completed
+      if (
+        data &&
+        data.from &&
+        !data.bookingConfirmed &&
+        !data.recoverySMSSent &&
+        (data.job || data.address || data.name)
+      ) {
+        data.recoverySMSSent = true;
+        const capturedKey = data.tradieKey || "";
+        const capturedFrom = data.from || "";
+        const capturedJob = data.job || "";
+        const capturedAddress = data.address || "";
+        const capturedName = data.name || "";
+        // Fire and forget — never await in cleanup
+        (async () => {
+          try {
+            const t = await getTradieConfig({ query: { tid: capturedKey }, body: {} });
+            if (!t || !t.twilioNumber) return;
+            const collected = [
+              capturedJob ? `Job: ${capturedJob}` : "",
+              capturedAddress ? `Address: ${capturedAddress}` : "",
+              capturedName ? `Name: ${capturedName}` : ""
+            ].filter(Boolean).join(", ");
+            await sendCustomerSms(
+              t,
+              capturedFrom,
+              `Hi${capturedName ? " " + capturedName : ""} — looks like we got cut off. We had: ${collected}. Call us back on ${t.twilioNumber} to complete your booking.`
+            ).catch(() => {});
+            await sendOwnerSms(
+              t,
+              `⚠️ INCOMPLETE BOOKING\nCaller: ${capturedFrom}\n${collected}\nCall dropped before confirmation.`
+            ).catch(() => {});
+          } catch {}
+        })();
+      }
+      sessions.delete(sid);
+    }
   }
   for (const [key, exp] of processSpeechLocks.entries()) {
     if (!exp || now > exp) processSpeechLocks.delete(key);
@@ -2585,6 +2676,14 @@ function getSession(callSid, fromNumber = "") {
       confirmPromptSent: false,
 
       lastTwimlXml: null,
+      totalFailedAttempts: 0,
+      transferredToOwner: false,
+      bookingConfirmed: false,
+      recoverySMSSent: false,
+      tradieKey: "",
+      urgencyScore: 0,
+      urgencyAlertSent: false,
+      detectedTone: "casual",
 
       accessEditMode: "replace"
     });
@@ -2650,7 +2749,7 @@ function voiceActionUrl(req) {
   return "/process" + (req.query.tid ? `?tid=${encodeURIComponent(req.query.tid)}` : "");
 }
 
-function buildInitialVoiceTwiml(req, greetingText = "Hi, what do you need help with today?") {
+function buildInitialVoiceTwiml(req, greetingText = "Hi, what do you need help with today?", tradie = {}) {
   const twiml = new VoiceResponse();
   const gather = twiml.gather({
     input: "speech",
@@ -2661,14 +2760,23 @@ function buildInitialVoiceTwiml(req, greetingText = "Hi, what do you need help w
     language: "en-AU",
     speechModel: "phone_call",
     enhanced: true,
-    hints: "plumber, electrician, carpenter, tiler, painter, roofer, concreter, fencer, landscaper, handyman, air conditioning, hot water, blocked drain, leaking tap, leaking roof, broken pipe, no hot water, burst pipe, gas leak, rewire, switchboard, deck, pergola, bathroom, kitchen, quote, urgent, emergency, yes, no, confirm, cancel, reschedule, Monday, Tuesday, Wednesday, Thursday, Friday, Saturday, Sunday, morning, afternoon, today, tomorrow, next week, Street, Road, Avenue, Drive, Close, Court, Place, Lane, Crescent, Boulevard, Way"
+    hints: buildSpeechHints(tradie)
   });
   gather.say(greetingText, { voice: "Polly.Amy", language: "en-AU" });
   return twiml;
 }
 
 function handleVoiceEntry(req, res) {
-  const twiml = buildInitialVoiceTwiml(req);
+  const rawTradie = req._tradieConfig || {};
+  const bizName = rawTradie?.bizName || "";
+  const botName = rawTradie?.botName || "Alex";
+  let greeting;
+  if (bizName) {
+    greeting = `Hi, thanks for calling ${bizName}. This is ${botName}. What do you need help with today?`;
+  } else {
+    greeting = `Hi, what do you need help with today?`;
+  }
+  const twiml = buildInitialVoiceTwiml(req, greeting, rawTradie);
   const callSid = resolveCallSid(req);
   const fromNumber = (req.body?.From || req.query?.From || "").trim();
   const session = getSession(callSid, fromNumber);
@@ -2681,6 +2789,40 @@ function handleVoiceEntry(req, res) {
   return sendVoiceTwiml(res, twiml);
 }
 
+function buildSpeechHints(tradie) {
+  const base = "yes, no, confirm, cancel, reschedule, Monday, Tuesday, Wednesday, Thursday, Friday, Saturday, Sunday, morning, afternoon, today, tomorrow, next week, Street, Road, Avenue, Drive, Close, Court, Place, Lane, Crescent, Boulevard, Way, urgent, emergency, none, quote";
+
+  const services = String(tradie?.services || tradie?.tone || "").toLowerCase();
+  const bizName = String(tradie?.bizName || "").toLowerCase();
+  const combined = services + " " + bizName;
+
+  const plumbing = "plumber, plumbing, blocked drain, leaking tap, burst pipe, hot water, gas leak, toilet, sink, tap, pipe, sewage, overflow, cistern, valve, flexi hose, water heater";
+  const electrical = "electrician, electrical, rewire, switchboard, power point, light fitting, circuit breaker, safety switch, no power, sparking, short circuit, LED downlight, smoke alarm";
+  const building = "builder, carpenter, deck, pergola, fence, fencing, retaining wall, cladding, framing, structural, renovation, extension";
+  const tiling = "tiler, tiling, tiles, bathroom, kitchen splashback, grout, waterproofing, wall tiles, floor tiles";
+  const painting = "painter, painting, interior, exterior, render, texture coat, feature wall, touch up";
+  const roofing = "roofer, roofing, leaking roof, gutter, downpipe, ridge cap, fascia, soffit, colorbond, terracotta";
+  const aircon = "air conditioning, aircon, split system, ducted, reverse cycle, gas heater, evaporative, service, regas, not cooling, not heating";
+  const landscaping = "landscaper, landscaping, lawn, turf, retaining wall, garden bed, irrigation, mulch, instant lawn, tree removal, stump grinding";
+  const concreting = "concreter, concreting, driveway, slab, path, footpath, exposed aggregate, reinforced";
+
+  let hints = base;
+  if (!combined.trim() || combined.trim().length < 3) {
+    hints += ", " + plumbing + ", " + electrical + ", " + building;
+  } else {
+    if (/plumb|drain|pipe|tap|water|gas/.test(combined)) hints += ", " + plumbing;
+    if (/electr|power|light|switch|wire/.test(combined)) hints += ", " + electrical;
+    if (/build|carp|deck|fence|pergola|renov/.test(combined)) hints += ", " + building;
+    if (/tile|tiling|bathroom|kitchen/.test(combined)) hints += ", " + tiling;
+    if (/paint/.test(combined)) hints += ", " + painting;
+    if (/roof|gutter/.test(combined)) hints += ", " + roofing;
+    if (/air|aircon|hvac|heat|cool/.test(combined)) hints += ", " + aircon;
+    if (/landscap|lawn|garden|turf/.test(combined)) hints += ", " + landscaping;
+    if (/concret|driv|slab|path/.test(combined)) hints += ", " + concreting;
+  }
+  return hints;
+}
+
 function ask(twiml, prompt, actionUrl, options = {}) {
   const gather = twiml.gather({
     input: "speech",
@@ -2691,7 +2833,7 @@ function ask(twiml, prompt, actionUrl, options = {}) {
     timeout: VOICE_GATHER_TIMEOUT_SECONDS,
     speechModel: "phone_call",
     enhanced: true,
-    hints: "plumber, electrician, carpenter, tiler, painter, roofer, concreter, fencer, landscaper, handyman, air conditioning, hot water, blocked drain, leaking tap, leaking roof, broken pipe, no hot water, burst pipe, gas leak, rewire, switchboard, deck, pergola, bathroom, kitchen, quote, urgent, emergency, yes, no, confirm, cancel, reschedule, Monday, Tuesday, Wednesday, Thursday, Friday, Saturday, Sunday, morning, afternoon, today, tomorrow, next week, Street, Road, Avenue, Drive, Close, Court, Place, Lane, Crescent, Boulevard, Way",
+    hints: buildSpeechHints(typeof tradie !== "undefined" ? tradie : {}),
     ...options
   });
 
@@ -2721,7 +2863,36 @@ function incrementRetryCountForStep(session, step) {
   return session.retryCountByStep[step];
 }
 
-function repeatLastStepPrompt(req, twiml, session, step, reason = "NO_SPEECH") {
+async function repeatLastStepPrompt(req, res, twiml, session, step, reason = "NO_SPEECH", tradie = {}) {
+  // Increment total failed attempts across entire call
+  session.totalFailedAttempts = Number(session.totalFailedAttempts || 0) + 1;
+
+  // After 7 total failures transfer to owner number
+  if (session.totalFailedAttempts >= 7 && !session.transferredToOwner) {
+    session.transferredToOwner = true;
+    const ownerNumber = tradie?.ownerSmsTo || process.env.OWNER_SMS_TO || "";
+    if (ownerNumber) {
+      console.log(`TRANSFER_TO_OWNER after 7 failed attempts owner=${ownerNumber}`);
+      try {
+        await sendOwnerSms(tradie,
+          `📞 CALL TRANSFER\nCaller ${session.from || "unknown"} could not be understood after 7 attempts.\nJob hint: ${session.job || "unknown"}`
+        );
+      } catch {}
+      const transferTwiml = new VoiceResponse();
+      transferTwiml.say(
+        "No worries — let me get someone on the line for you right now.",
+        { voice: "Polly.Amy", language: "en-AU" }
+      );
+      const dial = transferTwiml.dial({ timeout: 30, callerId: req.body?.To || "" });
+      dial.number(ownerNumber);
+      transferTwiml.say(
+        "Sorry we missed you — please call back and we will get you sorted.",
+        { voice: "Polly.Amy", language: "en-AU" }
+      );
+      res.type("text/xml").send(transferTwiml.toString());
+      return { handled: true, transferred: true };
+    }
+  }
   const retryCount = incrementRetryCountForStep(session, step);
   const actionUrl = voiceActionUrl(req);
   const basePrompt = session.lastPrompt || "Could you repeat that?";
@@ -3650,6 +3821,7 @@ app.post("/process", async (req, res) => {
     const confidence = hasConfidence ? Number(confidenceRaw) : null;
 
     const session = getSession(callSid, fromNumber);
+    session.tradieKey = session.tradieKey || tradie.key;
 
     // state persistence: CallSid keyed session is authoritative for the current step
     const authoritativeStep = session.step || "intent";
@@ -3750,7 +3922,7 @@ app.post("/process", async (req, res) => {
       console.log(`NO_SPEECH_TIMEOUT TID=${tradie.key} CALLSID=${callSid} FROM=${fromNumber}`);
       session.silenceTries += 1;
       session.lastNoSpeechFallback = true;
-      const repeated = repeatLastStepPrompt(req, twiml, session, session.step, "NO_SPEECH");
+      const repeated = await repeatLastStepPrompt(req, res, twiml, session, session.step, "NO_SPEECH", tradie);
       if (repeated.shouldReset) resetSession(callSid);
       return sendVoiceTwiml(res, twiml);
     } else {
@@ -3794,7 +3966,7 @@ app.post("/process", async (req, res) => {
         return sendVoiceTwiml(res, twiml);
       }
 
-      const repeatedFallback = repeatLastStepPrompt(req, twiml, session, "sms_fallback_offer", speech ? "UNCLEAR" : "NO_SPEECH");
+      const repeatedFallback = await repeatLastStepPrompt(req, res, twiml, session, "sms_fallback_offer", speech ? "UNCLEAR" : "NO_SPEECH", tradie);
       return sendVoiceTwiml(res, twiml);
     }
 
@@ -4200,7 +4372,7 @@ app.post("/process", async (req, res) => {
       if (!speech || confirmConfidenceTooLow || !yn2) {
         const interpreted = !speech ? "NO_SPEECH" : (confirmConfidenceTooLow ? "UNCLEAR" : "UNCLEAR");
         console.log(`STEP=confirm speech='${speech}' interpreted='${interpreted}' retryCount=${getRetryCountForStep(session, "confirm") + 1}`);
-        const repeatedConfirm = repeatLastStepPrompt(req, twiml, session, "confirm", interpreted);
+        const repeatedConfirm = await repeatLastStepPrompt(req, res, twiml, session, "confirm", interpreted, tradie);
         if (repeatedConfirm.shouldReset) resetSession(callSid);
         return sendVoiceTwiml(res, twiml);
       }
@@ -4298,6 +4470,45 @@ ${historyLine}${memoryLine}${accessLine2}`.trim()).catch(() => {});
           session.from,
           `Booked: ${formatForVoice(startDt)} at ${session.address} for ${session.job}. Reply Y to confirm or N to reschedule.`
         ).catch(() => {});
+      }
+
+      session.bookingConfirmed = true;
+
+      // Generate one line AI summary and SMS to owner
+      if (llmReady()) {
+        (async () => {
+          try {
+            const summaryResp = await fetch("https://api.openai.com/v1/chat/completions", {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                Authorization: `Bearer ${OPENAI_API_KEY}`
+              },
+              body: JSON.stringify({
+                model: "gpt-4o",
+                max_tokens: 60,
+                temperature: 0.3,
+                messages: [
+                  {
+                    role: "system",
+                    content: "Summarise this trades booking in exactly one sentence under 20 words. Include job, address and time only. Be concise."
+                  },
+                  {
+                    role: "user",
+                    content: `Job: ${session.job}. Address: ${session.address}. Name: ${session.name}. Time: ${session.time}. Urgency: ${session.urgencyScore || 1}/10.`
+                  }
+                ]
+              })
+            });
+            if (summaryResp.ok) {
+              const sd = await summaryResp.json();
+              const summaryLine = sd?.choices?.[0]?.message?.content?.trim() || "";
+              if (summaryLine) {
+                await sendOwnerSms(tradie, `📋 CALL SUMMARY: ${summaryLine}`).catch(() => {});
+              }
+            }
+          } catch {}
+        })();
       }
 
       const summaryJob = session.job || "your job";
@@ -4460,6 +4671,8 @@ ${nice}`).catch(() => {});
 app.post("/twilio/voice", async (req, res) => {
   try {
     if (!validateTwilioSignature(req)) return res.status(403).send("Forbidden");
+    const tradie = await getTradieConfig(req);
+    req._tradieConfig = tradie;
     return handleVoiceEntry(req, res);
   } catch (e) {
     console.error("/twilio/voice error", e);
