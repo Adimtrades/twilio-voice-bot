@@ -2820,6 +2820,14 @@ function getSession(callSid, fromNumber = "") {
       urgencyAlertSent: false,
       detectedTone: "casual",
       pendingStep: "",
+      unclearTurns: 0,
+      toneMode: "balanced",
+      memoryHooks: {
+        timePreference: "",
+        urgencyLevel: "",
+        emotionalStress: "",
+        budgetConcern: ""
+      },
 
       accessEditMode: "replace",
       callbackRequested: false
@@ -3267,6 +3275,140 @@ function detectIntent(text) {
   if (has(quote)) return "QUOTE";
   if (has(existing)) return "EXISTING_CUSTOMER";
   return "NEW_BOOKING";
+}
+
+function detectConversationState(text = "") {
+  const t = String(text || "").toLowerCase().trim();
+  const has = (arr) => arr.some((w) => t.includes(w));
+
+  const states = [];
+  if (!t) return { primaryState: "confusion", states: ["confusion"], offTopic: false };
+
+  if (has(["book", "booking", "come out", "send someone", "appointment", "slot", "available"])) states.push("booking_intent");
+  if (has(["too expensive", "too high", "cheaper", "price", "cost", "quote me better", "can't afford", "budget"])) states.push("price_objection");
+  if (has(["don't understand", "confused", "what do you mean", "not sure", "say that again", "unclear"])) states.push("confusion");
+  if (has(["asap", "right now", "urgent", "today", "immediately", "getting worse", "emergency"])) states.push("urgency");
+  if (has(["stressed", "overwhelmed", "anxious", "panicking", "really upset", "freaking out"])) states.push("emotional_distress");
+  if (has(["anyone else", "other company", "shopping around", "compare", "another quote", "another company quoted"])) states.push("comparison_shopping");
+  if (has(["listen", "just do it", "stop", "i need", "i want", "now", "don't waste my time"])) states.push("dominant_customer");
+  if (has(["whatever works", "you decide", "not sure", "i guess", "anything is fine", "up to you"])) states.push("passive_customer");
+  if (has(["exactly", "itemise", "breakdown", "how long", "process", "warranty", "steps"])) states.push("analytical_customer");
+  if (has(["are you real", "can i trust", "do you actually", "licensed", "insured", "prove", "who are you"])) states.push("trust_testing");
+
+  const isStory = t.split(/\s+/).filter(Boolean).length > 22 && has(["then", "after that", "last week", "my partner", "my neighbour", "anyway"]);
+  if (isStory) states.push("ranting_storytelling");
+
+  const priority = [
+    "emotional_distress", "urgency", "price_objection", "trust_testing", "comparison_shopping",
+    "dominant_customer", "analytical_customer", "passive_customer", "ranting_storytelling", "booking_intent", "confusion"
+  ];
+  const primaryState = priority.find((state) => states.includes(state)) || "confusion";
+  const offTopic = states.includes("ranting_storytelling") && !states.includes("booking_intent");
+  return { primaryState, states: states.length ? states : ["confusion"], offTopic };
+}
+
+function loss_aversion_line() {
+  return "If we leave it too long, this can become more costly to fix.";
+}
+
+function social_proof_line() {
+  return "We handle this type of issue often.";
+}
+
+function authority_recommendation_line() {
+  return "Best next step is to lock a time and inspect it properly.";
+}
+
+function scarcity_line() {
+  return "Today is filling quickly, so securing a slot now is safest.";
+}
+
+function micro_commitment_question() {
+  return "Would morning or afternoon suit you better?";
+}
+
+function trust_reassurance_line() {
+  return pickRandom([
+    "We handle this type of issue often.",
+    "This will be quick to inspect.",
+    "We'll make this easy."
+  ]);
+}
+
+function toneModifierForState(session, detectedState) {
+  if (detectedState === "dominant_customer") return "concise";
+  if (detectedState === "emotional_distress") return "supportive";
+  if (detectedState === "analytical_customer") return "factual";
+  if (detectedState === "passive_customer") return "guiding";
+  return session?.toneMode || "balanced";
+}
+
+function updateConversationMemory(session, text, conversationState) {
+  if (!session) return;
+  session.memoryHooks = session.memoryHooks || {
+    timePreference: "",
+    urgencyLevel: "",
+    emotionalStress: "",
+    budgetConcern: ""
+  };
+
+  const t = String(text || "").toLowerCase();
+  if (/\b(morning|afternoon|before\s?noon|after\s?noon|after work|this evening|tonight)\b/.test(t)) {
+    session.memoryHooks.timePreference = RegExp.$1;
+  }
+  if (conversationState?.states?.includes("urgency")) session.memoryHooks.urgencyLevel = "high";
+  if (conversationState?.states?.includes("emotional_distress")) session.memoryHooks.emotionalStress = "high";
+  if (/\b(budget|can't afford|too expensive|cheap|cheaper|price)\b/.test(t)) session.memoryHooks.budgetConcern = "high";
+}
+
+function buildTaskControlPrompt(session, step) {
+  if (step === "job") return "What job do you need help with?";
+  if (step === "address" || step === "address_confirm") return "What is the address for the job?";
+  if (step === "name") return "What name should I put the booking under?";
+  if (step === "access") return "Any access notes like gate code, parking, or pets?";
+  if (step === "time" || step === "pickSlot") {
+    if (session?.memoryHooks?.timePreference) return `Noted ${session.memoryHooks.timePreference}. ${micro_commitment_question()}`;
+    return micro_commitment_question();
+  }
+  if (step === "confirm") return "Does that all sound right so we can lock this in?";
+  return "What do you need help with today?";
+}
+
+function buildOffTopicRecoveryResponse(session, conversationState, step) {
+  const reaction = conversationState.primaryState === "emotional_distress"
+    ? "That sounds stressful."
+    : "I hear you.";
+  const controlPrompt = buildTaskControlPrompt(session, step);
+  return `${reaction} ${trust_reassurance_line()} Let's get this sorted — ${controlPrompt}`.trim();
+}
+
+function composeAdaptivePrompt(session, basePrompt, conversationState, step) {
+  const raw = String(basePrompt || "").trim();
+  if (!raw) return raw;
+
+  const state = conversationState?.primaryState || "confusion";
+  const toneMode = toneModifierForState(session, state);
+  session.toneMode = toneMode;
+
+  const prefix = toneMode === "concise"
+    ? "Understood."
+    : toneMode === "supportive"
+      ? "You're doing the right thing by calling."
+      : toneMode === "factual"
+        ? "Just to confirm details clearly."
+        : toneMode === "guiding"
+          ? "No worries, I'll guide this step by step."
+          : getAffirmation(session);
+
+  const inserts = [];
+  if (state === "price_objection") inserts.push(loss_aversion_line(), authority_recommendation_line());
+  if (state === "comparison_shopping") inserts.push(social_proof_line());
+  if (state === "urgency") inserts.push(scarcity_line());
+  if (state === "trust_testing") inserts.push(trust_reassurance_line());
+  if (state === "analytical_customer" && step === "confirm") inserts.push("Just to confirm —");
+
+  const joiner = inserts.length ? `${inserts.join(" ")} ` : "";
+  return `${prefix} ${joiner}${raw}`.replace(/\s+/g, " ").trim();
 }
 
 // 
@@ -4239,6 +4381,9 @@ app.post("/process", async (req, res) => {
 
     const session = getSession(callSid, fromNumber);
     session.tradieKey = session.tradieKey || tradie.key;
+    const conversationState = detectConversationState(speech || "");
+    updateConversationMemory(session, speech, conversationState);
+    session.conversationState = conversationState;
 
     // state persistence: CallSid keyed session is authoritative for the current step
     const authoritativeStep = session.step || "intent";
@@ -4354,8 +4499,25 @@ app.post("/process", async (req, res) => {
     if (speech && isLowConfidence(confidence)) {
       const currentStep = session.step || "intent";
       console.log(`LOW_CONFIDENCE TID=${tradie.key} CALLSID=${callSid} STEP=${currentStep} confidence=${confidence}`);
+      session.unclearTurns = Number(session.unclearTurns || 0) + 1;
       session.lastPrompt = "Sorry, I didn’t quite catch that. Please say it again.";
       ask(twiml, session.lastPrompt, voiceActionUrl(req), { input: "speech", timeout: 6, speechTimeout: "auto" });
+      return sendVoiceTwiml(res, twiml);
+    }
+
+    if (!speech || conversationState.primaryState === "confusion") {
+      session.unclearTurns = Number(session.unclearTurns || 0) + 1;
+    } else {
+      session.unclearTurns = 0;
+    }
+
+    if (session.unclearTurns >= 3) {
+      session.unclearTurns = 0;
+      const controlPrompt = "Let's get a time secured first so this doesn't get worse. " + micro_commitment_question();
+      session.step = "time";
+      session.lastPrompt = controlPrompt;
+      addToHistory(session, "assistant", controlPrompt);
+      ask(twiml, controlPrompt, voiceActionUrl(req), { input: "speech", timeout: 7, speechTimeout: "auto" });
       return sendVoiceTwiml(res, twiml);
     }
 
@@ -4430,6 +4592,24 @@ app.post("/process", async (req, res) => {
       !!speech &&
       isOffScript &&
       !["confirm", "pickSlot", "intent", "initial"].includes(session.step);
+
+    if (speech && (conversationState.offTopic || conversationState.primaryState === "ranting_storytelling" || conversationState.primaryState === "emotional_distress")) {
+      const recoveryPrompt = buildOffTopicRecoveryResponse(session, conversationState, session.step || "intent");
+      const controlledPrompt = composeAdaptivePrompt(session, recoveryPrompt, conversationState, session.step || "intent");
+      session.lastPrompt = controlledPrompt;
+      addToHistory(session, "assistant", controlledPrompt);
+      ask(twiml, controlledPrompt, voiceActionUrl(req), { input: "speech", timeout: 7, speechTimeout: "auto" });
+      return sendVoiceTwiml(res, twiml);
+    }
+
+    if (speech && ["price_objection", "comparison_shopping", "trust_testing", "dominant_customer", "analytical_customer", "passive_customer", "urgency"].includes(conversationState.primaryState)) {
+      const controlPrompt = buildTaskControlPrompt(session, session.step || "intent");
+      const adapted = composeAdaptivePrompt(session, controlPrompt, conversationState, session.step || "intent");
+      session.lastPrompt = adapted;
+      addToHistory(session, "assistant", adapted);
+      ask(twiml, adapted, voiceActionUrl(req), { input: "speech", timeout: 7, speechTimeout: "auto" });
+      return sendVoiceTwiml(res, twiml);
+    }
 
     if (shouldUseLlm) {
       session.llmTurns += 1;
