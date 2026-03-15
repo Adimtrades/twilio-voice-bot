@@ -28,7 +28,7 @@
 // REQUIRE_TWILIO_SIG=false,
 // LLM_ENABLED=false, OPENAI_API_KEY, LLM_BASE_URL, LLM_MODEL
 // GOOGLE_SERVICE_JSON, GOOGLE_SERVICE_JSON_FILE, GOOGLE_APPLICATION_CREDENTIALS
-// ADMIN_DASH_PASSWORD
+// ADMIN_DASH_PASSWORD, ADMIN_ALERT_NUMBER
 
 try { require("dotenv").config(); } catch {}
 const express = require("express");
@@ -2241,6 +2241,21 @@ app.post("/stripe/webhook", express.raw({ type: "application/json" }), async (re
     }
 
     console.log("stripe webhook received", { eventType: event.type, eventId: event.id });
+
+    // Dedup — skip if same event processed within last 60 seconds
+    const eventNow = Date.now();
+    const lastSeen = processedStripeEvents.get(event.id);
+    if (lastSeen && (eventNow - lastSeen) < 60000) {
+      console.log(`STRIPE_WEBHOOK_DEDUP skipped eventId=${event.id}`);
+      return res.json({ received: true, deduped: true });
+    }
+    processedStripeEvents.set(event.id, eventNow);
+    // Cleanup old entries every 100 events
+    if (processedStripeEvents.size > 100) {
+      for (const [eid, ts] of processedStripeEvents.entries()) {
+        if (eventNow - ts > 120000) processedStripeEvents.delete(eid);
+      }
+    }
     const stripeObj = event.data.object || {};
 
     if (event.type === "checkout.session.completed") {
@@ -2459,6 +2474,7 @@ app.post("/stripe/webhook", express.raw({ type: "application/json" }), async (re
     return res.json({ received: true });
   } catch (e) {
     console.error("stripe webhook error", e);
+    trackError("Stripe webhook");
     return res.status(500).send("Server error");
   }
 });
@@ -2656,9 +2672,53 @@ const sessions = new Map();
 // In-memory caller blacklist — persists for life of server process
 // Owner SMSes "BLOCK +61xxxxxxxxx" to add, "UNBLOCK +61xxxxxxxxx" to remove
 const callerBlacklist = new Map(); // key: "tradieKey::phoneNumber" -> true
+// Stripe webhook dedup — prevent double processing within 60 seconds
+const processedStripeEvents = new Map(); // eventId -> timestamp
+// Error rate monitoring — alert if more than 10 errors in one hour
+const errorRateTracker = { count: 0, windowStart: Date.now(), alerted: false };
+
+function trackError(context = "") {
+  const now = Date.now();
+  // Reset window every hour
+  if (now - errorRateTracker.windowStart > 60 * 60 * 1000) {
+    errorRateTracker.count = 0;
+    errorRateTracker.windowStart = now;
+    errorRateTracker.alerted = false;
+  }
+  errorRateTracker.count += 1;
+  if (errorRateTracker.count >= 10 && !errorRateTracker.alerted) {
+    errorRateTracker.alerted = true;
+    const alertBody = `🚨 ERROR SPIKE: ${errorRateTracker.count} errors in the last hour on your AI booking bot. Context: ${context || "unknown"}. Check Render logs.`;
+    // Fire and forget
+    (async () => {
+      try {
+        await sendSms({
+          from: process.env.TWILIO_SMS_FROM || "",
+          to: process.env.ADMIN_ALERT_NUMBER || "",
+          body: alertBody
+        });
+        // Also send email
+        if (typeof sendTradieEmail === "function") {
+          await sendTradieEmail(
+            "adimtrades@gmail.com",
+            "🚨 Bot Error Spike Alert",
+            alertBody,
+            `<p>${alertBody}</p>`
+          ).catch(() => {});
+        }
+      } catch {}
+    })();
+  }
+}
 const processSpeechLocks = new Map();
 
 function cleanupMaps() {
+  // Cap sessions at 500 — evict oldest first to prevent memory leak
+  if (sessions.size > 500) {
+    const sorted = [...sessions.entries()].sort((a, b) => (a[1].updatedAt || 0) - (b[1].updatedAt || 0));
+    const toDelete = sorted.slice(0, sessions.size - 500);
+    for (const [sid] of toDelete) sessions.delete(sid);
+  }
   const now = Date.now();
   for (const [sid, data] of sessions.entries()) {
     if (!data?.updatedAt || (now - data.updatedAt) > SESSION_TTL_MS) {
@@ -2744,9 +2804,13 @@ function getSession(callSid, fromNumber = "") {
       lastEmotion: "neutral",
       calendarCheckAnnounced: false,
       confirmPromptSent: false,
-      _usedAffirmations: [],
 
       lastTwimlXml: null,
+      _usedAffirmations: [],
+      addressConfirmed: false,
+      addressReadBack: false,
+      suburb: "",
+      bookingRef: "",
       totalFailedAttempts: 0,
       transferredToOwner: false,
       bookingConfirmed: false,
@@ -2755,10 +2819,7 @@ function getSession(callSid, fromNumber = "") {
       urgencyScore: 0,
       urgencyAlertSent: false,
       detectedTone: "casual",
-      addressConfirmed: false,
       pendingStep: "",
-      suburb: "",
-      addressReadBack: false,
 
       accessEditMode: "replace",
       callbackRequested: false
@@ -2850,9 +2911,16 @@ function handleVoiceEntry(req, res) {
   const timeGreeting = getTimeOfDayGreeting(tradieTimezone);
   const isHoliday = isAustralianPublicHoliday(tradieTimezone);
   const holidayNote = isHoliday ? " Hope you are enjoying the public holiday." : "";
-  const greeting = bizName
-    ? `${timeGreeting}, thanks for calling ${bizName}. This is ${botName}.${holidayNote} What do you need help with today?`
-    : `${timeGreeting}.${holidayNote} What do you need help with today?`;
+  let greeting;
+  if (typeof isReturning !== "undefined" && isReturning && returningName && bizName) {
+    greeting = `${timeGreeting} ${returningName}, welcome back to ${bizName}.${holidayNote} What do you need help with today?`;
+  } else if (typeof isReturning !== "undefined" && isReturning && returningName) {
+    greeting = `${timeGreeting} ${returningName}, good to hear from you again.${holidayNote} What do you need help with today?`;
+  } else if (bizName) {
+    greeting = `${timeGreeting}, thanks for calling ${bizName}. This is ${botName}.${holidayNote} What do you need help with today?`;
+  } else {
+    greeting = `${timeGreeting}.${holidayNote} What do you need help with today?`;
+  }
   const twiml = buildInitialVoiceTwiml(req, greeting, rawTradie);
   const callSid = resolveCallSid(req);
   const fromNumber = (req.body?.From || req.query?.From || "").trim();
@@ -3305,12 +3373,122 @@ function normaliseAussieSlang(text, tz) {
   return t;
 }
 
+function wrapSsml(text, rate = "medium", pitch = "medium") {
+  return `<speak><prosody rate="${rate}" pitch="${pitch}">${text}</prosody></speak>`;
+}
+
+function saySlowly(twiml, text) {
+  twiml.say({ voice: "Polly.Amy", language: "en-AU" }, wrapSsml(text, "slow", "low"));
+}
+
+function sayWarm(twiml, text) {
+  twiml.say({ voice: "Polly.Amy", language: "en-AU" }, wrapSsml(text, "medium", "medium"));
+}
+
+function pickRandom(arr) {
+  if (!Array.isArray(arr) || arr.length === 0) return "";
+  return arr[Math.floor(Math.random() * arr.length)];
+}
+
+function getAffirmation(session) {
+  const used = Array.isArray(session._usedAffirmations) ? session._usedAffirmations : [];
+  const all = [
+    "Perfect.", "Got it.", "Lovely.", "No worries.", "Brilliant.",
+    "Good one.", "Great stuff.", "Noted.", "Wonderful.", "Sounds good."
+  ];
+  const available = all.filter(a => !used.includes(a));
+  const pool = available.length > 0 ? available : all;
+  const pick = pickRandom(pool);
+  session._usedAffirmations = [...used.slice(-4), pick];
+  return pick;
+}
+
+function getTimeOfDayGreeting(tz) {
+  const hour = DateTime.now().setZone(tz || "Australia/Sydney").hour;
+  if (hour < 12) return "Good morning";
+  if (hour < 17) return "Good afternoon";
+  return "Thanks for calling this evening";
+}
+
+function getJobEmpathy(job) {
+  const j = String(job || "").toLowerCase();
+  if (/burst pipe|flooding|gas leak|sparking|no power|emergency/.test(j))
+    return "Oh no — let us get that sorted fast.";
+  if (/blocked drain|blocked toilet|overflow/.test(j))
+    return "That is never fun — let us get someone out.";
+  if (/no hot water|hot water/.test(j))
+    return "No hot water is rough — let us fix that quickly.";
+  if (/broken|not working|damaged/.test(j))
+    return "That sounds frustrating — let us get it sorted.";
+  return "";
+}
+
+function getCalendarWaitMessage() {
+  return pickRandom([
+    "Just checking the calendar — won't be a moment.",
+    "Bear with me one sec while I check availability.",
+    "Let me just pull up the calendar for you.",
+    "One moment — just checking that now.",
+    "Just a sec — looking at availability."
+  ]);
+}
+
+function isAustralianPublicHoliday(tz) {
+  const now = DateTime.now().setZone(tz || "Australia/Sydney");
+  const m = now.month;
+  const d = now.day;
+  const fixed = [[1,1],[1,26],[4,25],[12,25],[12,26]];
+  return fixed.some(([fm, fd]) => fm === m && fd === d);
+}
+
+function normaliseSpokenNumber(text) {
+  if (!text) return text;
+  const map = {
+    zero:"0",one:"1",two:"2",three:"3",four:"4",five:"5",six:"6",
+    seven:"7",eight:"8",nine:"9",ten:"10",eleven:"11",twelve:"12",
+    thirteen:"13",fourteen:"14",fifteen:"15",sixteen:"16",seventeen:"17",
+    eighteen:"18",nineteen:"19",twenty:"20",thirty:"30",forty:"40",
+    fifty:"50",sixty:"60",seventy:"70",eighty:"80",ninety:"90"
+  };
+  let t = String(text).toLowerCase();
+  for (const [w, n] of Object.entries(map)) {
+    t = t.replace(new RegExp(`\b${w}\b`, "g"), n);
+  }
+  return t;
+}
+
+function normaliseAussieSlang(text) {
+  if (!text) return text;
+  let t = String(text).toLowerCase();
+  t = t.replace(/\bthis arvo\b/g, "this afternoon");
+  t = t.replace(/\barvo\b/g,      "afternoon");
+  t = t.replace(/\barvie\b/g,     "afternoon");
+  t = t.replace(/\bsmoko\b/g,     "10am");
+  t = t.replace(/\btomoz\b/g,     "tomorrow");
+  t = t.replace(/\bhalf two\b/g,  "2:30pm");
+  t = t.replace(/\bhalf three\b/g,"3:30pm");
+  t = t.replace(/\bhalf four\b/g, "4:30pm");
+  t = t.replace(/\bhalf five\b/g, "5:30pm");
+  t = t.replace(/\bhalf six\b/g,  "6:30pm");
+  t = t.replace(/\bhalf seven\b/g,"7:30am");
+  t = t.replace(/\bhalf eight\b/g,"8:30am");
+  t = t.replace(/\bhalf nine\b/g, "9:30am");
+  t = t.replace(/\bhalf ten\b/g,  "10:30am");
+  t = t.replace(/\bhalf eleven\b/g,"11:30am");
+  t = t.replace(/\bhalf twelve\b/g,"12:30pm");
+  return t;
+}
+
+function generateBookingRef() {
+  return Math.random().toString(36).substring(2, 8).toUpperCase();
+}
+
 function normalizeTimeText(text, tz) {
   if (!text) return "";
   let t = String(text).toLowerCase().trim();
 
   // Normalise Australian slang and spoken numbers first
-  t = normaliseAussieSlang(t, tz);
+  t = normaliseAussieSlang(t);
   t = normaliseSpokenNumber(t);
 
   t = t.replace(/\b(\d{1,2})\s*:\s*(\d{2})\s*p\.?\s*m\.?\b/g, "$1:$2pm");
@@ -3328,6 +3506,14 @@ function normalizeTimeText(text, tz) {
     const d = now.toFormat("cccc d LLL yyyy");
     t = t.replace("today", d);
   }
+
+  // If text contains a day name but no time, default to 9am
+  const dayOnly = /\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday|next week|tomorrow)\b/i.test(t);
+  const hasTime = /\b\d{1,2}(:\d{2})?\s*(am|pm)\b|\b(morning|afternoon|evening|midday|noon|midnight)\b/i.test(t);
+  if (dayOnly && !hasTime) {
+    t = t + " at 9am";
+  }
+
   return t;
 }
 
@@ -3517,7 +3703,12 @@ function trySlotFill(session, speech, tz) {
     session.accessNote = session.accessNote || raw;
   }
 
-  if (!session.job && /(leak|blocked|hot water|air con|heater|toilet|sink|tap|power|switch|deck|til(e|es)|fence|roof|gutter|drain)/i.test(raw)) {
+  // Multi job capture — join both if caller mentions two jobs
+  const jobPattern = /(leak|blocked|hot water|air con|heater|toilet|sink|tap|power|switch|deck|tile|tiles|fence|roof|gutter|drain|pipe|painting|electrical|plumbing)/gi;
+  const jobMatches = raw.match(jobPattern);
+  if (!session.job && jobMatches && jobMatches.length >= 2) {
+    session.job = raw;
+  } else if (!session.job && jobMatches && jobMatches.length === 1) {
     session.job = raw;
   }
 }
@@ -4019,7 +4210,9 @@ app.post("/process", async (req, res) => {
           `🌙 AFTER HOURS CALL\nCaller: ${afterHoursFrom}\nTime: ${nowForHours.toFormat("HH:mm")} (${tradie.timezone || "AEST"})\nBot is still attempting to take the booking.`
         ).catch(() => {});
       } catch {}
-      // Do NOT hang up — bot continues to take the booking after hours
+      // Store flag so confirm step can add reassurance message
+      req._isAfterHours = true;
+      // Do NOT hang up — let bot continue to take booking after hours
     }
 
     const tz = tradie.timezone;
@@ -4324,10 +4517,10 @@ app.post("/process", async (req, res) => {
     if (session.step === "intent") {
       // If job was already captured in initial step skip straight to address
       if (session.job) {
-        const jobEmpathy = getJobEmpathy(session.job);
-        const affirmJob = jobEmpathy || getAffirmation(session);
+        const jeIntent = getJobEmpathy(session.job);
+        const affIntent = jeIntent || getAffirmation(session);
         session.step = "address";
-        session.lastPrompt = `${affirmJob} And whereabouts is the job? What is the address?`;
+        session.lastPrompt = `${affIntent} And whereabouts is the job? What is the address?`;
         addToHistory(session, "assistant", session.lastPrompt);
         ask(twiml, session.lastPrompt, actionUrl);
         return sendVoiceTwiml(res, twiml);
@@ -4388,10 +4581,10 @@ app.post("/process", async (req, res) => {
         return sendVoiceTwiml(res, twiml);
       }
 
-      const jobEmpathy2 = getJobEmpathy(session.job);
-      const affirmJob2 = jobEmpathy2 || getAffirmation(session);
+      const jeJob = getJobEmpathy(session.job);
+      const affJob = jeJob || getAffirmation(session);
       session.step = "address";
-      session.lastPrompt = `${affirmJob2} And whereabouts is the job? What is the full address?`;
+      session.lastPrompt = `${affJob} And whereabouts is the job? What is the full address?`;
       addToHistory(session, "assistant", session.lastPrompt);
       ask(twiml, session.lastPrompt, actionUrl);
       return sendVoiceTwiml(res, twiml);
@@ -4490,9 +4683,10 @@ app.post("/process", async (req, res) => {
         return sendVoiceTwiml(res, twiml);
       }
 
-      const affirmName = getAffirmation(session);
+      const affName = getAffirmation(session);
+      const firstName = session.name ? session.name.split(" ")[0] : "";
       session.step = "access";
-      session.lastPrompt = `${affirmName} ${session.name ? session.name + " — " : ""}any access notes like a gate code, parking, or pets? Just say none if not.`;
+      session.lastPrompt = `${affName}${firstName ? " " + firstName + " —" : ""} any access notes like a gate code, parking, or pets? Just say none if not.`;
       addToHistory(session, "assistant", session.lastPrompt);
       ask(twiml, session.lastPrompt, actionUrl);
       return sendVoiceTwiml(res, twiml);
@@ -4531,9 +4725,9 @@ app.post("/process", async (req, res) => {
         return sendVoiceTwiml(res, twiml);
       }
 
-      const affirmAccess = getAffirmation(session);
+      const affAccess = getAffirmation(session);
       session.step = "time";
-      session.lastPrompt = `${affirmAccess} And what day and time works best for you?`;
+      session.lastPrompt = `${affAccess} And what day and time works best for you?`;
       addToHistory(session, "assistant", session.lastPrompt);
       ask(twiml, session.lastPrompt, actionUrl);
       return sendVoiceTwiml(res, twiml);
@@ -4547,8 +4741,17 @@ app.post("/process", async (req, res) => {
       if (session.bookedStartMs) dt = DateTime.fromMillis(session.bookedStartMs, { zone: tz });
       else {
         if (!looksLikeAsap(session.time)) dt = parseRequestedDateTime(session.time, tz);
-        if (!dt && speech && !looksLikeAsap(session.time)) {
-          session.lastPrompt = "Sorry, I didn’t quite catch that time. Please say it again, for example: tomorrow at 2 pm.";
+        if (!dt && looksLikeAsap(session.time)) {
+          dt = nextBusinessOpenSlot(tradie);
+          const asapSlotText = formatForVoice(dt);
+          session.lastPrompt = `The next available slot is ${asapSlotText}. Does that work for you?`;
+          session.bookedStartMs = dt.toMillis();
+          addToHistory(session, "assistant", session.lastPrompt);
+          ask(twiml, session.lastPrompt, actionUrl, { input: "speech", timeout: 7, speechTimeout: "auto" });
+          return sendVoiceTwiml(res, twiml);
+        }
+        if (!dt && speech) {
+          session.lastPrompt = "Sorry, I did not quite catch that time. Please say it again — for example: tomorrow at 2 pm.";
           ask(twiml, session.lastPrompt, actionUrl, { input: "speech", timeout: 6, speechTimeout: "auto" });
           return sendVoiceTwiml(res, twiml);
         }
@@ -4604,10 +4807,13 @@ app.post("/process", async (req, res) => {
       }
       session.confirmPromptSent = true;
 
-      session.lastPrompt =
-`${session.name ? "Perfect " + session.name.split(" ")[0] + " — " : ""}just to confirm — ${session.job} at ${session.address}, ${whenText}. ${noteLine}${accessLine}Does that all sound right? Say yes to confirm or no to change something.`;
+      const cfFirstName = session.name ? session.name.split(" ")[0] : "";
+      const cfPrompt = `${cfFirstName ? "Perfect " + cfFirstName + " — " : ""}just to confirm — ${session.job} at ${session.address}, ${whenText}. ${noteLine || ""}${accessLine || ""}Does that all sound right? Say yes to confirm or no to change something.`;
+      session.lastPrompt = cfPrompt;
 
       addToHistory(session, "assistant", session.lastPrompt);
+      // Slow readback of address and time so caller can verify
+      saySlowly(twiml, `${session.job} at ${session.address}, ${whenText}.`);
       ask(twiml, session.lastPrompt, actionUrl, { input: "speech", timeout: 7, speechTimeout: "auto" });
       return sendVoiceTwiml(res, twiml);
     }
@@ -4657,10 +4863,13 @@ app.post("/process", async (req, res) => {
       }
       session.confirmPromptSent = true;
 
-      session.lastPrompt =
-`${session.name ? "Perfect " + session.name.split(" ")[0] + " — " : ""}just to confirm — ${session.job} at ${session.address}, ${whenText}. ${noteLine}${accessLine}Does that all sound right? Say yes to confirm or no to change something.`;
+      const cfFirstName = session.name ? session.name.split(" ")[0] : "";
+      const cfPrompt = `${cfFirstName ? "Perfect " + cfFirstName + " — " : ""}just to confirm — ${session.job} at ${session.address}, ${whenText}. ${noteLine || ""}${accessLine || ""}Does that all sound right? Say yes to confirm or no to change something.`;
+      session.lastPrompt = cfPrompt;
 
       addToHistory(session, "assistant", session.lastPrompt);
+      // Slow readback of address and time so caller can verify
+      saySlowly(twiml, `${session.job} at ${session.address}, ${whenText}.`);
       ask(twiml, session.lastPrompt, actionUrl, { input: "speech", timeout: 7, speechTimeout: "auto" });
       return sendVoiceTwiml(res, twiml);
     }
@@ -4716,6 +4925,8 @@ app.post("/process", async (req, res) => {
       // Pending confirmation (for inbound SMS Y/N)
       const pendingKey = makePendingKey(tradie.key, session.from);
       const bookingId = `${callSid}:${startDt.toMillis()}`;
+      const bookingRef = generateBookingRef();
+      session.bookingRef = bookingRef;
       const payload = {
         bookingId,
         callSid,
@@ -4756,6 +4967,10 @@ app.post("/process", async (req, res) => {
         ? `\n🚨 Urgency: ${session.urgencyScore}/10 — respond fast` : "";
       const valueLine = `\nEst. job value: $${estimatedValue}`;
 
+      // First time caller detection using customer note absence
+      const isFirstTimeCaller = !session.customerNote && !session.isReturningCaller;
+      const newCallerLine = isFirstTimeCaller ? "\n🆕 NEW CALLER — first booking from this number" : "";
+
       await sendOwnerSms(tradie,
 `NEW BOOKING ✅
 Name: ${session.name}
@@ -4764,7 +4979,7 @@ Address: ${session.address}
 Job: ${session.job}
 Time: ${formatForVoice(startDt)}
 Confirm: customer will reply Y/N
-${historyLine}${memoryLine}${accessLine2}${valueLine}${urgencyLine}`.trim()).catch(() => {});
+${historyLine}${memoryLine}${accessLine2}${valueLine || ""}${urgencyLine || ""}${newCallerLine}`.trim()).catch(() => {});
 
       const eventResult = await createBookingCalendarEvent({
         tradie,
@@ -4796,7 +5011,7 @@ ${historyLine}${memoryLine}${accessLine2}${valueLine}${urgencyLine}`.trim()).cat
         await sendCustomerSms(
           tradie,
           session.from,
-          `Booked: ${formatForVoice(startDt)} at ${session.address} for ${session.job}. Reply Y to confirm or N to reschedule.`
+          `Booked: ${formatForVoice(startDt)} at ${session.address} for ${session.job}. Ref: ${session.bookingRef || ""}. Reply Y to confirm or N to reschedule.`
         ).catch(() => {});
       }
 
@@ -4892,8 +5107,16 @@ ${historyLine}${memoryLine}${accessLine2}${valueLine}${urgencyLine}`.trim()).cat
       const summaryName = session.name || "you";
       const summaryAddress = session.address || "your address";
       const summaryTime = session.time || "your requested time";
-      const summaryText = `All set ${summaryName}. To confirm — we have booked ${summaryJob} at ${summaryAddress} for ${summaryTime}. We have sent you a text to confirm. Thanks for calling, speak soon.`;
-      twiml.say(summaryText, { voice: "Polly.Amy", language: "en-AU" });
+      const summaryText = `All set ${summaryName}. Your booking reference is ${session.bookingRef || "confirmed"}. We have booked ${summaryJob} at ${summaryAddress} for ${summaryTime}. You are locked in and the tradie has been notified. We have sent you a text with the details. Thanks for calling — speak soon.`;
+      const afterHoursNote = req._isAfterHours
+        ? " We are closed right now but the tradie will confirm your booking first thing tomorrow morning."
+        : "";
+      const isSameDay = startDt && startDt.hasSame(DateTime.now().setZone(tz), "day");
+      const sameDayNote = isSameDay
+        ? " I will make sure the tradie sees this straight away."
+        : "";
+      const finalSummary = summaryText + afterHoursNote + sameDayNote;
+      twiml.say(finalSummary, { voice: "Polly.Amy", language: "en-AU" });
       twiml.hangup();
       resetSession(callSid);
       return sendVoiceTwiml(res, twiml);
@@ -4907,6 +5130,7 @@ ${historyLine}${memoryLine}${accessLine2}${valueLine}${urgencyLine}`.trim()).cat
     return sendVoiceTwiml(res, twiml);
   } catch (err) {
     console.error("VOICE ERROR:", err);
+    trackError("VOICE /process");
     try {
       const recoveryTwiml = new VoiceResponse();
       const recoveryActionUrl = "/process" + (req.query.tid ? `?tid=${encodeURIComponent(req.query.tid)}` : "");
@@ -5103,6 +5327,7 @@ app.post("/twilio/voice", async (req, res) => {
     return handleVoiceEntry(req, res);
   } catch (e) {
     console.error("/twilio/voice error", e);
+    trackError("VOICE /twilio/voice");
     const twiml = new VoiceResponse();
     const gather = twiml.gather({
       input: "speech",
@@ -5266,6 +5491,7 @@ app.post("/check-availability", async (req, res) => {
     return sendVoiceTwiml(res, twiml);
   } catch (e) {
     console.error("/check-availability error", e);
+    trackError("VOICE /check-availability");
     const recoveryUrl = "/process" + (req.query.tid ? `?tid=${encodeURIComponent(req.query.tid)}` : "");
     twiml.say("I had a little trouble checking the calendar just then — no worries, I have saved your details and we will confirm the time by SMS shortly.", { voice: "Polly.Amy", language: "en-AU" });
     twiml.redirect({ method: "POST" }, recoveryUrl);
@@ -5457,6 +5683,55 @@ setInterval(async () => {
     }
   } catch (schedErr) {
     console.error("WEEKLY_FORECAST_ERROR", schedErr?.message || schedErr);
+  }
+}, 60 * 60 * 1000);
+
+// Render keep-alive ping every 14 minutes to prevent cold starts mid-call
+const SELF_URL = (process.env.BASE_URL || "http://localhost:" + (process.env.PORT || 10000)).replace(/\/+$/, "");
+setInterval(async () => {
+  try {
+    const http = require("https");
+    const url = new URL(SELF_URL + "/health");
+    const req = (url.protocol === "https:" ? require("https") : require("http")).request(url, { method: "GET" }, (res) => {
+      res.resume();
+    });
+    req.on("error", () => {});
+    req.end();
+  } catch {}
+}, 14 * 60 * 1000);
+
+// Daily health check — runs every hour, fires once at 8am AEST (22:00 UTC)
+setInterval(async () => {
+  try {
+    const now = new Date();
+    if (now.getUTCHours() !== 22) return;
+
+    if (!supabase) return;
+    const { data: tradieRows } = await supabase
+      .from(SUPABASE_TRADIES_TABLE)
+      .select("*")
+      .eq("status", "ACTIVE");
+
+    if (!tradieRows?.length) return;
+
+    for (const row of tradieRows) {
+      try {
+        const t = normalizeTradieConfig(row);
+        if (!t.ownerSmsTo) continue;
+        if (!t.googleRefreshToken) {
+          await sendSms({
+            from: t.smsFrom || process.env.TWILIO_SMS_FROM || "",
+            to: t.ownerSmsTo,
+            body: `⚠️ HEALTH CHECK: Google Calendar not connected for your AI booking bot. Callers cannot book until you reconnect. Visit: ${process.env.BASE_URL || ""}/api/google/connect?tradieId=${row.id}`
+          }).catch(() => {});
+          console.log(`HEALTH_CHECK_NO_CALENDAR tradie=${t.key}`);
+        }
+      } catch (hErr) {
+        console.error("HEALTH_CHECK_TRADIE_ERROR", hErr?.message || hErr);
+      }
+    }
+  } catch (schedErr) {
+    console.error("HEALTH_CHECK_ERROR", schedErr?.message || schedErr);
   }
 }, 60 * 60 * 1000);
 
