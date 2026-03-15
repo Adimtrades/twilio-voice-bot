@@ -43,6 +43,7 @@ const { DateTime } = require("luxon");
 const { google } = require("googleapis");
 const { createClient } = require("@supabase/supabase-js");
 const OpenAI = require("openai");
+const behaviouralEngine = require("./behaviouralEngine");
 
 const BOT_VERSION = process.env.BOT_VERSION || process.env.npm_package_version || "1.0.0";
 const LOG_TAG = `[bot:${BOT_VERSION}]`;
@@ -2828,6 +2829,7 @@ function getSession(callSid, fromNumber = "") {
         emotionalStress: "",
         budgetConcern: ""
       },
+      conversation_state: behaviouralEngine.createConversationState(),
 
       accessEditMode: "replace",
       callbackRequested: false
@@ -2837,6 +2839,7 @@ function getSession(callSid, fromNumber = "") {
       if (!s.from && fromNumber) s.from = fromNumber;
   }
   const active = sessions.get(callSid);
+  if (!active.conversation_state) active.conversation_state = behaviouralEngine.createConversationState();
   active.updatedAt = Date.now();
   return sessions.get(callSid);
 }
@@ -2976,7 +2979,17 @@ function buildSpeechHints(tradie) {
   return hints;
 }
 
+function applyTonePolishSafe(session, responseText) {
+  try {
+    const shorten = Number(session?.conversation_state?.urgency_score || 0) >= 7;
+    return behaviouralEngine.tonePolish(responseText, { shorten });
+  } catch {
+    return String(responseText || "").trim();
+  }
+}
+
 function ask(twiml, prompt, actionUrl, options = {}) {
+  const polishedPrompt = applyTonePolishSafe(options?.session, prompt);
   const gather = twiml.gather({
     input: "speech",
     speechTimeout: "auto",
@@ -2990,7 +3003,7 @@ function ask(twiml, prompt, actionUrl, options = {}) {
     ...options
   });
 
-  gather.say(prompt || "Sorry, can you repeat that?", { voice: "Polly.Amy", language: "en-AU" });
+  gather.say(polishedPrompt || "Sorry, can you repeat that?", { voice: "Polly.Amy", language: "en-AU" });
   twiml.pause({ length: 1 });
 }
 
@@ -3323,8 +3336,8 @@ function scarcity_line() {
   return "Today is filling quickly, so securing a slot now is safest.";
 }
 
-function micro_commitment_question() {
-  return "Would morning or afternoon suit you better?";
+function micro_commitment_question(type = "time") {
+  return behaviouralEngine.generateGuidedChoice(type);
 }
 
 function trust_reassurance_line() {
@@ -3401,15 +3414,34 @@ function composeAdaptivePrompt(session, basePrompt, conversationState, step) {
           : getAffirmation(session);
 
   const inserts = [];
-  if (state === "price_objection") inserts.push(loss_aversion_line(), authority_recommendation_line());
+  const behaviourState = session?.conversation_state || {};
+
+  if (state === "price_objection") inserts.push(authority_recommendation_line());
   if (state === "comparison_shopping") inserts.push(social_proof_line());
   if (state === "urgency") inserts.push(scarcity_line());
-  if (state === "trust_testing") inserts.push(trust_reassurance_line());
+  if (state === "trust_testing" || behaviourState.resistance_type === "trust" || behaviourState.commitment_stage === "info") {
+    inserts.push(behaviouralEngine.addTrustSignal(behaviourState.commitment_stage === "decision" ? "decision" : "early"));
+  }
+
+  if (behaviourState.urgency_score >= 6 && !behaviourState.loss_framing_used) {
+    const problem = behaviourState.last_customer_problem_summary || "this issue";
+    inserts.push(behaviouralEngine.applyLossFraming(problem));
+    behaviourState.loss_framing_used = true;
+  }
+
+  if (step === "time" || step === "pickSlot") {
+    const memoryLine = behaviouralEngine.memoryRecallResponse(behaviourState, "we can prioritise that window");
+    if (memoryLine) inserts.push(memoryLine);
+  }
+
   if (state === "analytical_customer" && step === "confirm") inserts.push("Just to confirm —");
 
-  const joiner = inserts.length ? `${inserts.join(" ")} ` : "";
-  return `${prefix} ${joiner}${raw}`.replace(/\s+/g, " ").trim();
+  const problemSummary = behaviourState.last_customer_problem_summary || session?.job || "the issue";
+  const guidedBase = behaviouralEngine.reflectAndGuide(problemSummary, raw);
+  const combined = `${prefix} ${inserts.join(" ")} ${guidedBase}`.replace(/\s+/g, " ").trim();
+  return applyTonePolishSafe(session, combined);
 }
+
 
 // 
 // Time parsing
@@ -4385,6 +4417,27 @@ app.post("/process", async (req, res) => {
     updateConversationMemory(session, speech, conversationState);
     session.conversationState = conversationState;
 
+    try {
+      session.conversation_state = behaviouralEngine.updateConversationState(
+        session.conversation_state,
+        speech || "",
+        session.step || "intent"
+      );
+      if (process.env.DEBUG_BEHAVIOUR === "true") {
+        console.log("BEHAVIOUR_STATE", {
+          callSid,
+          urgency: session.conversation_state?.urgency_score,
+          trust: session.conversation_state?.trust_score,
+          resistance: session.conversation_state?.resistance_type,
+          commitment: session.conversation_state?.commitment_stage
+        });
+      }
+    } catch (behaviourErr) {
+      if (process.env.DEBUG_BEHAVIOUR === "true") {
+        console.error("BEHAVIOUR_STATE_UPDATE_ERROR", behaviourErr?.message || behaviourErr);
+      }
+    }
+
     // state persistence: CallSid keyed session is authoritative for the current step
     const authoritativeStep = session.step || "intent";
 
@@ -4513,7 +4566,7 @@ app.post("/process", async (req, res) => {
 
     if (session.unclearTurns >= 3) {
       session.unclearTurns = 0;
-      const controlPrompt = "Let's get a time secured first so this doesn't get worse. " + micro_commitment_question();
+      const controlPrompt = "Let's get a time secured first so this doesn't get worse. " + micro_commitment_question("time");
       session.step = "time";
       session.lastPrompt = controlPrompt;
       addToHistory(session, "assistant", controlPrompt);
@@ -4594,20 +4647,24 @@ app.post("/process", async (req, res) => {
       !["confirm", "pickSlot", "intent", "initial"].includes(session.step);
 
     if (speech && (conversationState.offTopic || conversationState.primaryState === "ranting_storytelling" || conversationState.primaryState === "emotional_distress")) {
-      const recoveryPrompt = buildOffTopicRecoveryResponse(session, conversationState, session.step || "intent");
-      const controlledPrompt = composeAdaptivePrompt(session, recoveryPrompt, conversationState, session.step || "intent");
+      const fallbackQuestion = buildTaskControlPrompt(session, session.step || "intent");
+      const redirected = behaviouralEngine.redirectOffTopic(session.conversation_state, fallbackQuestion);
+      const controlledPrompt = composeAdaptivePrompt(session, redirected, conversationState, session.step || "intent");
       session.lastPrompt = controlledPrompt;
       addToHistory(session, "assistant", controlledPrompt);
-      ask(twiml, controlledPrompt, voiceActionUrl(req), { input: "speech", timeout: 7, speechTimeout: "auto" });
+      ask(twiml, controlledPrompt, voiceActionUrl(req), { input: "speech", timeout: 7, speechTimeout: "auto", session });
       return sendVoiceTwiml(res, twiml);
     }
 
     if (speech && ["price_objection", "comparison_shopping", "trust_testing", "dominant_customer", "analytical_customer", "passive_customer", "urgency"].includes(conversationState.primaryState)) {
       const controlPrompt = buildTaskControlPrompt(session, session.step || "intent");
-      const adapted = composeAdaptivePrompt(session, controlPrompt, conversationState, session.step || "intent");
+      const resistance = session.conversation_state?.resistance_type;
+      const objection = behaviouralEngine.objectionResponse(resistance);
+      const trustSignal = behaviouralEngine.addTrustSignal(session.conversation_state?.commitment_stage === "decision" ? "decision" : "early");
+      const adapted = composeAdaptivePrompt(session, `${objection} ${trustSignal} ${controlPrompt}`.trim(), conversationState, session.step || "intent");
       session.lastPrompt = adapted;
       addToHistory(session, "assistant", adapted);
-      ask(twiml, adapted, voiceActionUrl(req), { input: "speech", timeout: 7, speechTimeout: "auto" });
+      ask(twiml, adapted, voiceActionUrl(req), { input: "speech", timeout: 7, speechTimeout: "auto", session });
       return sendVoiceTwiml(res, twiml);
     }
 
@@ -4907,7 +4964,7 @@ app.post("/process", async (req, res) => {
 
       const affAccess = getAffirmation(session);
       session.step = "time";
-      session.lastPrompt = `${affAccess} And what day and time works best for you?`;
+      session.lastPrompt = `${affAccess} ${micro_commitment_question("day")} ${micro_commitment_question("time")}`;
       addToHistory(session, "assistant", session.lastPrompt);
       ask(twiml, session.lastPrompt, actionUrl);
       return sendVoiceTwiml(res, twiml);
@@ -4924,7 +4981,8 @@ app.post("/process", async (req, res) => {
         if (!dt && looksLikeAsap(session.time)) {
           dt = nextBusinessOpenSlot(tradie);
           const asapSlotText = formatForVoice(dt);
-          session.lastPrompt = `The next available slot is ${asapSlotText}. Does that work for you?`;
+          const recallLine = behaviouralEngine.memoryRecallResponse(session.conversation_state, `we have ${asapSlotText} available`);
+          session.lastPrompt = `${recallLine ? recallLine + ". " : ""}The next available slot is ${asapSlotText}. Does that work for you?`;
           session.bookedStartMs = dt.toMillis();
           addToHistory(session, "assistant", session.lastPrompt);
           ask(twiml, session.lastPrompt, actionUrl, { input: "speech", timeout: 7, speechTimeout: "auto" });
