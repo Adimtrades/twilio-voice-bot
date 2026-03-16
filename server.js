@@ -2815,6 +2815,12 @@ function getSession(callSid, fromNumber = "") {
       totalFailedAttempts: 0,
       transferredToOwner: false,
       bookingConfirmed: false,
+      callFlow: {
+        bookingConfirmed: false,
+        calendarEventCreated: false,
+        userFinalAcknowledgement: false,
+        hangupAllowed: false
+      },
       recoverySMSSent: false,
       tradieKey: "",
       urgencyScore: 0,
@@ -2874,6 +2880,7 @@ function getSession(callSid, fromNumber = "") {
       smartModeActive: true
     };
   }
+  ensureCallFlow(active);
   active.updatedAt = Date.now();
   return sessions.get(callSid);
 }
@@ -3198,6 +3205,29 @@ function keepCallAliveForProcessing(req, twiml, message = "") {
   twiml.redirect({ method: "POST" }, checkUrl);
 }
 
+function canHangUp(session) {
+  if (!session || !session.callFlow) return false;
+
+  return (
+    session.callFlow.bookingConfirmed === true &&
+    session.callFlow.calendarEventCreated === true &&
+    session.callFlow.userFinalAcknowledgement === true
+  );
+}
+
+function ensureCallFlow(session) {
+  if (!session || typeof session !== "object") return;
+  if (!session.callFlow || typeof session.callFlow !== "object") {
+    session.callFlow = {
+      bookingConfirmed: false,
+      calendarEventCreated: false,
+      userFinalAcknowledgement: false,
+      hangupAllowed: false
+    };
+  }
+  session.callFlow.hangupAllowed = canHangUp(session);
+}
+
 function sendVoiceTwiml(res, twiml, fallbackMessage = "Sorry, still here with you. What do you need help with today?") {
   const responseTwiml = twiml instanceof VoiceResponse ? twiml : new VoiceResponse();
   let xml = "";
@@ -3220,6 +3250,33 @@ function sendVoiceTwiml(res, twiml, fallbackMessage = "Sorry, still here with yo
     });
     gather.say(fallbackMessage, { voice: "Polly.Amy", language: "en-AU" });
     xml = fallback.toString();
+  }
+
+  try {
+    const callSid = res.locals?.callSid;
+    const session = callSid ? sessions.get(callSid) : null;
+    if (session) {
+      ensureCallFlow(session);
+      console.log("FLOW STATUS:", session.callFlow);
+    }
+
+    const hangupAllowed = canHangUp(session);
+    const hasGatherOrRedirect = xml.includes("<Gather") || xml.includes("<Redirect");
+    const hasHangup = xml.includes("<Hangup");
+
+    if (hasHangup && !hangupAllowed) {
+      console.log("HANGUP BLOCKED — booking flow incomplete");
+      xml = '<?xml version="1.0" encoding="UTF-8"?><Response><Say>Before we finish, I just need to confirm a few final details.</Say><Gather input="speech" action="/process" method="POST" speechTimeout="auto"><Say>Let’s continue.</Say></Gather></Response>';
+    }
+
+    if (!hangupAllowed && !hasGatherOrRedirect && !xml.includes("<Hangup")) {
+      const failsafeSuffix = '<Pause length="1"/><Gather input="speech" action="/process" method="POST" speechTimeout="auto"><Say>Is there anything else you would like help with before we finalise your booking?</Say></Gather>';
+      xml = xml.includes("</Response>")
+        ? xml.replace("</Response>", `${failsafeSuffix}</Response>`)
+        : `${xml}${failsafeSuffix}`;
+    }
+  } catch (flowErr) {
+    console.error("FLOW_GUARD_TWIML_PATCH_ERROR", flowErr?.message || flowErr);
   }
 
   // Cache last response for idempotency replay
@@ -5346,6 +5403,10 @@ ${historyLine}${memoryLine}${accessLine2}${valueLine || ""}${urgencyLine || ""}$
         return sendVoiceTwiml(res, twiml);
       }
       session.conversationState.calendarEventPending = false;
+      ensureCallFlow(session);
+      session.callFlow.calendarEventCreated = true;
+      session.callFlow.hangupAllowed = canHangUp(session);
+      console.log("FLOW STATUS:", session.callFlow);
 
       // Customer SMS: confirm Y/N
       if (session.from) {
@@ -5357,6 +5418,10 @@ ${historyLine}${memoryLine}${accessLine2}${valueLine || ""}${urgencyLine || ""}$
       }
 
       session.bookingConfirmed = true;
+      ensureCallFlow(session);
+      session.callFlow.bookingConfirmed = true;
+      session.callFlow.hangupAllowed = canHangUp(session);
+      console.log("FLOW STATUS:", session.callFlow);
 
       // Rating SMS 1 hour after booking end — fire and forget
       const ratingDelayMs = endDt
@@ -5459,8 +5524,38 @@ ${historyLine}${memoryLine}${accessLine2}${valueLine || ""}${urgencyLine || ""}$
       const finalSummary = summaryText + afterHoursNote + sameDayNote;
       twiml.say(finalSummary, { voice: "Polly.Amy", language: "en-AU" });
       setLockedFlowStep(session, "close", "calendar_success");
-      console.log(`HANGUP_PREVENTED reason=close_step callSid=${callSid}`);
-      resetSession(callSid);
+      session.step = "close";
+      session.lastPrompt = "Before we finish, is there anything else you need? You can say yes that's all, thanks, goodbye, or all done.";
+      ensureCallFlow(session);
+      session.callFlow.hangupAllowed = canHangUp(session);
+      console.log("FLOW STATUS:", session.callFlow);
+      ask(twiml, session.lastPrompt, actionUrl, { input: "speech", timeout: 7, speechTimeout: "auto" });
+      return sendVoiceTwiml(res, twiml);
+    }
+
+    if (session.step === "close") {
+      const finalAck = /\b(yes\s+that'?s\s+all|that'?s\s+all|thanks|thank\s+you|goodbye|all\s+done|no\s+that'?s\s+it|no\s+that'?s\s+all)\b/i.test(speech || "");
+      if (finalAck) {
+        ensureCallFlow(session);
+        session.callFlow.userFinalAcknowledgement = true;
+        session.callFlow.hangupAllowed = canHangUp(session);
+        console.log("FLOW STATUS:", session.callFlow);
+      }
+
+      if (canHangUp(session)) {
+        twiml.say("Perfect. Your booking is fully confirmed. Goodbye.", { voice: "Polly.Amy", language: "en-AU" });
+        twiml.hangup();
+        return sendVoiceTwiml(res, twiml);
+      }
+
+      console.log("HANGUP BLOCKED — booking flow incomplete");
+      twiml.say("Before we finish, I just need to confirm a few final details.", { voice: "Polly.Amy", language: "en-AU" });
+      twiml.gather({
+        input: "speech",
+        action: "/process",
+        method: "POST",
+        speechTimeout: "auto"
+      }).say("Let’s continue.", { voice: "Polly.Amy", language: "en-AU" });
       return sendVoiceTwiml(res, twiml);
     }
 
