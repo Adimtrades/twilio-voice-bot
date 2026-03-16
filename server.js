@@ -129,23 +129,45 @@ app.use((req, res, next) => {
 // ----------------------------------------------------------------------------
 // Process-level safety
 // ----------------------------------------------------------------------------
-process.on("unhandledRejection", (reason) => console.error("UNHANDLED REJECTION:", reason));
-process.on("uncaughtException", async (err) => {
+process.on("uncaughtException", (err) => {
   console.error("UNCAUGHT EXCEPTION:", err);
-  try {
-    if (supabase) {
-      await supabase.from("error_logs").insert([{
-        error_type: "uncaughtException",
-        message: err?.message || String(err),
-        stack: err?.stack || null,
-        created_at: new Date().toISOString()
-      }]);
-    }
-  } catch (logErr) {
-    console.error("FAILED_TO_LOG_UNCAUGHT_EXCEPTION", logErr);
-  }
-  process.exit(1);
 });
+
+process.on("unhandledRejection", (err) => {
+  console.error("UNHANDLED PROMISE:", err);
+});
+
+process.on("SIGTERM", () => {
+  console.log("Graceful shutdown start");
+  process.exit(0);
+});
+
+setInterval(() => {
+  const m = process.memoryUsage();
+  console.log("MEM:", Math.round(m.rss / 1024 / 1024), "MB");
+}, 60000);
+
+const safeAsync = (fn) => (req, res, next) =>
+  Promise.resolve(fn(req, res, next)).catch((err) => {
+    console.error("ROUTE ERROR:", err);
+    if (res.headersSent) return;
+    const isSmsLike = (req.originalUrl || "").includes("/sms");
+    const fallbackTwiml = isSmsLike
+      ? "<Response><Message>Sorry, we are experiencing a temporary issue. Let’s continue.</Message></Response>"
+      : "<Response><Say>Sorry, we are experiencing a temporary issue. Let’s continue.</Say></Response>";
+    res.type("text/xml");
+    res.send(fallbackTwiml);
+  });
+
+function wrapRouteMethod(method) {
+  return (routePath, ...handlers) => {
+    const wrapped = handlers.map((handler) => (typeof handler === "function" ? safeAsync(handler) : handler));
+    return method(routePath, ...wrapped);
+  };
+}
+
+app.get = wrapRouteMethod(app.get.bind(app));
+app.post = wrapRouteMethod(app.post.bind(app));
 
 // ----------------------------------------------------------------------------
 // RAW BODY CAPTURE (Twilio signature validation needs raw x-www-form-urlencoded)
@@ -165,6 +187,15 @@ app.use((req, res, next) => {
 app.use((req, res, next) => {
   if (req.originalUrl === "/stripe/webhook") return next();
   return express.json({ limit: "1mb" })(req, res, next);
+});
+
+app.use((req, res, next) => {
+  const callSid = String(req.body?.CallSid || req.query?.CallSid || "").trim();
+  if (callSid && sessions && sessions.has(callSid)) {
+    const session = sessions.get(callSid);
+    if (session) session.lastActivity = Date.now();
+  }
+  next();
 });
 
 app.get('/health', (req, res) => {
@@ -925,6 +956,23 @@ async function fetchJsonWithGuards(url, options, { retryOnce = true } = {}) {
   }
 }
 
+async function safeLLMCall(payload) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 9000);
+
+  try {
+    return await openai.chat.completions.create({
+      ...payload,
+      signal: controller.signal
+    });
+  } catch (e) {
+    console.error("LLM FAIL:", e);
+    return null;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 function extractResponseTextFromOpenAI(data) {
   if (data && typeof data.output_text === "string" && data.output_text.trim()) return data.output_text.trim();
   const text1 = data?.output?.[0]?.content?.[0]?.text;
@@ -947,26 +995,15 @@ async function callLlm(tradie, session, userSpeech) {
   ];
 
   try {
-    const response = await fetch("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${OPENAI_API_KEY}`
-      },
-      body: JSON.stringify({
-        model: "gpt-4o",
-        max_tokens: 200,
-        temperature: 0.6,
-        messages
-      })
+    const data = await safeLLMCall({
+      model: "gpt-4o",
+      max_tokens: 200,
+      temperature: 0.6,
+      messages
     });
 
-    if (!response.ok) {
-      console.warn("LLM HTTP error:", response.status);
-      return null;
-    }
+    if (!data) return null;
 
-    const data = await response.json();
     const text = data?.choices?.[0]?.message?.content || "";
     const clean = text.replace(/```json|```/g, "").trim();
 
@@ -2670,6 +2707,39 @@ app.post("/admin/provision", async (req, res) => {
 // Conversation / session store (in-memory)
 // 
 const sessions = new Map();
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, v] of sessions.entries()) {
+    if (!v || now - Number(v.lastActivity || 0) > 1000 * 60 * 30) {
+      sessions.delete(k);
+    }
+  }
+}, 1000 * 60 * 5);
+
+const rate = new Map();
+
+function rateLimit(phone) {
+  const now = Date.now();
+  const arr = rate.get(phone) || [];
+  const fresh = arr.filter((t) => now - t < 10000);
+  fresh.push(now);
+  rate.set(phone, fresh);
+  return fresh.length > 8;
+}
+
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [phone, stamps] of rate.entries()) {
+    const fresh = (stamps || []).filter((t) => now - t < 10000);
+    if (!fresh.length) {
+      rate.delete(phone);
+    } else {
+      rate.set(phone, fresh);
+    }
+  }
+}, 30000);
 // In-memory caller blacklist — persists for life of server process
 // Owner SMSes "BLOCK +61xxxxxxxxx" to add, "UNBLOCK +61xxxxxxxxx" to remove
 const callerBlacklist = new Map(); // key: "tradieKey::phoneNumber" -> true
@@ -2796,6 +2866,7 @@ function getSession(callSid, fromNumber = "") {
       lastAtAddress: null,
       duplicateEvent: null,
       startedAt: Date.now(),
+      lastActivity: Date.now(),
       _countedCall: false,
 
       history: [],
@@ -2882,6 +2953,7 @@ function getSession(callSid, fromNumber = "") {
   }
   ensureCallFlow(active);
   active.updatedAt = Date.now();
+  active.lastActivity = Date.now();
   return sessions.get(callSid);
 }
 function resetSession(callSid) { sessions.delete(callSid); }
@@ -4139,6 +4211,20 @@ async function getCalendarClient(identifier) {
 }
 function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
 
+async function safeSupabaseWrite(writePromise, context = "") {
+  try {
+    const result = await writePromise;
+    if (result?.error) {
+      console.error("DB WRITE FAIL:", context, result.error);
+    }
+    return result;
+  } catch (error) {
+    console.error("DB WRITE FAIL:", context, error);
+    return { error };
+  }
+}
+
+
 async function resolveCalendarTarget(tradie, context = {}) {
   const fallbackCalendarId = String(tradie?.calendarId || "").trim();
   if (fallbackCalendarId) {
@@ -4229,13 +4315,13 @@ Job: ${job}`,
 
 async function insertCalendarEventWithRetry(calendar, calendarId, requestBody) {
   let lastErr = null;
-  for (let attempt = 1; attempt <= CAL_RETRY_ATTEMPTS; attempt++) {
+  for (let i = 0; i < 3; i++) {
     try {
       return await calendar.events.insert({ calendarId, requestBody });
-    } catch (err) {
-      lastErr = err;
-      console.error(`Calendar insert failed (attempt ${attempt}/${CAL_RETRY_ATTEMPTS})`, err?.message || err);
-      if (attempt < CAL_RETRY_ATTEMPTS) await sleep(attempt === 1 ? 200 : 800);
+    } catch (e) {
+      lastErr = e;
+      console.log("Calendar retry", i);
+      if (i < 2) await new Promise((r) => setTimeout(r, 1500));
     }
   }
   throw lastErr;
@@ -4450,15 +4536,19 @@ Action: Call/text back ASAP.`;
 // ----------------------------------------------------------------------------
 app.post("/voice", async (req, res) => {
   try {
-    if (!validateTwilioSignature(req)) return res.status(403).send("Forbidden");
+    if (!validateTwilioSignature(req)) {
+      const deniedTwiml = new VoiceResponse();
+      deniedTwiml.say("Sorry, we are experiencing a temporary issue. Let’s continue.", { voice: "Polly.Amy", language: "en-AU" });
+      return sendVoiceTwiml(res, deniedTwiml);
+    }
 
     if (supabase) {
-      await supabase.from("calls").insert([{
+      await safeSupabaseWrite(supabase.from("calls").insert([{
         call_sid: resolveCallSid(req),
         from_number: String(req.body?.From || "").trim() || null,
         to_number: String(req.body?.To || "").trim() || null,
         created_at: new Date().toISOString()
-      }]).catch(() => {});
+      }]), "calls.insert");
     }
 
     return handleVoiceEntry(req, res);
@@ -4482,7 +4572,10 @@ app.post("/process", async (req, res) => {
   const twiml = new VoiceResponse();
 
   try {
-    if (!validateTwilioSignature(req)) return res.status(403).send("Forbidden");
+    if (!validateTwilioSignature(req)) {
+      twiml.say("Sorry, we are experiencing a temporary issue. Let’s continue.", { voice: "Polly.Amy", language: "en-AU" });
+      return sendVoiceTwiml(res, twiml);
+    }
 
     const tradie = await getTradieConfig(req);
 
@@ -4542,6 +4635,11 @@ app.post("/process", async (req, res) => {
     const fromNumber = (req.body.From || "").trim();
     res.locals.callSid = callSid;
 
+    if (fromNumber && rateLimit(fromNumber)) {
+      twiml.say("Thanks for your patience — we are handling a lot right now. I can still help you book this in.", { voice: "Polly.Amy", language: "en-AU" });
+      twiml.pause({ length: 1 });
+    }
+
     // Block any POST that arrives after session was reset on confirmed booking
     const existingSession = sessions.get(callSid);
     if (!existingSession && req.body?.SpeechResult) {
@@ -4561,6 +4659,13 @@ app.post("/process", async (req, res) => {
     const confidence = hasConfidence ? Number(confidenceRaw) : null;
 
     const session = getSession(callSid, fromNumber);
+    if (session.processing === true) {
+      console.log("FLOW LOCK — duplicate webhook");
+      return sendVoiceTwiml(res, twiml);
+    }
+    session.processing = true;
+
+    try {
     session.callSid = callSid;
     session.tradieKey = session.tradieKey || tradie.key;
     const detectedConversationState = detectConversationState(speech || "");
@@ -5476,34 +5581,24 @@ ${historyLine}${memoryLine}${accessLine2}${valueLine || ""}${urgencyLine || ""}$
       if (llmReady()) {
         (async () => {
           try {
-            const summaryResp = await fetch("https://api.openai.com/v1/chat/completions", {
-              method: "POST",
-              headers: {
-                "Content-Type": "application/json",
-                Authorization: `Bearer ${OPENAI_API_KEY}`
-              },
-              body: JSON.stringify({
-                model: "gpt-4o",
-                max_tokens: 60,
-                temperature: 0.3,
-                messages: [
-                  {
-                    role: "system",
-                    content: "Summarise this trades booking in exactly one sentence under 20 words. Include job, address and time only. Be concise."
-                  },
-                  {
-                    role: "user",
-                    content: `Job: ${session.job}. Address: ${session.address}. Name: ${session.name}. Time: ${session.time}. Urgency: ${session.urgencyScore || 1}/10.`
-                  }
-                ]
-              })
+            const sd = await safeLLMCall({
+              model: "gpt-4o",
+              max_tokens: 60,
+              temperature: 0.3,
+              messages: [
+                {
+                  role: "system",
+                  content: "Summarise this trades booking in exactly one sentence under 20 words. Include job, address and time only. Be concise."
+                },
+                {
+                  role: "user",
+                  content: `Job: ${session.job}. Address: ${session.address}. Name: ${session.name}. Time: ${session.time}. Urgency: ${session.urgencyScore || 1}/10.`
+                }
+              ]
             });
-            if (summaryResp.ok) {
-              const sd = await summaryResp.json();
-              const summaryLine = sd?.choices?.[0]?.message?.content?.trim() || "";
-              if (summaryLine) {
-                await sendOwnerSms(tradie, `📋 CALL SUMMARY: ${summaryLine}`).catch(() => {});
-              }
+            const summaryLine = sd?.choices?.[0]?.message?.content?.trim() || "";
+            if (summaryLine) {
+              await sendOwnerSms(tradie, `📋 CALL SUMMARY: ${summaryLine}`).catch(() => {});
             }
           } catch {}
         })();
@@ -5565,6 +5660,9 @@ ${historyLine}${memoryLine}${accessLine2}${valueLine || ""}${urgencyLine || ""}$
     addToHistory(session, "assistant", session.lastPrompt);
     ask(twiml, session.lastPrompt, actionUrl, { input: "speech" });
     return sendVoiceTwiml(res, twiml);
+    } finally {
+      session.processing = false;
+    }
   } catch (err) {
     console.error("VOICE ERROR:", err);
     trackError("VOICE /process");
@@ -5596,7 +5694,11 @@ ${historyLine}${memoryLine}${accessLine2}${valueLine || ""}${urgencyLine || ""}$
 // ----------------------------------------------------------------------------
 app.post("/sms", async (req, res) => {
   try {
-    if (!validateTwilioSignature(req)) return res.status(403).send("Forbidden");
+    if (!validateTwilioSignature(req)) {
+      const deniedTwiml = new MessagingResponse();
+      deniedTwiml.message("Sorry, we are experiencing a temporary issue. Let's continue.");
+      return res.type("text/xml").send(deniedTwiml.toString());
+    }
 
     const tradie = await getTradieConfig(req);
     if (tradie.status && tradie.status !== "ACTIVE") {
@@ -5609,14 +5711,20 @@ app.post("/sms", async (req, res) => {
     const body = (req.body.Body || "").trim();
     const bodyLower = body.toLowerCase();
 
+    if (from && rateLimit(from)) {
+      const twimlRate = new MessagingResponse();
+      twimlRate.message("Thanks for your patience — we're receiving a lot of messages right now. We'll keep helping you here.");
+      return res.type("text/xml").send(twimlRate.toString());
+    }
+
     if (supabase) {
-      await supabase.from("messages").insert([{
+      await safeSupabaseWrite(supabase.from("messages").insert([{
         from_number: from || null,
         to_number: String(req.body.To || "").trim() || null,
         message: body || null,
         message_sid: String(req.body.MessageSid || "").trim() || null,
         created_at: new Date().toISOString()
-      }]).catch(() => {});
+      }]), "messages.insert");
     }
 
     // If MMS photos are included, forward owner the media URLs
@@ -5758,7 +5866,11 @@ ${nice}`).catch(() => {});
 
 app.post("/twilio/voice", async (req, res) => {
   try {
-    if (!validateTwilioSignature(req)) return res.status(403).send("Forbidden");
+    if (!validateTwilioSignature(req)) {
+      const deniedTwiml = new VoiceResponse();
+      deniedTwiml.say("Sorry, we are experiencing a temporary issue. Let’s continue.", { voice: "Polly.Amy", language: "en-AU" });
+      return sendVoiceTwiml(res, deniedTwiml);
+    }
     const tradie = await getTradieConfig(req);
     req._tradieConfig = tradie;
     return handleVoiceEntry(req, res);
@@ -5799,7 +5911,11 @@ app.post("/twilio/sms", (req, res) => {
 
 app.post("/next-step", async (req, res) => {
   try {
-    if (!validateTwilioSignature(req)) return res.status(403).send("Forbidden");
+    if (!validateTwilioSignature(req)) {
+      const deniedTwiml = new VoiceResponse();
+      deniedTwiml.say("Sorry, we are experiencing a temporary issue. Let’s continue.", { voice: "Polly.Amy", language: "en-AU" });
+      return sendVoiceTwiml(res, deniedTwiml);
+    }
     const twiml = new VoiceResponse();
     const processUrl = "/process" + (req.query.tid ? `?tid=${encodeURIComponent(req.query.tid)}` : "");
     twiml.redirect({ method: "POST" }, processUrl);
@@ -5816,7 +5932,11 @@ app.post("/next-step", async (req, res) => {
 
 app.post("/time", async (req, res) => {
   try {
-    if (!validateTwilioSignature(req)) return res.status(403).send("Forbidden");
+    if (!validateTwilioSignature(req)) {
+      const deniedTwiml = new VoiceResponse();
+      deniedTwiml.say("Sorry, we are experiencing a temporary issue. Let’s continue.", { voice: "Polly.Amy", language: "en-AU" });
+      return sendVoiceTwiml(res, deniedTwiml);
+    }
     const twiml = new VoiceResponse();
     const actionUrl = voiceActionUrl(req);
     const gather = twiml.gather({
@@ -5840,7 +5960,11 @@ app.post("/time", async (req, res) => {
 
 app.post("/confirm", async (req, res) => {
   try {
-    if (!validateTwilioSignature(req)) return res.status(403).send("Forbidden");
+    if (!validateTwilioSignature(req)) {
+      const deniedTwiml = new VoiceResponse();
+      deniedTwiml.say("Sorry, we are experiencing a temporary issue. Let’s continue.", { voice: "Polly.Amy", language: "en-AU" });
+      return sendVoiceTwiml(res, deniedTwiml);
+    }
     const twiml = new VoiceResponse();
     const actionUrl = voiceActionUrl(req);
     twiml.redirect({ method: "POST" }, actionUrl);
@@ -5858,7 +5982,11 @@ app.post("/check-availability", async (req, res) => {
   const twiml = new VoiceResponse();
 
   try {
-    if (!validateTwilioSignature(req)) return res.status(403).send("Forbidden");
+    if (!validateTwilioSignature(req)) {
+      const deniedTwiml = new VoiceResponse();
+      deniedTwiml.say("Sorry, we are experiencing a temporary issue. Let’s continue.", { voice: "Polly.Amy", language: "en-AU" });
+      return sendVoiceTwiml(res, deniedTwiml);
+    }
 
     const tradie = await getTradieConfig(req);
     const tz = tradie.timezone;
