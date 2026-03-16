@@ -2830,6 +2830,22 @@ function getSession(callSid, fromNumber = "") {
         budgetConcern: ""
       },
       conversation_state: behaviouralEngine.createConversationState(),
+      conversationState: {
+        currentStep: "intro",
+        collectedFields: {
+          name: "",
+          job: "",
+          time: "",
+          urgency: "",
+          address: "",
+          accessNotes: ""
+        },
+        lastBotQuestion: "",
+        confirmationPending: false,
+        calendarEventPending: true,
+        callLockedToFlow: true,
+        smartModeActive: true
+      },
 
       accessEditMode: "replace",
       callbackRequested: false
@@ -2840,10 +2856,84 @@ function getSession(callSid, fromNumber = "") {
   }
   const active = sessions.get(callSid);
   if (!active.conversation_state) active.conversation_state = behaviouralEngine.createConversationState();
+  if (!active.conversationState || typeof active.conversationState !== "object") {
+    active.conversationState = {
+      currentStep: "intro",
+      collectedFields: {
+        name: "",
+        job: "",
+        time: "",
+        urgency: "",
+        address: "",
+        accessNotes: ""
+      },
+      lastBotQuestion: "",
+      confirmationPending: false,
+      calendarEventPending: true,
+      callLockedToFlow: true,
+      smartModeActive: true
+    };
+  }
   active.updatedAt = Date.now();
   return sessions.get(callSid);
 }
 function resetSession(callSid) { sessions.delete(callSid); }
+
+const LOCKED_FLOW_STEPS = ["intro", "name", "job", "time", "urgency", "address", "access", "confirm", "calendar", "close"];
+
+function syncConversationStateFromSession(session) {
+  if (!session?.conversationState) return;
+  session.conversationState.collectedFields = {
+    name: session.name || "",
+    job: session.job || "",
+    time: session.time || "",
+    urgency: String(session.urgencyScore || ""),
+    address: session.address || "",
+    accessNotes: session.accessNote || ""
+  };
+  session.conversationState.confirmationPending = session.step === "confirm";
+}
+
+function setLockedFlowStep(session, nextStep, reason = "") {
+  const flow = session?.conversationState;
+  if (!flow) return;
+  const current = flow.currentStep || "intro";
+  const fromIdx = LOCKED_FLOW_STEPS.indexOf(current);
+  const toIdx = LOCKED_FLOW_STEPS.indexOf(nextStep);
+  if (flow.callLockedToFlow && fromIdx >= 0 && toIdx >= 0 && toIdx < fromIdx) {
+    console.log(`FLOW_GUARD_BLOCK callSid=${session.callSid || "unknown"} from=${current} to=${nextStep} reason=${reason}`);
+    return;
+  }
+  if (current !== nextStep) {
+    console.log(`FLOW_STEP_CHANGE callSid=${session.callSid || "unknown"} from=${current} to=${nextStep} reason=${reason}`);
+    flow.currentStep = nextStep;
+  }
+}
+
+function buildObjectivePrompt(step, collectedFields = {}) {
+  const firstName = (collectedFields.name || "").split(" ")[0] || "";
+  if (step === "intro") return "Hi, what do you need help with today?";
+  if (step === "name") return "Great — what is your name?";
+  if (step === "job") return firstName ? `Thanks ${firstName} — what exactly needs fixing?` : "What exactly needs fixing?";
+  if (step === "time") return "What day and time works best for you?";
+  if (step === "urgency") return "How urgent is this — emergency, today, or can it wait a bit?";
+  if (step === "address") return "What is the address for the job?";
+  if (step === "access") return "Any access notes like gate code, parking, or pets? Say none if not.";
+  if (step === "confirm") return "Just to confirm — does that all sound right so we can lock this in?";
+  if (step === "calendar") return "Great — I am locking this into the calendar now.";
+  return "Just checking you're still there — would you like to continue booking?";
+}
+
+function mapLegacyStepToLockedStep(step) {
+  if (!step || step === "intent") return "intro";
+  if (["name"].includes(step)) return "name";
+  if (["job"].includes(step)) return "job";
+  if (["time", "pickSlot"].includes(step)) return "time";
+  if (["address", "address_confirm"].includes(step)) return "address";
+  if (["access"].includes(step)) return "access";
+  if (["confirm"].includes(step)) return "confirm";
+  return "intro";
+}
 
 
 // idempotency lock: suppress duplicate CallSid+step webhook processing within short TTL
@@ -4351,8 +4441,8 @@ app.post("/process", async (req, res) => {
       const blCheckKey = `${tradie.key}::${callerNumber}`;
       if (callerBlacklist.has(blCheckKey)) {
         console.log(`BLACKLISTED_CALLER_BLOCKED tradie=${tradie.key} number=${callerNumber}`);
-        twiml.say("Sorry, we are unable to take your call at this time.", { voice: "Polly.Amy", language: "en-AU" });
-        twiml.hangup();
+        console.log(`HANGUP_PREVENTED reason=blacklist callSid=${resolveCallSid(req)}`);
+        twiml.say("Sorry, we are unable to take your call at this time. I can ask someone to call you back.", { voice: "Polly.Amy", language: "en-AU" });
         return sendVoiceTwiml(res, twiml);
       }
     }
@@ -4361,7 +4451,7 @@ app.post("/process", async (req, res) => {
     // give caller a friendly setup message instead of crashing
     if (!tradie.googleRefreshToken || tradie.googleConnected === false) {
       twiml.say("Hi, thanks for calling. We are just setting up your booking system — please try again in a few minutes and we will be ready to take your booking.", { voice: "Polly.Amy", language: "en-AU" });
-      twiml.hangup();
+      console.log(`HANGUP_PREVENTED reason=calendar_not_connected callSid=${resolveCallSid(req)}`);
       return sendVoiceTwiml(res, twiml);
     }
 
@@ -4399,7 +4489,9 @@ app.post("/process", async (req, res) => {
     const existingSession = sessions.get(callSid);
     if (!existingSession && req.body?.SpeechResult) {
       const doneTwiml = new VoiceResponse();
-      doneTwiml.hangup();
+      console.log(`HANGUP_PREVENTED reason=post_reset_webhook callSid=${callSid}`);
+      const keepAlivePrompt = "Just checking you're still there — would you like to continue booking?";
+      ask(doneTwiml, keepAlivePrompt, voiceActionUrl(req), { input: "speech", timeout: 8, speechTimeout: "auto" });
       return res.type("text/xml").send(doneTwiml.toString());
     }
 
@@ -4412,10 +4504,14 @@ app.post("/process", async (req, res) => {
     const confidence = hasConfidence ? Number(confidenceRaw) : null;
 
     const session = getSession(callSid, fromNumber);
+    session.callSid = callSid;
     session.tradieKey = session.tradieKey || tradie.key;
-    const conversationState = detectConversationState(speech || "");
-    updateConversationMemory(session, speech, conversationState);
-    session.conversationState = conversationState;
+    const detectedConversationState = detectConversationState(speech || "");
+    updateConversationMemory(session, speech, detectedConversationState);
+    syncConversationStateFromSession(session);
+    session.conversationState.smartModeActive = true;
+    session.conversationState.callLockedToFlow = true;
+    setLockedFlowStep(session, mapLegacyStepToLockedStep(session.step), "sync_from_legacy_step");
 
     try {
       session.conversation_state = behaviouralEngine.updateConversationState(
@@ -4481,17 +4577,16 @@ app.post("/process", async (req, res) => {
 
     const globalOverride = detectGlobalVoiceOverride(speech);
     if (globalOverride === "START_OVER") {
-      session.step = "intent";
-      session.lastPrompt = "No worries, starting over. What would you like help with today?";
-      resetRetryCountForStep(session, "intent");
-      ask(twiml, session.lastPrompt, voiceActionUrl(req), { input: "speech", timeout: 7, speechTimeout: "auto" });
+      console.log(`FLOW_GUARD_BLOCK callSid=${callSid} reason=start_over_blocked`);
+      const retryPrompt = buildObjectivePrompt(session.conversationState.currentStep, session.conversationState.collectedFields);
+      session.lastPrompt = retryPrompt;
+      ask(twiml, retryPrompt, voiceActionUrl(req), { input: "speech", timeout: 7, speechTimeout: "auto" });
       return sendVoiceTwiml(res, twiml);
     }
     if (globalOverride === "CANCEL") {
       await missedRevenueAlert(tradie, session, "Caller said cancel").catch(() => {});
       twiml.say("No problem. I’ve cancelled this request. Goodbye.", { voice: "Polly.Amy", language: "en-AU" });
-      twiml.hangup();
-      resetSession(callSid);
+      console.log(`HANGUP_PREVENTED reason=cancel_requested callSid=${callSid}`);
       return sendVoiceTwiml(res, twiml);
     }
     if (globalOverride === "OPERATOR") {
@@ -4518,9 +4613,9 @@ app.post("/process", async (req, res) => {
       }
 
       if (session.abuseStrikes >= 5) {
-        twiml.say("I am going to have to end this call now. Please call back when you are ready and we will be happy to help.", { voice: "Polly.Amy", language: "en-AU" });
-        twiml.hangup();
-        resetSession(callSid);
+        console.log(`HANGUP_PREVENTED reason=abuse_threshold callSid=${callSid}`);
+        twiml.say("Let us keep this respectful so I can help with your booking. Are you ready to continue?", { voice: "Polly.Amy", language: "en-AU" });
+        ask(twiml, "Would you like to continue booking?", voiceActionUrl(req), { input: "speech", timeout: 7, speechTimeout: "auto" });
         return sendVoiceTwiml(res, twiml);
       }
 
@@ -4558,7 +4653,7 @@ app.post("/process", async (req, res) => {
       return sendVoiceTwiml(res, twiml);
     }
 
-    if (!speech || conversationState.primaryState === "confusion") {
+    if (!speech || detectedConversationState.primaryState === "confusion") {
       session.unclearTurns = Number(session.unclearTurns || 0) + 1;
     } else {
       session.unclearTurns = 0;
@@ -4644,24 +4739,25 @@ app.post("/process", async (req, res) => {
       session.llmTurns < LLM_MAX_TURNS &&
       !!speech &&
       isOffScript &&
-      !["confirm", "pickSlot", "intent", "initial"].includes(session.step);
+      !["confirm", "pickSlot", "intent", "initial"].includes(session.step) &&
+      !session.conversationState.smartModeActive;
 
-    if (speech && (conversationState.offTopic || conversationState.primaryState === "ranting_storytelling" || conversationState.primaryState === "emotional_distress")) {
+    if (!session.conversationState.smartModeActive && speech && (detectedConversationState.offTopic || detectedConversationState.primaryState === "ranting_storytelling" || detectedConversationState.primaryState === "emotional_distress")) {
       const fallbackQuestion = buildTaskControlPrompt(session, session.step || "intent");
       const redirected = behaviouralEngine.redirectOffTopic(session.conversation_state, fallbackQuestion);
-      const controlledPrompt = composeAdaptivePrompt(session, redirected, conversationState, session.step || "intent");
+      const controlledPrompt = composeAdaptivePrompt(session, redirected, detectedConversationState, session.step || "intent");
       session.lastPrompt = controlledPrompt;
       addToHistory(session, "assistant", controlledPrompt);
       ask(twiml, controlledPrompt, voiceActionUrl(req), { input: "speech", timeout: 7, speechTimeout: "auto", session });
       return sendVoiceTwiml(res, twiml);
     }
 
-    if (speech && ["price_objection", "comparison_shopping", "trust_testing", "dominant_customer", "analytical_customer", "passive_customer", "urgency"].includes(conversationState.primaryState)) {
+    if (!session.conversationState.smartModeActive && speech && ["price_objection", "comparison_shopping", "trust_testing", "dominant_customer", "analytical_customer", "passive_customer", "urgency"].includes(detectedConversationState.primaryState)) {
       const controlPrompt = buildTaskControlPrompt(session, session.step || "intent");
       const resistance = session.conversation_state?.resistance_type;
       const objection = behaviouralEngine.objectionResponse(resistance);
       const trustSignal = behaviouralEngine.addTrustSignal(session.conversation_state?.commitment_stage === "decision" ? "decision" : "early");
-      const adapted = composeAdaptivePrompt(session, `${objection} ${trustSignal} ${controlPrompt}`.trim(), conversationState, session.step || "intent");
+      const adapted = composeAdaptivePrompt(session, `${objection} ${trustSignal} ${controlPrompt}`.trim(), detectedConversationState, session.step || "intent");
       session.lastPrompt = adapted;
       addToHistory(session, "assistant", adapted);
       ask(twiml, adapted, voiceActionUrl(req), { input: "speech", timeout: 7, speechTimeout: "auto", session });
@@ -4718,7 +4814,7 @@ app.post("/process", async (req, res) => {
     const yn = detectYesNoFromDigits(digits) || detectYesNo(speech);
     const corrected = speech ? detectCorrection(speech) : false;
     const changeField = detectChangeFieldFromDigits(digits) || detectChangeFieldFromSpeech(speech);
-    const canGlobalInterrupt = !["intent", "confirm", "pickSlot", "access"].includes(session.step);
+    const canGlobalInterrupt = !session.conversationState.smartModeActive && !["intent", "confirm", "pickSlot", "access"].includes(session.step);
 
     if (canGlobalInterrupt && (corrected || changeField)) {
       if (changeField) {
@@ -5129,19 +5225,16 @@ app.post("/process", async (req, res) => {
       // Detect correction attempt — "no no" "wrong" "actually"
       const isCorrecting = /\b(no no|wrong|actually|wait|hang on|sorry that|not right)\b/i.test(speech || "");
       if (isCorrecting) {
-        resetRetryCountForStep(session, "confirm");
-        session.confirmPromptSent = false;
-        session.step = "job";
-        session.lastPrompt = "My apologies — let us start from the top. What is the job?";
+        console.log(`AMBIGUOUS_INPUT_RETRY callSid=${callSid} step=confirm reason=correction_phrase`);
+        session.lastPrompt = "No worries — tell me exactly what you want changed, and I’ll update it.";
         addToHistory(session, "assistant", session.lastPrompt);
         ask(twiml, session.lastPrompt, actionUrl);
         return sendVoiceTwiml(res, twiml);
       }
 
       if (yn2 === "NO") {
-        console.log(`STEP=confirm speech='${speech}' interpreted='NO' retryCount=${getRetryCountForStep(session, "confirm")}`);
-        session.step = "access";
-        session.lastPrompt = "Any access notes like gate code, parking, or pets? Say none if not.";
+        console.log(`AMBIGUOUS_INPUT_RETRY callSid=${callSid} step=confirm reason=explicit_no`);
+        session.lastPrompt = "No worries — what should I correct: job, time, address, or access notes?";
         addToHistory(session, "assistant", session.lastPrompt);
         ask(twiml, session.lastPrompt, actionUrl, { input: "speech", timeout: 7, speechTimeout: "auto" });
         return sendVoiceTwiml(res, twiml);
@@ -5243,6 +5336,16 @@ ${historyLine}${memoryLine}${accessLine2}${valueLine || ""}${urgencyLine || ""}$
         customerCalendarNotice = " I couldn’t write to the calendar yet, but I’ve saved the booking and will text you.";
         await missedRevenueAlert(tradie, session, "Calendar insert failed — manual follow-up").catch(() => {});
       }
+      if (!eventResult.ok) {
+        session.conversationState.calendarEventPending = true;
+        session.step = "confirm";
+        session.confirmPromptSent = false;
+        session.lastPrompt = `I am still working on locking this into the calendar.${customerCalendarNotice} Just to confirm again — should I keep trying this booking?`;
+        addToHistory(session, "assistant", session.lastPrompt);
+        ask(twiml, session.lastPrompt, actionUrl, { input: "speech", timeout: 7, speechTimeout: "auto" });
+        return sendVoiceTwiml(res, twiml);
+      }
+      session.conversationState.calendarEventPending = false;
 
       // Customer SMS: confirm Y/N
       if (session.from) {
@@ -5355,14 +5458,15 @@ ${historyLine}${memoryLine}${accessLine2}${valueLine || ""}${urgencyLine || ""}$
         : "";
       const finalSummary = summaryText + afterHoursNote + sameDayNote;
       twiml.say(finalSummary, { voice: "Polly.Amy", language: "en-AU" });
-      twiml.hangup();
+      setLockedFlowStep(session, "close", "calendar_success");
+      console.log(`HANGUP_PREVENTED reason=close_step callSid=${callSid}`);
       resetSession(callSid);
       return sendVoiceTwiml(res, twiml);
     }
 
     // Fallback for missing/unknown step
-    session.step = "intent";
-    session.lastPrompt = "Hi. What would you like help with today?";
+    console.log(`FLOW_GUARD_BLOCK callSid=${callSid} reason=unknown_step step=${session.step}`);
+    session.lastPrompt = buildObjectivePrompt(session.conversationState.currentStep, session.conversationState.collectedFields);
     addToHistory(session, "assistant", session.lastPrompt);
     ask(twiml, session.lastPrompt, actionUrl, { input: "speech" });
     return sendVoiceTwiml(res, twiml);
