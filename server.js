@@ -2861,6 +2861,7 @@ function getSession(callSid, fromNumber = "") {
       silenceTries: 0,
       retryCount: 0,
       retryCountByStep: {},
+      lowConfidenceStreak: 0,
       from: fromNumber,
 
       lastAtAddress: null,
@@ -3320,73 +3321,58 @@ function incrementRetryCountForStep(session, step) {
   return session.retryCountByStep[step];
 }
 
-async function repeatLastStepPrompt(req, res, twiml, session, step, reason = "NO_SPEECH", tradie = {}) {
-  // Increment total failed attempts across entire call
-  session.totalFailedAttempts = Number(session.totalFailedAttempts || 0) + 1;
-
-  // After 7 total failures transfer to owner number
-  if (session.totalFailedAttempts >= 7 && !session.transferredToOwner) {
-    session.transferredToOwner = true;
-    const ownerNumber = tradie?.ownerSmsTo || process.env.OWNER_SMS_TO || "";
-    if (ownerNumber) {
-      console.log(`TRANSFER_TO_OWNER after 7 failed attempts owner=${ownerNumber}`);
-      try {
-        await sendOwnerSms(tradie,
-          `📞 CALL TRANSFER\nCaller ${session.from || "unknown"} could not be understood after 7 attempts.\nJob hint: ${session.job || "unknown"}`
-        );
-      } catch {}
-      const transferTwiml = new VoiceResponse();
-      transferTwiml.say(
-        "No worries — let me get someone on the line for you right now.",
-        { voice: "Polly.Amy", language: "en-AU" }
-      );
-      const dial = transferTwiml.dial({ timeout: 30, callerId: req.body?.To || "" });
-      dial.number(ownerNumber);
-      transferTwiml.say(
-        "Sorry we missed you — please call back and we will get you sorted.",
-        { voice: "Polly.Amy", language: "en-AU" }
-      );
-      res.type("text/xml").send(transferTwiml.toString());
-      return { handled: true, transferred: true };
-    }
-  }
+function repeatLastStepPrompt(req, twiml, session, step, reason = "NO_SPEECH") {
   const retryCount = incrementRetryCountForStep(session, step);
   const actionUrl = voiceActionUrl(req);
   const basePrompt = session.lastPrompt || "Could you repeat that?";
 
+  const emotionPrefix = session.lastEmotion === "angry"
+    ? "Take your time — "
+    : session.lastEmotion === "confused"
+    ? "No worries — "
+    : session.lastEmotion === "urgent"
+    ? "Nearly there — "
+    : session.lastEmotion === "rambling"
+    ? "Just quickly — "
+    : session.lastEmotion === "upset"
+    ? "I have got you — "
+    : "No worries — ";
+
+  console.log(`STEP=${step} speech='' interpreted='${reason}' retryCount=${retryCount}`);
+
+  // First few retries — gentle re-ask with emotion prefix
   if (retryCount <= MAX_NO_SPEECH_RETRIES) {
-    console.log(`RETRY_VALIDATION_TRIGGERED step=${step} reason=${reason} attempt=${retryCount}`);
-    let prompt = "I didn’t quite catch that — could you repeat it?";
-    if (retryCount === 2) {
-      prompt = "Just briefly — could you repeat that one more time?";
-    } else if (retryCount >= 3) {
-      prompt = step === "time"
-        ? "Try a clear time like: tomorrow at 2 PM."
-        : "Please repeat in a few words so I can lock this in.";
-    }
+    const prompt = `${emotionPrefix}${basePrompt}`;
     session.lastPrompt = basePrompt;
-    console.log(`STEP=${step} speech='' interpreted='${reason}' retryCount=${retryCount}`);
-    ask(twiml, prompt, actionUrl, { session, input: "speech", timeout: 6, speechTimeout: "auto" });
+    ask(twiml, prompt, actionUrl, { input: "speech", timeout: 7, speechTimeout: "auto" });
     return { handled: true };
   }
 
+  // After MAX retries offer SMS fallback but keep call alive
   if (retryCount === MAX_NO_SPEECH_RETRIES + 1) {
     session.lastStepBeforeFallback = step;
     session.promptBeforeFallback = basePrompt;
     session.step = "sms_fallback_offer";
-    session.lastPrompt = "I didn’t catch that. You can say it again, or say ‘text me’ and I’ll send an SMS link.";
-    console.log(`STEP=${step} speech='' interpreted='${reason}' retryCount=${retryCount}`);
-    ask(twiml, session.lastPrompt, actionUrl, { session, input: "speech", timeout: 6, speechTimeout: "auto" });
+    session.lastPrompt = "No worries — you can keep trying or say text me and I will send a link to your phone.";
+    ask(twiml, session.lastPrompt, actionUrl, { input: "speech", timeout: 8, speechTimeout: "auto" });
     return { handled: true };
   }
 
-  console.log(`STEP=${step} speech='' interpreted='${reason}' retryCount=${retryCount}`);
-  const silenceRecovery = session.from
-    ? "Still there? Take your time — I am here when you are ready."
-    : "No worries — I am still here. What do you need help with today?";
-  ask(twiml, silenceRecovery, actionUrl, { session, input: "speech", timeout: 10, speechTimeout: "auto" });
+  // Beyond MAX+1 — rotate recovery phrases and keep call alive forever
+  // Never hang up — just keep re-engaging with varied messages
+  const recoveryMessages = [
+    "Still there? Take your time — no rush at all.",
+    "I am still here whenever you are ready.",
+    "Just say anything and I will help you from there.",
+    "No pressure — whenever you are ready just speak.",
+    "Take your time — I am not going anywhere."
+  ];
+  const recoveryIndex = (retryCount - MAX_NO_SPEECH_RETRIES - 2) % recoveryMessages.length;
+  const recovery = recoveryMessages[recoveryIndex];
+  ask(twiml, recovery, actionUrl, { input: "speech", timeout: 12, speechTimeout: "auto" });
   return { handled: true };
 }
+
 
 function keepCallAliveForProcessing(req, twiml, message = "") {
   if (message) {
@@ -3457,8 +3443,13 @@ function safeHangupGuard(session, twiml, req) {
     );
     return false;
   }
-  twiml.hangup();
-  return true;
+  ask(
+    twiml,
+    "I'm still here — let's finish your booking.",
+    voiceActionUrl(req),
+    { session, input: "speech", timeout: 8, speechTimeout: "auto" }
+  );
+  return false;
 }
 
 function canHangUp(session) {
@@ -3483,70 +3474,48 @@ function ensureCallFlow(session) {
   session.callFlow.hangupAllowed = unlockCallCompletionIfReady(session);
 }
 
-function sendVoiceTwiml(res, twiml, fallbackMessage = "Sorry, still here with you. What do you need help with today?") {
-  const responseTwiml = twiml instanceof VoiceResponse ? twiml : new VoiceResponse();
+function sendVoiceTwiml(res, twiml, fallbackMessage = "Still here — what do you need help with today?") {
   let xml = "";
-
   try {
-    xml = String(responseTwiml.toString() || "").trim();
+    const t = twiml instanceof VoiceResponse ? twiml : new VoiceResponse();
+    xml = String(t.toString() || "").trim();
   } catch {
     xml = "";
   }
 
-  if (!xml || xml === '<?xml version="1.0" encoding="UTF-8"?><Response/>') {
-    const fallback = new VoiceResponse();
-    const gather = fallback.gather({
-      input: "speech",
-      timeout: 8,
-      speechTimeout: "auto",
-      action: "/process",
-      method: "POST",
-      language: "en-AU"
-    });
-    gather.say(fallbackMessage, { voice: "Polly.Amy", language: "en-AU" });
-    xml = fallback.toString();
-  }
+  const isEmpty = !xml ||
+    xml === '<?xml version="1.0" encoding="UTF-8"?><Response/>' ||
+    xml === "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Response></Response>";
 
-  try {
-    const callSid = res.locals?.callSid;
-    const session = callSid ? sessions.get(callSid) : null;
-    if (session) {
-      ensureCallFlow(session);
-      console.log("FLOW STATUS:", session.callFlow);
-    }
-
-    const hangupAllowed = canHangUp(session);
-    const hasGatherOrRedirect = xml.includes("<Gather") || xml.includes("<Redirect");
-    const hasHangup = xml.includes("<Hangup");
-
-    if (hasHangup && !hangupAllowed) {
-      logStructured("HANGUP_BLOCKED", {
-        callSid: callSid || "unknown",
-        source: "sendVoiceTwiml"
+  if (isEmpty) {
+    try {
+      const fallback = new VoiceResponse();
+      const gather = fallback.gather({
+        input: "speech",
+        timeout: 8,
+        speechTimeout: "auto",
+        action: "/process",
+        method: "POST",
+        language: "en-AU"
       });
-      xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Response><Gather input=\"speech\" action=\"/process\" method=\"POST\" speechTimeout=\"auto\"><Say>I'm still here — let's finish your booking.</Say></Gather></Response>";
+      gather.say(fallbackMessage, { voice: "Polly.Amy", language: "en-AU" });
+      xml = fallback.toString();
+    } catch {
+      xml = '<?xml version="1.0" encoding="UTF-8"?><Response><Say voice="Polly.Amy" language="en-AU">Still here — what do you need help with today?</Say><Redirect method="POST">/process</Redirect></Response>';
     }
-
-    if (!hangupAllowed && !hasGatherOrRedirect && !hasHangup) {
-      const failsafeSuffix = "<Pause length=\"1\"/><Gather input=\"speech\" action=\"/process\" method=\"POST\" speechTimeout=\"auto\"><Say>I'm still here — let's finish your booking.</Say></Gather>";
-      xml = xml.includes("</Response>")
-        ? xml.replace("</Response>", `${failsafeSuffix}</Response>`)
-        : `${xml}${failsafeSuffix}`;
-    }
-  } catch (flowErr) {
-    console.error("FLOW_GUARD_TWIML_PATCH_ERROR", flowErr?.message || flowErr);
   }
 
-  // Cache last response for idempotency replay
+  // Cache last XML for idempotency replay
   try {
-    const callSid = res.locals?.callSid;
-    if (callSid && sessions.has(callSid)) {
-      sessions.get(callSid).lastTwimlXml = xml;
+    const cSid = res.locals?.callSid;
+    if (cSid && sessions.has(cSid)) {
+      sessions.get(cSid).lastTwimlXml = xml;
     }
   } catch {}
 
   return res.type("text/xml").send(xml);
 }
+
 
 async function performCalendarAvailabilityCheck({ tradie, dt, tz, callSid }) {
   const startedAt = Date.now();
@@ -3655,26 +3624,29 @@ function validateAccess(speech) {
 
 // confidence gating: only reject when speech is empty, low confidence, or invalid for the current step
 function shouldReject(step, speech, confidence) {
-  if (!speech || speech.length < 2) return true;
+  // Never reject if speech has meaningful content — always try to use it
+  const s = String(speech || "").trim();
+  if (!s || s.length < 2) return true;
 
-  // For address and time steps never reject on confidence alone
-  // as these fields contain numbers and street names that score low
-  if (step === "address" || step === "time") {
-    return !speech || speech.trim().length < 3;
+  // Address and time — accept anything 3+ chars, numbers score low naturally
+  if (step === "address" || step === "time") return s.length < 3;
+
+  // Name — accept any 2+ char response
+  if (step === "name") return s.length < 2;
+
+  // Access — always accept, access notes can be anything
+  if (step === "access") return false;
+
+  // Job — accept if speech has any meaningful words
+  if (step === "job") {
+    // Accept if 3+ chars — do not hard reject based on confidence
+    return s.length < 3;
   }
 
-  // For name step only reject if completely empty
-  if (step === "name") {
-    return !speech || speech.trim().length < 2;
-  }
-
-  if (isLowConfidence(confidence)) return true;
-
-  if (step === "job") return !validateJob(speech);
-  if (step === "access") return !validateAccess(speech);
-
+  // For all other steps never reject if speech exists
   return false;
 }
+
 
 // 
 // Intent detection (heuristic fallback)
@@ -4786,8 +4758,7 @@ app.post("/process", async (req, res) => {
     // If tradie is active but Google Calendar not connected yet
     // give caller a friendly setup message instead of crashing
     if (!tradie.googleRefreshToken || tradie.googleConnected === false) {
-      twiml.say("Hi, thanks for calling. We are just setting up your booking system — please try again in a few minutes and we will be ready to take your booking.", { voice: "Polly.Amy", language: "en-AU" });
-      console.log(`HANGUP_PREVENTED reason=calendar_not_connected callSid=${resolveCallSid(req)}`);
+      twiml.say("Hi, thanks for calling. We are just finishing setup — our booking system will be ready very shortly. Please try again in a few minutes and we will get you sorted.", { voice: "Polly.Amy", language: "en-AU" });
       return sendVoiceTwiml(res, twiml);
     }
 
@@ -4830,9 +4801,8 @@ app.post("/process", async (req, res) => {
     const existingSession = sessions.get(callSid);
     if (!existingSession && req.body?.SpeechResult) {
       const doneTwiml = new VoiceResponse();
-      console.log(`HANGUP_PREVENTED reason=post_reset_webhook callSid=${callSid}`);
-      const keepAlivePrompt = "Just checking you're still there — would you like to continue booking?";
-      ask(doneTwiml, keepAlivePrompt, voiceActionUrl(req), { input: "speech", timeout: 8, speechTimeout: "auto" });
+      doneTwiml.say("Thanks for calling — your booking has already been confirmed. We will see you then. Goodbye.", { voice: "Polly.Amy", language: "en-AU" });
+      doneTwiml.hangup();
       return res.type("text/xml").send(doneTwiml.toString());
     }
 
@@ -4950,7 +4920,7 @@ app.post("/process", async (req, res) => {
     if (globalOverride === "CANCEL") {
       await missedRevenueAlert(tradie, session, "Caller said cancel").catch(() => {});
       twiml.say("No problem. I’ve cancelled this request. Goodbye.", { voice: "Polly.Amy", language: "en-AU" });
-      console.log(`HANGUP_PREVENTED reason=cancel_requested callSid=${callSid}`);
+      twiml.hangup();
       return sendVoiceTwiml(res, twiml);
     }
     if (globalOverride === "OPERATOR") {
@@ -4968,18 +4938,17 @@ app.post("/process", async (req, res) => {
       session.abuseStrikes += 1;
       const prefix = abuseReply(session.abuseStrikes);
 
+      if (session.abuseStrikes >= 5) {
+        twiml.say("I am going to have to end this call now.", { voice: "Polly.Amy", language: "en-AU" });
+        twiml.hangup();
+        return sendVoiceTwiml(res, twiml);
+      }
+
       if (session.abuseStrikes >= 3) {
         const prompt = `${prefix} If you'd still like help, please tell me what you need.`;
         session.lastPrompt = prompt;
         addToHistory(session, "assistant", prompt);
         ask(twiml, prompt, "/process" + (req.query.tid ? `?tid=${encodeURIComponent(req.query.tid)}` : ""));
-        return sendVoiceTwiml(res, twiml);
-      }
-
-      if (session.abuseStrikes >= 5) {
-        console.log(`HANGUP_PREVENTED reason=abuse_threshold callSid=${callSid}`);
-        twiml.say("Let us keep this respectful so I can help with your booking. Are you ready to continue?", { voice: "Polly.Amy", language: "en-AU" });
-        ask(twiml, "Would you like to continue booking?", voiceActionUrl(req), { input: "speech", timeout: 7, speechTimeout: "auto" });
         return sendVoiceTwiml(res, twiml);
       }
 
@@ -5021,14 +4990,30 @@ app.post("/process", async (req, res) => {
       }
     }
 
-    // confidence gating: do not advance when Twilio speech confidence is too low
+    // Low confidence gating — never hang up, accept after 3 consecutive low scores
     if (speech && isLowConfidence(confidence)) {
       const currentStep = session.step || "intent";
-      console.log(`LOW_CONFIDENCE TID=${tradie.key} CALLSID=${callSid} STEP=${currentStep} confidence=${confidence}`);
-      session.unclearTurns = Number(session.unclearTurns || 0) + 1;
-      session.lastPrompt = "Sorry, I didn’t quite catch that. Please say it again.";
-      ask(twiml, session.lastPrompt, voiceActionUrl(req), { input: "speech", timeout: 6, speechTimeout: "auto" });
-      return sendVoiceTwiml(res, twiml);
+      session.lowConfidenceStreak = Number(session.lowConfidenceStreak || 0) + 1;
+      console.log(`LOW_CONFIDENCE TID=${tradie.key} CALLSID=${callSid} STEP=${currentStep} confidence=${confidence} streak=${session.lowConfidenceStreak}`);
+
+      // After 3 consecutive low confidence turns accept the speech anyway
+      // and let the step handler deal with it — better than being stuck forever
+      if (session.lowConfidenceStreak >= 3) {
+        console.log(`LOW_CONFIDENCE_ACCEPT forced accept after ${session.lowConfidenceStreak} streak`);
+        session.lowConfidenceStreak = 0;
+        // Fall through to normal step handling below
+      } else {
+        const lcPrompts = [
+          "Sorry — I did not quite catch that. Could you say it again a little clearer?",
+          "I missed that one — please try again.",
+          "Just say that one more time and I will get it."
+        ];
+        session.lastPrompt = lcPrompts[Math.min(session.lowConfidenceStreak - 1, lcPrompts.length - 1)];
+        ask(twiml, session.lastPrompt, voiceActionUrl(req), { input: "speech", timeout: 7, speechTimeout: "auto" });
+        return sendVoiceTwiml(res, twiml);
+      }
+    } else {
+      session.lowConfidenceStreak = 0;
     }
 
     if (!speech || detectedConversationState.primaryState === "confusion") {
@@ -5071,7 +5056,7 @@ app.post("/process", async (req, res) => {
         return sendVoiceTwiml(res, twiml);
       }
 
-      const repeatedFallback = await repeatLastStepPrompt(req, res, twiml, session, "sms_fallback_offer", speech ? "UNCLEAR" : "NO_SPEECH", tradie);
+      const repeatedFallback = repeatLastStepPrompt(req, twiml, session, "sms_fallback_offer", speech ? "UNCLEAR" : "NO_SPEECH");
       return sendVoiceTwiml(res, twiml);
     }
 
@@ -5596,8 +5581,7 @@ app.post("/process", async (req, res) => {
       if (!speech || confirmConfidenceTooLow || !yn2) {
         const interpreted = !speech ? "NO_SPEECH" : (confirmConfidenceTooLow ? "UNCLEAR" : "UNCLEAR");
         console.log(`STEP=confirm speech='${speech}' interpreted='${interpreted}' retryCount=${getRetryCountForStep(session, "confirm") + 1}`);
-        const repeatedConfirm = await repeatLastStepPrompt(req, res, twiml, session, "confirm", interpreted, tradie);
-        if (repeatedConfirm.shouldReset) resetSession(callSid);
+        repeatLastStepPrompt(req, twiml, session, "confirm", interpreted);
         return sendVoiceTwiml(res, twiml);
       }
 
@@ -5873,9 +5857,13 @@ ${historyLine}${memoryLine}${accessLine2}${valueLine || ""}${urgencyLine || ""}$
       return sendVoiceTwiml(res, twiml);
     }
 
-    // Fallback for missing/unknown step
-    console.log(`FLOW_GUARD_BLOCK callSid=${callSid} reason=unknown_step step=${session.step}`);
-    session.lastPrompt = buildObjectivePrompt(session.conversationState.currentStep, session.conversationState.collectedFields);
+    // Fallback for missing/unknown step — reset to last known step or intent
+    const safeStep = ["intent","job","address","name","access","time","confirm"].includes(session.step)
+      ? session.step : "intent";
+    session.step = safeStep;
+    if (safeStep === "intent") {
+      session.lastPrompt = "What do you need help with today?";
+    }
     addToHistory(session, "assistant", session.lastPrompt);
     ask(twiml, session.lastPrompt, actionUrl, { session, input: "speech" });
     return sendVoiceTwiml(res, twiml);
@@ -5884,20 +5872,13 @@ ${historyLine}${memoryLine}${accessLine2}${valueLine || ""}${urgencyLine || ""}$
     }
   } catch (err) {
     console.error("VOICE ERROR:", err);
-    trackError("VOICE /process");
+    try {
+      trackError("VOICE /process catch");
+    } catch {}
     try {
       const recoveryTwiml = new VoiceResponse();
-      const callSid = resolveCallSid(req);
-      const session = callSid ? sessions.get(callSid) : null;
       const recoveryActionUrl = "/process" + (req.query.tid ? `?tid=${encodeURIComponent(req.query.tid)}` : "");
-      const currentObjectiveStep = session?.conversationState?.currentStep || mapLegacyStepToLockedStep(session?.step || "intent");
-      const retryPrompt = buildObjectivePrompt(currentObjectiveStep, session?.conversationState?.collectedFields || {});
-      logStructured("ERROR_RECOVERY_TRIGGERED", {
-        callSid,
-        step: currentObjectiveStep,
-        error: err?.message || String(err)
-      });
-      recoveryTwiml.say("Sorry — small system issue. Let's continue.", { voice: "Polly.Amy", language: "en-AU" });
+      recoveryTwiml.say("Sorry about that — still with you. Let me pick up where we left off.", { voice: "Polly.Amy", language: "en-AU" });
       const recoverGather = recoveryTwiml.gather({
         input: "speech",
         timeout: 8,
@@ -5906,21 +5887,26 @@ ${historyLine}${memoryLine}${accessLine2}${valueLine || ""}${urgencyLine || ""}$
         method: "POST",
         language: "en-AU"
       });
-      recoverGather.say(retryPrompt, { voice: "Polly.Amy", language: "en-AU" });
+      const callSid = resolveCallSid(req);
+      const session = callSid ? sessions.get(callSid) : null;
+      recoverGather.say(session?.lastPrompt || "What do you need help with today?", { voice: "Polly.Amy", language: "en-AU" });
       return sendVoiceTwiml(res, recoveryTwiml);
     } catch (fatalErr) {
       console.error("FATAL VOICE RECOVERY ERROR:", fatalErr);
-      const lastResort = new VoiceResponse();
-      lastResort.say("Sorry — small system issue. Let's continue.", { voice: "Polly.Amy", language: "en-AU" });
-      lastResort.gather({
-        input: "speech",
-        timeout: 8,
-        speechTimeout: "auto",
-        action: "/process",
-        method: "POST",
-        language: "en-AU"
-      }).say("I'm still here — let's finish your booking.", { voice: "Polly.Amy", language: "en-AU" });
-      return sendVoiceTwiml(res, lastResort);
+      try {
+        const lastResort = new VoiceResponse();
+        const lastResortUrl = "/process" + (req.query?.tid ? `?tid=${encodeURIComponent(req.query.tid)}` : "");
+        const lastGather = lastResort.gather({
+          input: "speech",
+          timeout: 8,
+          speechTimeout: "auto",
+          action: lastResortUrl,
+          method: "POST",
+          language: "en-AU"
+        });
+        lastGather.say("Still here — what do you need help with today?", { voice: "Polly.Amy", language: "en-AU" });
+        return sendVoiceTwiml(res, lastResort);
+      } catch {}
     }
   }
 });
@@ -6112,18 +6098,22 @@ app.post("/twilio/voice", async (req, res) => {
     return handleVoiceEntry(req, res);
   } catch (e) {
     console.error("/twilio/voice error", e);
-    trackError("VOICE /twilio/voice");
-    const twiml = new VoiceResponse();
-    const gather = twiml.gather({
-      input: "speech",
-      timeout: 8,
-      speechTimeout: "auto",
-      action: "/process",
-      method: "POST",
-      language: "en-AU"
-    });
-    gather.say("Hi, sorry about that — still here. What do you need help with today?", { voice: "Polly.Amy", language: "en-AU" });
-    return sendVoiceTwiml(res, twiml);
+    try { trackError("VOICE /twilio/voice catch"); } catch {}
+    try {
+      const twiml = new VoiceResponse();
+      const gather = twiml.gather({
+        input: "speech",
+        timeout: 8,
+        speechTimeout: "auto",
+        action: "/process",
+        method: "POST",
+        language: "en-AU"
+      });
+      gather.say("Hi — still here. What do you need help with today?", { voice: "Polly.Amy", language: "en-AU" });
+      return sendVoiceTwiml(res, twiml);
+    } catch {
+      return res.status(200).send('<?xml version="1.0" encoding="UTF-8"?><Response><Say voice="Polly.Amy" language="en-AU">Still here — please say what you need help with.</Say><Redirect method="POST">/process</Redirect></Response>');
+    }
   }
 });
 
@@ -6292,11 +6282,15 @@ app.post("/check-availability", async (req, res) => {
     return sendVoiceTwiml(res, twiml);
   } catch (e) {
     console.error("/check-availability error", e);
-    trackError("VOICE /check-availability");
-    const recoveryUrl = "/process" + (req.query.tid ? `?tid=${encodeURIComponent(req.query.tid)}` : "");
-    twiml.say("I had a little trouble checking the calendar just then — no worries, I have saved your details and we will confirm the time by SMS shortly.", { voice: "Polly.Amy", language: "en-AU" });
-    twiml.redirect({ method: "POST" }, recoveryUrl);
-    return sendVoiceTwiml(res, twiml);
+    try { trackError("VOICE /check-availability catch"); } catch {}
+    try {
+      const recoveryUrl = "/process" + (req.query.tid ? `?tid=${encodeURIComponent(req.query.tid)}` : "");
+      twiml.say("I had a little trouble with the calendar just then — no worries, I have saved your details. Let me try that again.", { voice: "Polly.Amy", language: "en-AU" });
+      twiml.redirect({ method: "POST" }, recoveryUrl);
+      return sendVoiceTwiml(res, twiml);
+    } catch {
+      return res.status(200).send('<?xml version="1.0" encoding="UTF-8"?><Response><Redirect method="POST">/process</Redirect></Response>');
+    }
   }
 });
 
