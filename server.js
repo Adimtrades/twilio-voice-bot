@@ -3197,7 +3197,7 @@ function getSession(callSid, fromNumber = "") {
         lastQuestionAsked: "",
         awaitingUserResponse: false,
         lastQuestionTimestamp: 0,
-        minQuestionGapMs: 1200,
+        minQuestionGapMs: 0,
         confirmationPending: false,
         calendarEventPending: true,
         callLockedToFlow: true,
@@ -3238,7 +3238,7 @@ function getSession(callSid, fromNumber = "") {
       lastQuestionAsked: "",
       awaitingUserResponse: false,
       lastQuestionTimestamp: 0,
-      minQuestionGapMs: 1200,
+      minQuestionGapMs: 0,
       confirmationPending: false,
       calendarEventPending: true,
       callLockedToFlow: true,
@@ -3537,24 +3537,9 @@ function ask(twiml, prompt, actionUrl, options = {}) {
     const minGap = Number(session.conversationState.minQuestionGapMs || 1200);
     const isSameQuestion = session.conversationState.lastQuestionAsked === activeStep;
     const gapMs = now - Number(session.conversationState.lastQuestionTimestamp || 0);
-    if (isSameQuestion && gapMs < minGap) {
-      console.log(`QUESTION_LOCKED step=${activeStep} gapMs=${gapMs}`);
-      const lockPrompt = "I didn’t quite catch that — could you repeat it?";
-      const gatherLocked = twiml.gather({
-        input: "speech",
-        speechTimeout: "auto",
-        action: actionUrl,
-        method: "POST",
-        language: "en-AU",
-        timeout: VOICE_GATHER_TIMEOUT_SECONDS,
-        speechModel: "phone_call",
-        enhanced: true,
-        hints: buildSpeechHints(typeof tradie !== "undefined" ? tradie : {}),
-        ...options
-      });
-      gatherLocked.say(lockPrompt, { voice: "Polly.Amy", language: "en-AU" });
-      twiml.pause({ length: 1 });
-      return;
+    if (false) {
+      // QUESTION_LOCKED disabled — was causing wrong prompts to fire
+      // when steps advanced quickly through the flow
     }
     session.conversationState.lastQuestionAsked = activeStep;
     session.conversationState.lastQuestionTimestamp = now;
@@ -5105,9 +5090,9 @@ app.post("/process", async (req, res) => {
     const detectedConversationState = detectConversationState(speech || "");
     updateConversationMemory(session, speech, detectedConversationState);
     syncConversationStateFromSession(session);
-    session.conversationState.smartModeActive = true;
-    session.conversationState.callLockedToFlow = true;
-    setLockedFlowStep(session, mapLegacyStepToLockedStep(session.step), "sync_from_legacy_step");
+    session.conversationState.smartModeActive = false;
+    session.conversationState.callLockedToFlow = false;
+    // Step flow is managed exclusively by the step handlers below
 
     try {
       session.conversation_state = behaviouralEngine.updateConversationState(
@@ -5385,27 +5370,13 @@ app.post("/process", async (req, res) => {
       !["confirm", "pickSlot", "intent", "initial"].includes(session.step) &&
       !session.conversationState.smartModeActive;
 
-    if (!session.conversationState.smartModeActive && speech && (detectedConversationState.offTopic || detectedConversationState.primaryState === "ranting_storytelling" || detectedConversationState.primaryState === "emotional_distress")) {
-      const fallbackQuestion = buildTaskControlPrompt(session, session.step || "intent");
-      const redirected = behaviouralEngine.redirectOffTopic(session.conversation_state, fallbackQuestion);
-      const controlledPrompt = composeAdaptivePrompt(session, redirected, detectedConversationState, session.step || "intent");
-      session.lastPrompt = controlledPrompt;
-      addToHistory(session, "assistant", controlledPrompt);
-      ask(twiml, controlledPrompt, voiceActionUrl(req), { input: "speech", timeout: 7, speechTimeout: "auto", session });
-      return sendVoiceTwiml(res, twiml);
-    }
+    // Smart mode disabled — step handlers manage the flow directly
 
-    if (!session.conversationState.smartModeActive && speech && ["price_objection", "comparison_shopping", "trust_testing", "dominant_customer", "analytical_customer", "passive_customer", "urgency"].includes(detectedConversationState.primaryState)) {
-      const controlPrompt = buildTaskControlPrompt(session, session.step || "intent");
-      const resistance = session.conversation_state?.resistance_type;
-      const objection = behaviouralEngine.objectionResponse(resistance);
-      const trustSignal = behaviouralEngine.addTrustSignal(session.conversation_state?.commitment_stage === "decision" ? "decision" : "early");
-      const adapted = composeAdaptivePrompt(session, `${objection} ${trustSignal} ${controlPrompt}`.trim(), detectedConversationState, session.step || "intent");
-      session.lastPrompt = adapted;
-      addToHistory(session, "assistant", adapted);
-      ask(twiml, adapted, voiceActionUrl(req), { input: "speech", timeout: 7, speechTimeout: "auto", session });
-      return sendVoiceTwiml(res, twiml);
-    }
+
+
+    // Adaptive prompt disabled — step handlers manage the flow
+
+
 
     if (shouldUseLlm) {
       session.llmTurns += 1;
@@ -5528,11 +5499,15 @@ app.post("/process", async (req, res) => {
           return sendVoiceTwiml(res, twiml);
         }
 
-        // Booking flow stays locked: only ask for job if job is still missing.
-        session.step = "job";
-        session.lastPrompt = "What job do you need help with?";
+        // First answer is always the job — move straight to address
+        if (speech && speech.trim()) session.job = session.job || speech.trim();
+        session.intent = "NEW_BOOKING";
+        const jeI2 = getJobEmpathy(session.job);
+        const affI2 = jeI2 || getAffirmation(session);
+        session.step = "address";
+        session.lastPrompt = `${affI2} And what is the address for the job?`;
         addToHistory(session, "assistant", session.lastPrompt);
-        ask(twiml, session.lastPrompt, actionUrl, { session });
+        ask(twiml, session.lastPrompt, actionUrl, { session, input: "speech" });
         return sendVoiceTwiml(res, twiml);
       }
 
@@ -5703,11 +5678,10 @@ app.post("/process", async (req, res) => {
         return sendVoiceTwiml(res, twiml);
       }
 
-      const affAccess = getAffirmation(session);
       session.step = "time";
-      session.lastPrompt = "What day and time works best for you?";
+      session.lastPrompt = "What day and time works best for the booking?";
       addToHistory(session, "assistant", session.lastPrompt);
-      ask(twiml, session.lastPrompt, actionUrl, { session });
+      ask(twiml, session.lastPrompt, actionUrl, { session, input: "speech", timeout: 7, speechTimeout: "auto" });
       return sendVoiceTwiml(res, twiml);
     }
 
@@ -5787,7 +5761,7 @@ app.post("/process", async (req, res) => {
       session.confirmPromptSent = true;
 
       const cfFirstName = session.name ? session.name.split(" ")[0] : "";
-      const cfPrompt = `Booking for ${session.job} at ${session.address} ${whenText}. Confirm?`;
+      const cfPrompt = `Just to confirm — ${session.job} at ${session.address}${cfFirstName ? " for " + cfFirstName : ""}, ${whenText}. ${noteLine || ""}${accessLine || ""}Does that sound right? Say yes to book or no to change something.`;
       session.lastPrompt = cfPrompt;
 
       addToHistory(session, "assistant", session.lastPrompt);
@@ -5841,7 +5815,7 @@ app.post("/process", async (req, res) => {
       session.confirmPromptSent = true;
 
       const cfFirstName = session.name ? session.name.split(" ")[0] : "";
-      const cfPrompt = `Booking for ${session.job} at ${session.address} ${whenText}. Confirm?`;
+      const cfPrompt = `Just to confirm — ${session.job} at ${session.address}${cfFirstName ? " for " + cfFirstName : ""}, ${whenText}. ${noteLine || ""}${accessLine || ""}Does that sound right? Say yes to book or no to change something.`;
       session.lastPrompt = cfPrompt;
 
       addToHistory(session, "assistant", session.lastPrompt);
