@@ -935,7 +935,7 @@ function buildLlmSystemPrompt(tradie, session = {}) {
     address: "What is the address?",
     name: "What is your name?",
     access: "Any access notes like gate code, parking, or pets?",
-    time: "What time would you like?",
+    time: "What day and time works best for you?",
     confirm: "Is that correct?"
   };
 
@@ -3416,7 +3416,7 @@ function handleVoiceEntry(req, res) {
 }
 
 function buildSpeechHints(tradie) {
-  const base = "yes, no, confirm, cancel, reschedule, Monday, Tuesday, Wednesday, Thursday, Friday, Saturday, Sunday, morning, afternoon, today, tomorrow, next week, Street, Road, Avenue, Drive, Close, Court, Place, Lane, Crescent, Boulevard, Way, urgent, emergency, none, quote";
+  const base = "yes, no, confirm, cancel, reschedule, Monday, Tuesday, Wednesday, Thursday, Friday, Saturday, Sunday, today, tomorrow, next week, Street, Road, Avenue, Drive, Close, Court, Place, Lane, Crescent, Boulevard, Way, urgent, emergency, none, quote";
 
   const services = String(tradie?.services || tradie?.tone || "").toLowerCase();
   const bizName = String(tradie?.bizName || "").toLowerCase();
@@ -4036,8 +4036,7 @@ function buildTaskControlPrompt(session, step) {
   if (step === "name") return "What name should I put the booking under?";
   if (step === "access") return "Any access notes like gate code, parking, or pets?";
   if (step === "time" || step === "pickSlot") {
-    if (session?.memoryHooks?.timePreference) return `Noted ${session.memoryHooks.timePreference}. ${micro_commitment_question()}`;
-    return micro_commitment_question();
+    return "What day and time works best for you?";
   }
   if (step === "confirm") return "Does that all sound right so we can lock this in?";
   return "What do you need help with today?";
@@ -5305,7 +5304,7 @@ app.post("/process", async (req, res) => {
 
     if (session.unclearTurns >= 3) {
       session.unclearTurns = 0;
-      const controlPrompt = "Let's get a time secured first so this doesn't get worse. " + micro_commitment_question("time");
+      const controlPrompt = "Let's get a time secured first so this doesn't get worse. What day and time works best for you?";
       session.step = "time";
       session.lastPrompt = controlPrompt;
       addToHistory(session, "assistant", controlPrompt);
@@ -5706,7 +5705,7 @@ app.post("/process", async (req, res) => {
 
       const affAccess = getAffirmation(session);
       session.step = "time";
-      session.lastPrompt = `${affAccess} ${micro_commitment_question("day")} ${micro_commitment_question("time")}`;
+      session.lastPrompt = "What day and time works best for you?";
       addToHistory(session, "assistant", session.lastPrompt);
       ask(twiml, session.lastPrompt, actionUrl, { session });
       return sendVoiceTwiml(res, twiml);
@@ -6450,7 +6449,7 @@ app.post("/time", async (req, res) => {
       method: "POST",
       language: "en-AU"
     });
-    gather.say("That time is not available. Would you like another time?", { voice: "Polly.Amy", language: "en-AU" });
+    gather.say("Sorry that time is not available. What other time works for you?", { voice: "Polly.Amy", language: "en-AU" });
     return sendVoiceTwiml(res, twiml);
   } catch (e) {
     console.error("/time error", e);
@@ -6521,8 +6520,8 @@ app.post("/check-availability", async (req, res) => {
 
       if (slots.length === 0) {
         session.bookedStartMs = null;
-        session.lastPrompt = "That time is not available. Would you like another time?";
-        twiml.say("That time is not available. Would you like another time?", { voice: "Polly.Amy", language: "en-AU" });
+        session.lastPrompt = "Sorry that time is not available. What other time works for you?";
+        twiml.say("Sorry that time is not available. What other time works for you?", { voice: "Polly.Amy", language: "en-AU" });
         twiml.redirect({ method: "POST" }, "/time" + (req.query.tid ? `?tid=${encodeURIComponent(req.query.tid)}` : ""));
         return sendVoiceTwiml(res, twiml);
       }
@@ -6531,8 +6530,8 @@ app.post("/check-availability", async (req, res) => {
       const deltaMin = Math.abs(first.diff(requestedDt, "minutes").minutes);
       if (deltaMin > 5) {
         session.bookedStartMs = null;
-        session.lastPrompt = "That time is not available. Would you like another time?";
-        twiml.say("That time is not available. Would you like another time?", { voice: "Polly.Amy", language: "en-AU" });
+        session.lastPrompt = "Sorry that time is not available. What other time works for you?";
+        twiml.say("Sorry that time is not available. What other time works for you?", { voice: "Polly.Amy", language: "en-AU" });
         twiml.redirect({ method: "POST" }, "/time" + (req.query.tid ? `?tid=${encodeURIComponent(req.query.tid)}` : ""));
         return sendVoiceTwiml(res, twiml);
       }
