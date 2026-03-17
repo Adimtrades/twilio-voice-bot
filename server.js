@@ -5226,18 +5226,20 @@ app.post("/process", async (req, res) => {
       session.conversationState.silenceRetries += 1;
       session.lastNoSpeechFallback = true;
 
-      // Never hang up on silence — rotate recovery messages forever
-      const silenceMessages = [
-        "No worries — take your time. " + (session.lastPrompt || "What do you need help with today?"),
-        "Still there? I am here whenever you are ready.",
-        "Take your time — no rush at all.",
-        "I am still here. Just say anything when you are ready.",
-        "No pressure — I will wait."
-      ];
-      const silenceIdx = (session.silenceTries - 1) % silenceMessages.length;
-      session.lastPrompt = silenceMessages[silenceIdx];
+      // After first silence re-ask the actual last question
+      // After second silence use a gentle prompt
+      // After that keep alternating
+      const originalPrompt = session.lastPrompt || "What do you need help with today?";
+      let silencePrompt;
+      if (session.silenceTries === 1) {
+        silencePrompt = originalPrompt;
+      } else if (session.silenceTries === 2) {
+        silencePrompt = "Still there? Take your time — " + originalPrompt;
+      } else {
+        silencePrompt = "I am still here — no rush. " + originalPrompt;
+      }
 
-      ask(twiml, session.lastPrompt, voiceActionUrl(req), {
+      ask(twiml, silencePrompt, voiceActionUrl(req), {
         session,
         input: "speech",
         timeout: 15,
@@ -5430,30 +5432,24 @@ app.post("/process", async (req, res) => {
     const changeField = detectChangeFieldFromDigits(digits) || detectChangeFieldFromSpeech(speech);
     const canGlobalInterrupt = !session.conversationState.smartModeActive && !["intent", "confirm", "pickSlot", "access"].includes(session.step);
 
-    if (canGlobalInterrupt && (corrected || changeField)) {
-      if (changeField) {
-        session.step = changeField;
-        session.lastPrompt = `Sure — what’s the correct ${changeField}?`;
-      } else {
-        session.step = "access";
-        session.lastPrompt = "Any access notes like gate code, parking, or pets? Say none if not.";
-      }
+    // Only allow global interrupt for explicit field change requests
+    // Never interrupt during normal flow answers
+    const isExplicitChange = corrected && changeField &&
+      /\b(change|update|fix|wrong|incorrect|actually)\b/i.test(speech || "");
+    if (canGlobalInterrupt && isExplicitChange && changeField) {
+      session.step = changeField;
+      session.confirmPromptSent = false;
+      session.calendarCheckAnnounced = false;
+      session.calendarCheckDone = false;
+      session.lastPrompt = `Sure — what is the correct ${changeField}?`;
       addToHistory(session, "assistant", session.lastPrompt);
-
-      const actionUrl = "/process" + (req.query.tid ? `?tid=${encodeURIComponent(req.query.tid)}` : "");
-      ask(twiml, session.lastPrompt, actionUrl, { session });
+      const actionUrlChange = "/process" + (req.query.tid ? `?tid=${encodeURIComponent(req.query.tid)}` : "");
+      ask(twiml, session.lastPrompt, actionUrlChange, { session });
       return sendVoiceTwiml(res, twiml);
     }
 
-    if (canGlobalInterrupt && yn === "NO") {
-      session.step = "access";
-      session.lastPrompt = "Any access notes like gate code, parking, or pets? Say none if not.";
-      addToHistory(session, "assistant", session.lastPrompt);
-
-      const actionUrl = "/process" + (req.query.tid ? `?tid=${encodeURIComponent(req.query.tid)}` : "");
-      ask(twiml, session.lastPrompt, actionUrl, { session });
-      return sendVoiceTwiml(res, twiml);
-    }
+    // canGlobalInterrupt yn=NO disabled — was resetting to wrong step mid-flow
+    // NO responses are now handled within each step handler directly
 
     // ------------------------------------------------------------------------
     // MAIN FLOW
@@ -5690,7 +5686,12 @@ app.post("/process", async (req, res) => {
       // Always try to parse new speech first — never skip if caller gave a time
       if (speech && speech.trim().length > 2) {
         session.time = speech;
-        session.bookedStartMs = null; // reset so we reparse fresh
+        session.bookedStartMs = null;
+        // Reset calendar and confirm flags for fresh check
+        session.calendarCheckAnnounced = false;
+        session.calendarCheckDone = false;
+        session.calendarCheck = null;
+        session.confirmPromptSent = false;
       } else {
         session.time = session.time || "";
       }
@@ -5850,16 +5851,29 @@ app.post("/process", async (req, res) => {
       // Detect correction attempt — "no no" "wrong" "actually"
       const isCorrecting = /\b(no no|wrong|actually|wait|hang on|sorry that|not right)\b/i.test(speech || "");
       if (isCorrecting) {
-        console.log(`AMBIGUOUS_INPUT_RETRY callSid=${callSid} step=confirm reason=correction_phrase`);
-        session.lastPrompt = "No worries — tell me exactly what you want changed, and I’ll update it.";
+        session.confirmPromptSent = false;
+        session.calendarCheckAnnounced = false;
+        session.calendarCheckDone = false;
+        // Try to detect what they want to change from the same utterance
+        const changeFieldNow = detectChangeFieldFromSpeech(speech);
+        if (changeFieldNow) {
+          session.step = changeFieldNow;
+          session.lastPrompt = `No worries — what is the correct ${changeFieldNow}?`;
+        } else {
+          session.lastPrompt = "No worries — what would you like to change: job, time, address, or access notes?";
+        }
         addToHistory(session, "assistant", session.lastPrompt);
         ask(twiml, session.lastPrompt, actionUrl, { session });
         return sendVoiceTwiml(res, twiml);
       }
 
       if (yn2 === "NO") {
-        console.log(`AMBIGUOUS_INPUT_RETRY callSid=${callSid} step=confirm reason=explicit_no`);
-        session.lastPrompt = "No worries — what should I correct: job, time, address, or access notes?";
+        console.log(`STEP=confirm speech='${speech}' interpreted='NO'`);
+        // Reset confirm flags so it can be re-asked after correction
+        session.confirmPromptSent = false;
+        session.calendarCheckAnnounced = false;
+        session.calendarCheckDone = false;
+        session.lastPrompt = "No worries — what would you like to change: the job, time, address, or access notes?";
         addToHistory(session, "assistant", session.lastPrompt);
         ask(twiml, session.lastPrompt, actionUrl, { session, input: "speech", timeout: 10, speechTimeout: "auto" });
         return sendVoiceTwiml(res, twiml);
@@ -6415,27 +6429,58 @@ app.post("/time", async (req, res) => {
   try {
     if (!validateTwilioSignature(req)) {
       const deniedTwiml = new VoiceResponse();
-      deniedTwiml.say("Sorry, we are experiencing a temporary issue. Let’s continue.", { voice: "Polly.Amy", language: "en-AU" });
+      deniedTwiml.say("Sorry, we are experiencing a temporary issue.", { voice: "Polly.Amy", language: "en-AU" });
       return sendVoiceTwiml(res, deniedTwiml);
     }
+
+    // Reset calendar flags so rescheduling works cleanly
+    const callSid = resolveCallSid(req);
+    const fromNumber = (req.body.From || "").trim();
+    const session = getSession(callSid, fromNumber);
+    if (session) {
+      session.step = "time";
+      session.bookedStartMs = null;
+      session.time = "";
+      session.calendarCheckAnnounced = false;
+      session.calendarCheckDone = false;
+      session.calendarCheck = null;
+      session.confirmPromptSent = false;
+    }
+
     const twiml = new VoiceResponse();
-    const actionUrl = voiceActionUrl(req);
+    const tid = req.query.tid || req.body.tid || "";
+    const actionUrl = "/process" + (tid ? `?tid=${encodeURIComponent(tid)}` : "");
     const gather = twiml.gather({
       input: "speech",
       timeout: 10,
       speechTimeout: "auto",
       action: actionUrl,
       method: "POST",
-      language: "en-AU"
+      language: "en-AU",
+      speechModel: "phone_call",
+      enhanced: true
     });
-    gather.say("Sorry that time is not available. What other time works for you?", { voice: "Polly.Amy", language: "en-AU" });
+    gather.say("Sorry — that time is already taken. What other day and time works for you?", { voice: "Polly.Amy", language: "en-AU" });
     return sendVoiceTwiml(res, twiml);
   } catch (e) {
     console.error("/time error", e);
-    const twiml = new VoiceResponse();
-    twiml.say("Sorry, there was a temporary issue. Please tell me another time.", { voice: "Polly.Amy", language: "en-AU" });
-    twiml.redirect({ method: "POST" }, voiceActionUrl(req));
-    return sendVoiceTwiml(res, twiml);
+    try {
+      const twiml = new VoiceResponse();
+      const tid = req.query.tid || req.body.tid || "";
+      const actionUrl = "/process" + (tid ? `?tid=${encodeURIComponent(tid)}` : "");
+      const gather = twiml.gather({
+        input: "speech",
+        timeout: 10,
+        speechTimeout: "auto",
+        action: actionUrl,
+        method: "POST",
+        language: "en-AU"
+      });
+      gather.say("What other time works for you?", { voice: "Polly.Amy", language: "en-AU" });
+      return sendVoiceTwiml(res, twiml);
+    } catch {
+      return res.type("text/xml").send('<?xml version="1.0" encoding="UTF-8"?><Response><Redirect method="POST">/process</Redirect></Response>');
+    }
   }
 });
 
