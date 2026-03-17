@@ -5498,8 +5498,13 @@ app.post("/process", async (req, res) => {
 
     // STEP: intent
     if (session.step === "intent") {
+      // If first answer includes the job, move straight to address.
+      if (speech && speech.trim()) {
+        session.job = speech;
+      }
+
       // If job was already captured in initial step skip straight to address
-      if (session.job) {
+      if (session.job && session.job.trim()) {
         const jeIntent = getJobEmpathy(session.job);
         const affIntent = jeIntent || getAffirmation(session);
         session.step = "address";
@@ -5524,16 +5529,7 @@ app.post("/process", async (req, res) => {
           return sendVoiceTwiml(res, twiml);
         }
 
-        // Quote
-        if (session.intent === "QUOTE") {
-          session.step = "job";
-          session.lastPrompt = "Sure. What do you need a quote for?";
-          addToHistory(session, "assistant", session.lastPrompt);
-          ask(twiml, session.lastPrompt, actionUrl, { session });
-          return sendVoiceTwiml(res, twiml);
-        }
-
-        // Support/admin/existing or booking defaults to normal booking flow.
+        // Booking flow stays locked: only ask for job if job is still missing.
         session.step = "job";
         session.lastPrompt = "What job do you need help with?";
         addToHistory(session, "assistant", session.lastPrompt);
