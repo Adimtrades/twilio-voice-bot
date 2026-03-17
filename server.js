@@ -491,7 +491,7 @@ const MessagingResponse = twilio.twiml.MessagingResponse;
 const MAX_NO_SPEECH_RETRIES = Number(process.env.MAX_NO_SPEECH_RETRIES || 2);
 const CALENDAR_OP_TIMEOUT_MS = Number(process.env.CALENDAR_OP_TIMEOUT_MS || 8000);
 const CALENDAR_CHECK_TIMEOUT_MS = Number(process.env.CALENDAR_CHECK_TIMEOUT_MS || 5000);
-const VOICE_GATHER_TIMEOUT_SECONDS = Number(process.env.VOICE_GATHER_TIMEOUT_SECONDS || 6);
+const VOICE_GATHER_TIMEOUT_SECONDS = Number(process.env.VOICE_GATHER_TIMEOUT_SECONDS || 10);
 const SESSION_TTL_MS = Number(process.env.VOICE_SESSION_TTL_MS || 30 * 60 * 1000);
 const WEBHOOK_IDEMPOTENCY_TTL_MS = Number(process.env.WEBHOOK_IDEMPOTENCY_TTL_MS || 7000);
 const MIN_SPEECH_CONFIDENCE = Number(process.env.MIN_SPEECH_CONFIDENCE || 0.15);
@@ -5240,7 +5240,7 @@ app.post("/process", async (req, res) => {
       } else {
         session.lastPrompt = "I'm still here — let's finish your booking.";
       }
-      ask(twiml, session.lastPrompt, voiceActionUrl(req), { session, input: "speech", timeout: 8, speechTimeout: "auto" });
+      repeatLastStepPrompt(req, twiml, session, session.step, "NO_SPEECH");
       return sendVoiceTwiml(res, twiml);
     } else {
       session.silenceTries = 0;
@@ -6093,7 +6093,7 @@ ${historyLine}${memoryLine}${accessLine2}${valueLine || ""}${urgencyLine || ""}$
       const summaryName = session.name || "you";
       const summaryAddress = session.address || "your address";
       const summaryTime = session.time || "your requested time";
-      const summaryText = `All set ${summaryName}. Your booking reference is ${session.bookingRef || "confirmed"}. We have booked ${summaryJob} at ${summaryAddress} for ${summaryTime}. You are locked in and the tradie has been notified. We have sent you a confirmation text with all the details. If you need to make any changes just reply to that text. Thanks for calling — have a great day. Goodbye.`;
+      const summaryBaseText = `All set ${summaryName}. Your booking reference is ${session.bookingRef || "confirmed"}. We have booked ${summaryJob} at ${summaryAddress} for ${summaryTime}. You are locked in and the tradie has been notified. We have sent you a confirmation text with all the details. If you need to make any changes just reply to that text. Thanks for calling — have a great day. Goodbye.`;
       const afterHoursNote = req._isAfterHours
         ? " We are closed right now but the tradie will confirm your booking first thing tomorrow morning."
         : "";
@@ -6101,18 +6101,10 @@ ${historyLine}${memoryLine}${accessLine2}${valueLine || ""}${urgencyLine || ""}$
       const sameDayNote = isSameDay
         ? " I will make sure the tradie sees this straight away."
         : "";
-      const finalSummary = summaryText + afterHoursNote + sameDayNote;
-      twiml.say(finalSummary, { voice: "Polly.Amy", language: "en-AU" });
-      ensureCompletionState(session);
-      session.conversationState.finalCloseDelivered = true;
-      ensureCallFlow(session);
-      setLockedFlowStep(session, "close", "calendar_success");
-      session.step = "close";
-      session.lastPrompt = "Before we finish, is there anything else you need? You can say yes that's all, thanks, goodbye, or all done.";
-      ensureCallFlow(session);
-      session.callFlow.hangupAllowed = canHangUp(session);
-      console.log("FLOW STATUS:", session.callFlow);
-      ask(twiml, session.lastPrompt, actionUrl, { session, input: "speech", timeout: 7, speechTimeout: "auto" });
+      const summaryText = summaryBaseText + afterHoursNote + sameDayNote;
+      twiml.say(summaryText, { voice: "Polly.Amy", language: "en-AU" });
+      twiml.hangup();
+      resetSession(callSid);
       return sendVoiceTwiml(res, twiml);
     }
 
@@ -6154,37 +6146,12 @@ ${historyLine}${memoryLine}${accessLine2}${valueLine || ""}${urgencyLine || ""}$
       trackError("VOICE /process catch");
     } catch {}
     try {
-      const recoveryTwiml = new VoiceResponse();
-      const recoveryActionUrl = "/process" + (req.query.tid ? `?tid=${encodeURIComponent(req.query.tid)}` : "");
-      recoveryTwiml.say("Sorry about that — still with you. Let me pick up where we left off.", { voice: "Polly.Amy", language: "en-AU" });
-      const recoverGather = recoveryTwiml.gather({
-        input: "speech",
-        timeout: 8,
-        speechTimeout: "auto",
-        action: recoveryActionUrl,
-        method: "POST",
-        language: "en-AU"
-      });
-      const callSid = resolveCallSid(req);
-      const session = callSid ? sessions.get(callSid) : null;
-      recoverGather.say(session?.lastPrompt || "What do you need help with today?", { voice: "Polly.Amy", language: "en-AU" });
-      return sendVoiceTwiml(res, recoveryTwiml);
-    } catch (fatalErr) {
-      console.error("FATAL VOICE RECOVERY ERROR:", fatalErr);
-      try {
-        const lastResort = new VoiceResponse();
-        const lastResortUrl = "/process" + (req.query?.tid ? `?tid=${encodeURIComponent(req.query.tid)}` : "");
-        const lastGather = lastResort.gather({
-          input: "speech",
-          timeout: 8,
-          speechTimeout: "auto",
-          action: lastResortUrl,
-          method: "POST",
-          language: "en-AU"
-        });
-        lastGather.say("Still here — what do you need help with today?", { voice: "Polly.Amy", language: "en-AU" });
-        return sendVoiceTwiml(res, lastResort);
-      } catch {}
+      const safeTwiml = new VoiceResponse();
+      safeTwiml.say("Sorry about that — still here with you.", { voice: "Polly.Amy", language: "en-AU" });
+      safeTwiml.redirect({ method: "POST" }, "/process" + (req.query.tid ? `?tid=${encodeURIComponent(req.query.tid)}` : ""));
+      return sendVoiceTwiml(res, safeTwiml);
+    } catch {
+      return res.type("text/xml").send('<?xml version="1.0" encoding="UTF-8"?><Response><Redirect method="POST">/process</Redirect></Response>');
     }
   }
 });
