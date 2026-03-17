@@ -3150,6 +3150,7 @@ function getSession(callSid, fromNumber = "") {
       offScriptCount: 0,
       lastEmotion: "neutral",
       calendarCheckAnnounced: false,
+      calendarCheckDone: false,
       confirmPromptSent: false,
 
       lastTwimlXml: null,
@@ -3519,13 +3520,7 @@ function maybeSkipCollectedField(session, step) {
   const fields = session?.conversationState?.collectedFields || {};
   const value = field === "access" ? (session.accessNote ?? fields.access ?? "") : fields[field];
   if (!isFieldValid(field, value, session)) return false;
-  console.log(`FIELD_ALREADY_COLLECTED_SKIP step=${step} field=${field}`);
-  if (step === "job") session.step = "address";
-  else if (step === "address") session.step = "name";
-  else if (step === "name") session.step = "access";
-  else if (step === "access") session.step = "time";
-  else if (step === "time") session.step = "confirm";
-  return true;
+  return false;
 }
 
 function ask(twiml, prompt, actionUrl, options = {}) {
@@ -3781,7 +3776,7 @@ function sendVoiceTwiml(res, twiml, fallbackMessage = "Still here — what do yo
 }
 
 
-async function performCalendarAvailabilityCheck({ tradie, dt, tz, callSid }) {
+async function performCalendarAvailabilityCheck({ tradie, dt, tz, callSid, session }) {
   const startedAt = Date.now();
   console.log("CALENDAR_CHECK_START", {
     callSid,
@@ -3796,6 +3791,7 @@ async function performCalendarAvailabilityCheck({ tradie, dt, tz, callSid }) {
       "calendar availability"
     );
     const responseMs = Date.now() - startedAt;
+    if (session) session.calendarCheckDone = true;
     console.log("CALENDAR_CHECK_DONE", {
       callSid,
       tradieKey: tradie?.key || "unknown",
@@ -4405,7 +4401,7 @@ function detectYesNoFromDigits(d) {
 }
 function detectYesNo(text) {
   const t = (text || "").toLowerCase().trim();
-  const yes = ["yes","yeah","yep","yup","sure","ok","okay","correct","that's right","thats right","sounds good","absolutely","for sure","definitely","go ahead","go for it","that’s right","confirm"];
+  const yes = ["yes","yeah","yep","yup","sure","ok","okay","correct","that's right","thats right","that works","that is fine","that is good","works for me","perfect","sounds good","go ahead","lock it in","book it","yes please","definitely","for sure","absolutely","go for it","that’s right","confirm"];
   const no = ["no","nope","nah","wrong","not right","don’t","dont","change","edit"];
 
   if (yes.some((w) => t === w || t.includes(w))) return "YES";
@@ -5687,7 +5683,13 @@ app.post("/process", async (req, res) => {
 
     // STEP: time
     if (session.step === "time") {
-      session.time = speech || session.time || "";
+      // Always try to parse new speech first — never skip if caller gave a time
+      if (speech && speech.trim().length > 2) {
+        session.time = speech;
+        session.bookedStartMs = null; // reset so we reparse fresh
+      } else {
+        session.time = session.time || "";
+      }
 
       let dt = null;
       if (session.bookedStartMs) dt = DateTime.fromMillis(session.bookedStartMs, { zone: tz });
@@ -5825,10 +5827,15 @@ app.post("/process", async (req, res) => {
 
     // STEP: confirm
     if (session.step === "confirm") {
-      const confirmConfidenceTooLow = typeof confidence === "number" && confidence > 0 && confidence < 0.45;
-      const yn2 = detectYesNo(speech);
+      // If caller repeats the time instead of saying yes/no
+      // treat it as a YES confirmation — they are confirming the time
+      const isTimeRepeat = speech && parseRequestedDateTime &&
+        !!parseRequestedDateTime(speech, tz);
+      const yn2 = detectYesNo(speech) || (isTimeRepeat ? "YES" : null);
+      const confirmConfidenceTooLow = typeof confidence === "number" &&
+        confidence > 0 && confidence < 0.35;
 
-      if (!speech || confirmConfidenceTooLow || !yn2) {
+      if (!speech || (confirmConfidenceTooLow && !yn2)) {
         const interpreted = !speech ? "NO_SPEECH" : (confirmConfidenceTooLow ? "UNCLEAR" : "UNCLEAR");
         console.log(`STEP=confirm speech='${speech}' interpreted='${interpreted}' retryCount=${getRetryCountForStep(session, "confirm") + 1}`);
         repeatLastStepPrompt(req, twiml, session, "confirm", interpreted);
@@ -5852,6 +5859,27 @@ app.post("/process", async (req, res) => {
         addToHistory(session, "assistant", session.lastPrompt);
         ask(twiml, session.lastPrompt, actionUrl, { session, input: "speech", timeout: 7, speechTimeout: "auto" });
         return sendVoiceTwiml(res, twiml);
+      }
+
+      // Safety net — if we reached confirm but calendar was never checked
+      // run the calendar check now before creating the booking
+      if (
+        yn2 === "YES" &&
+        session.bookedStartMs &&
+        !session.calendarCheckDone &&
+        tradie.googleRefreshToken &&
+        tradie.id &&
+        tradie.calendarId
+      ) {
+        session.calendarCheck = {
+          requestedDtISO: DateTime.fromMillis(session.bookedStartMs, { zone: tz }).toISO(),
+          attempts: 0
+        };
+        session.calendarCheckAnnounced = false;
+        session.step = "time";
+        const calTwiml = new VoiceResponse();
+        keepCallAliveForProcessing(req, calTwiml, getCalendarWaitMessage ? getCalendarWaitMessage() : "Let me just check that time for you.");
+        return sendVoiceTwiml(res, calTwiml);
       }
 
       console.log(`STEP=confirm speech='${speech}' interpreted='YES' retryCount=${getRetryCountForStep(session, "confirm")}`);
@@ -6487,7 +6515,7 @@ app.post("/check-availability", async (req, res) => {
     session.calendarCheck.attempts = Number(session.calendarCheck.attempts || 0);
 
     session.calendarCheck.attempts += 1;
-    const result = await performCalendarAvailabilityCheck({ tradie, dt, tz, callSid });
+    const result = await performCalendarAvailabilityCheck({ tradie, dt, tz, callSid, session });
     if (result.ok) {
       const slots = Array.isArray(result.slots) ? result.slots : [];
       const requestedDt = DateTime.fromISO(session.calendarCheck.requestedDtISO || dt.toISO(), { zone: tz });
@@ -6510,6 +6538,7 @@ app.post("/check-availability", async (req, res) => {
         return sendVoiceTwiml(res, twiml);
       }
 
+      session.calendarCheckDone = true;
       session.calendarCheck = null;
       session.bookedStartMs = first.toMillis();
       session.step = "confirm";
