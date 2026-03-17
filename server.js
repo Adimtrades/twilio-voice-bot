@@ -553,31 +553,26 @@ async function upsertRow(table, row) {
   }
 }
 async function getOne(table, query) {
+  if (!supabaseCircuitAllow()) {
+    console.warn(`SUPABASE_CIRCUIT_BLOCKED table=${table}`);
+    return null;
+  }
   if (!supaReady()) return null;
   const url = `${SUPABASE_URL}/rest/v1/${table}?${query}&limit=1`;
   try {
     const r = await fetch(url, { headers: supaHeaders() });
     const data = await r.json();
+    supabaseCircuitSuccess();
     return Array.isArray(data) && data[0] ? data[0] : null;
-  } catch {
+  } catch (e) {
+    supabaseCircuitFailure();
     return null;
   }
 }
-// Wrap the existing getOne function with circuit breaker
-const _originalGetOne = getOne;
-async function getOne(table, query) {
-  if (!supabaseCircuitAllow()) {
-    console.warn(`SUPABASE_CIRCUIT_BLOCKED table=${table}`);
-    return null;
-  }
-  try {
-    const result = await _originalGetOne(table, query);
-    supabaseCircuitSuccess();
-    return result;
-  } catch (err) {
-    supabaseCircuitFailure();
-    throw err;
-  }
+// Circuit breaker check injected into supaReady guard
+// instead of wrapping getOne to avoid infinite recursion
+function supabaseReady() {
+  return supaReady() && supabaseCircuitAllow();
 }
 
 async function getMany(table, query) {
