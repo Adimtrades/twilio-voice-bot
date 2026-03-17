@@ -6093,7 +6093,7 @@ ${historyLine}${memoryLine}${accessLine2}${valueLine || ""}${urgencyLine || ""}$
       const summaryName = session.name || "you";
       const summaryAddress = session.address || "your address";
       const summaryTime = session.time || "your requested time";
-      const summaryText = `Booked: ${summaryJob} at ${summaryAddress} ${summaryTime}. Ref ${session.bookingRef || "confirmed"}.`;
+      const summaryText = `All set ${summaryName}. Your booking reference is ${session.bookingRef || "confirmed"}. We have booked ${summaryJob} at ${summaryAddress} for ${summaryTime}. You are locked in and the tradie has been notified. We have sent you a confirmation text with all the details. If you need to make any changes just reply to that text. Thanks for calling — have a great day. Goodbye.`;
       const afterHoursNote = req._isAfterHours
         ? " We are closed right now but the tradie will confirm your booking first thing tomorrow morning."
         : "";
