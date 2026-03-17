@@ -122,19 +122,114 @@ app.set("trust proxy", true);
 app.set("strict routing", false);
 
 app.use((req, res, next) => {
-  console.log("REQ", req.method, req.originalUrl);
+  req.requestId = req.headers["x-request-id"] ||
+    req.headers["x-twilio-request-id"] ||
+    `req_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+  res.setHeader("x-request-id", req.requestId);
+  console.log("REQ", req.method, req.originalUrl, `[${req.requestId}]`);
+  next();
+});
+
+// Global request timeout — kill any request taking over 25 seconds
+// Twilio webhooks time out at 30s so 25s gives time to respond
+app.use((req, res, next) => {
+  const TIMEOUT_MS = Number(process.env.REQUEST_TIMEOUT_MS || 25000);
+  const timer = setTimeout(() => {
+    if (!res.headersSent) {
+      console.error(`REQUEST_TIMEOUT ${req.method} ${req.originalUrl}`);
+      try { trackError("REQUEST_TIMEOUT"); } catch {}
+      // For Twilio voice routes return valid TwiML so call stays alive
+      const isTwilioVoice = req.originalUrl.includes("/twilio/voice") ||
+        req.originalUrl.includes("/process") ||
+        req.originalUrl.includes("/check-availability") ||
+        req.originalUrl.includes("/confirm");
+      if (isTwilioVoice) {
+        return res.type("text/xml").send(
+          '<?xml version="1.0" encoding="UTF-8"?><Response><Say voice="Polly.Amy" language="en-AU">Bear with me one moment.</Say><Redirect method="POST">/process</Redirect></Response>'
+        );
+      }
+      return res.status(504).json({ error: "Request timeout" });
+    }
+  }, TIMEOUT_MS);
+  res.on("finish", () => clearTimeout(timer));
+  res.on("close", () => clearTimeout(timer));
+  next();
+});
+
+app.use((req, res, next) => {
+  // Skip rate limiting for health and static routes
+  if (req.originalUrl === "/health" || req.originalUrl === "/") return next();
+
+  const ip = String(req.ip || req.headers["x-forwarded-for"] || "unknown")
+    .split(",")[0].trim();
+  const tradieNumber = String(req.body?.To || req.query?.To || "").trim();
+
+  // 120 requests per minute per IP
+  if (!checkRateLimit(`ip:${ip}`, 120)) {
+    console.warn(`RATE_LIMIT_IP ip=${ip} path=${req.originalUrl}`);
+    if (req.originalUrl.includes("/twilio/") || req.originalUrl.includes("/process")) {
+      return res.type("text/xml").send(
+        '<?xml version="1.0" encoding="UTF-8"?><Response><Say voice="Polly.Amy" language="en-AU">Please try again in a moment.</Say></Response>'
+      );
+    }
+    return res.status(429).json({ error: "Too many requests" });
+  }
+
+  // 300 requests per minute per tradie number
+  if (tradieNumber && !checkRateLimit(`tradie:${tradieNumber}`, 300)) {
+    console.warn(`RATE_LIMIT_TRADIE number=${tradieNumber}`);
+    return res.type("text/xml").send(
+      '<?xml version="1.0" encoding="UTF-8"?><Response><Say voice="Polly.Amy" language="en-AU">Our lines are busy — please try again shortly.</Say></Response>'
+    );
+  }
+
   next();
 });
 
 // ----------------------------------------------------------------------------
 // Process-level safety
 // ----------------------------------------------------------------------------
-process.on("uncaughtException", (err) => {
+process.on("uncaughtException", async (err) => {
   console.error("UNCAUGHT EXCEPTION:", err);
+  try { trackError("uncaughtException:" + (err?.message || "")); } catch {}
+
+  // Log to Supabase if available
+  try {
+    if (supabase) {
+      await supabase.from("error_logs").insert([{
+        error_type: "uncaughtException",
+        message: err?.message || String(err),
+        stack: err?.stack || null,
+        created_at: new Date().toISOString()
+      }]).timeout(2000);
+    }
+  } catch (logErr) {
+    console.error("FAILED_TO_LOG_UNCAUGHT_EXCEPTION", logErr);
+  }
+
+  // Only exit for truly fatal errors — not for common recoverable ones
+  const fatalPatterns = [
+    "EADDRINUSE", "MODULE_NOT_FOUND", "Cannot find module",
+    "ENOMEM", "out of memory"
+  ];
+  const isFatal = fatalPatterns.some(p =>
+    String(err?.message || err?.code || "").includes(p)
+  );
+
+  if (isFatal) {
+    console.error("FATAL_ERROR — exiting process");
+    process.exit(1);
+  } else {
+    console.warn("RECOVERABLE_EXCEPTION — keeping server alive");
+    // Clear potentially corrupted state
+    try { cleanupMaps(); } catch {}
+  }
 });
 
-process.on("unhandledRejection", (err) => {
-  console.error("UNHANDLED PROMISE:", err);
+process.on("unhandledRejection", (reason) => {
+  console.error("UNHANDLED REJECTION:", reason);
+  try { trackError("unhandledRejection:" + String(reason?.message || reason || "")); } catch {}
+  // Never crash on unhandled rejections — log and continue
 });
 
 process.on("SIGTERM", () => {
@@ -179,14 +274,14 @@ function rawBodySaver(req, res, buf) {
 // Twilio posts x-www-form-urlencoded for Voice/SMS (but DON'T touch Stripe webhook raw body)
 app.use((req, res, next) => {
   if (req.originalUrl === "/stripe/webhook") return next();
-  return express.urlencoded({ extended: false, verify: rawBodySaver })(req, res, next);
+  return express.urlencoded({ extended: true, limit: "5mb", verify: rawBodySaver })(req, res, next);
 });
 
 
 // JSON for everything except Stripe webhook (must be raw)
 app.use((req, res, next) => {
   if (req.originalUrl === "/stripe/webhook") return next();
-  return express.json({ limit: "1mb" })(req, res, next);
+  return express.json({ limit: "5mb" })(req, res, next);
 });
 
 app.use((req, res, next) => {
@@ -199,11 +294,19 @@ app.use((req, res, next) => {
 });
 
 app.get('/health', (req, res) => {
+  const mem = process.memoryUsage();
   res.json({
-    status: 'ok',
+    status: "ok",
     version: BOT_VERSION,
     time: new Date().toISOString(),
-    uptimeSeconds: Math.floor(process.uptime())
+    uptimeSeconds: Math.floor(process.uptime()),
+    activeCalls: typeof activeCallsMap !== "undefined" ? activeCallsMap.size : 0,
+    activeSessions: sessions.size,
+    heapMB: Math.round(mem.heapUsed / 1024 / 1024),
+    rssMB: Math.round(mem.rss / 1024 / 1024),
+    supabaseCircuit: typeof supabaseCircuit !== "undefined" ? supabaseCircuit.state : "UNKNOWN",
+    llmCircuit: global._llmCircuit ? global._llmCircuit.state : "CLOSED",
+    errorRateLastHour: typeof errorRateTracker !== "undefined" ? errorRateTracker.count : 0
   });
 });
 
@@ -460,6 +563,23 @@ async function getOne(table, query) {
     return null;
   }
 }
+// Wrap the existing getOne function with circuit breaker
+const _originalGetOne = getOne;
+async function getOne(table, query) {
+  if (!supabaseCircuitAllow()) {
+    console.warn(`SUPABASE_CIRCUIT_BLOCKED table=${table}`);
+    return null;
+  }
+  try {
+    const result = await _originalGetOne(table, query);
+    supabaseCircuitSuccess();
+    return result;
+  } catch (err) {
+    supabaseCircuitFailure();
+    throw err;
+  }
+}
+
 async function getMany(table, query) {
   if (!supaReady()) return [];
   const url = `${SUPABASE_URL}/rest/v1/${table}?${query}`;
@@ -994,13 +1114,38 @@ async function callLlm(tradie, session, userSpeech) {
     { role: "user", content: String(userSpeech || "") }
   ];
 
+  // LLM circuit breaker
+  if (!global._llmCircuit) {
+    global._llmCircuit = { failures: 0, lastFailure: 0, state: "CLOSED" };
+  }
+  const llmC = global._llmCircuit;
+  const llmNow = Date.now();
+  if (llmC.state === "OPEN" && llmNow - llmC.lastFailure < 60000) {
+    console.warn("LLM_CIRCUIT_OPEN skipping LLM call");
+    return null;
+  }
+  if (llmNow - llmC.lastFailure > 60000) {
+    llmC.state = "CLOSED";
+    llmC.failures = 0;
+  }
+
+  let llmTimer;
   try {
-    const data = await safeLLMCall({
-      model: "gpt-4o",
-      max_tokens: 200,
-      temperature: 0.6,
-      messages
+    // Hard 4 second timeout on LLM — never block the call flow
+    const llmTimeoutPromise = new Promise((_, reject) => {
+      llmTimer = setTimeout(() => reject(new Error("LLM timeout")), 4000);
     });
+
+    const data = await Promise.race([
+      safeLLMCall({
+        model: "gpt-4o",
+        max_tokens: 200,
+        temperature: 0.6,
+        messages
+      }),
+      llmTimeoutPromise
+    ]);
+    clearTimeout(llmTimer);
 
     if (!data) return null;
 
@@ -1051,6 +1196,13 @@ async function callLlm(tradie, session, userSpeech) {
 
     return parsed;
   } catch (e) {
+    clearTimeout(llmTimer);
+    llmC.failures += 1;
+    llmC.lastFailure = Date.now();
+    if (llmC.failures >= 3) {
+      llmC.state = "OPEN";
+      console.warn("LLM_CIRCUIT_OPEN after failures:", llmC.failures);
+    }
     console.warn("LLM call failed:", e?.message || e);
     return null;
   }
@@ -2743,6 +2895,30 @@ setInterval(() => {
 // In-memory caller blacklist — persists for life of server process
 // Owner SMSes "BLOCK +61xxxxxxxxx" to add, "UNBLOCK +61xxxxxxxxx" to remove
 const callerBlacklist = new Map(); // key: "tradieKey::phoneNumber" -> true
+// In-memory rate limiter — no external dependency needed
+// Limits: 60 requests per minute per IP, 200 per minute per tradie number
+const rateLimitStore = new Map(); // key -> { count, windowStart }
+
+function checkRateLimit(key, maxPerMinute) {
+  const now = Date.now();
+  const entry = rateLimitStore.get(key) || { count: 0, windowStart: now };
+  if (now - entry.windowStart > 60000) {
+    entry.count = 1;
+    entry.windowStart = now;
+  } else {
+    entry.count += 1;
+  }
+  rateLimitStore.set(key, entry);
+  return entry.count <= maxPerMinute;
+}
+
+// Clean rate limit store every 2 minutes
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, v] of rateLimitStore.entries()) {
+    if (now - v.windowStart > 120000) rateLimitStore.delete(k);
+  }
+}, 120000);
 // Stripe webhook dedup — prevent double processing within 60 seconds
 const processedStripeEvents = new Map(); // eventId -> timestamp
 // Error rate monitoring — alert if more than 10 errors in one hour
@@ -2781,16 +2957,117 @@ function trackError(context = "") {
     })();
   }
 }
+// Circuit breaker for Supabase — if 5 failures in 30 seconds open circuit
+// and use cached/fallback data for 30 seconds before retrying
+const supabaseCircuit = {
+  failures: 0,
+  lastFailure: 0,
+  state: "CLOSED", // CLOSED = normal, OPEN = degraded, HALF_OPEN = testing
+  FAILURE_THRESHOLD: 5,
+  RECOVERY_MS: 30000
+};
+
+// Concurrent call tracking for commercial monitoring
+const activeCallsMap = new Map(); // callSid -> startTime
+
+function registerActiveCall(callSid) {
+  activeCallsMap.set(callSid, Date.now());
+  const count = activeCallsMap.size;
+  if (count > 50) {
+    console.warn(`HIGH_CONCURRENT_CALLS count=${count}`);
+    try { trackError("HIGH_CONCURRENT_CALLS"); } catch {}
+  }
+  console.log(`CALL_STARTED callSid=${callSid} activeCalls=${count}`);
+}
+
+function deregisterActiveCall(callSid) {
+  const start = activeCallsMap.get(callSid);
+  activeCallsMap.delete(callSid);
+  if (start) {
+    const durationSec = Math.round((Date.now() - start) / 1000);
+    console.log(`CALL_ENDED callSid=${callSid} durationSec=${durationSec} activeCalls=${activeCallsMap.size}`);
+  }
+}
+
+// Clean stale active calls older than 45 minutes
+setInterval(() => {
+  const now = Date.now();
+  for (const [sid, start] of activeCallsMap.entries()) {
+    if (now - start > 45 * 60 * 1000) {
+      activeCallsMap.delete(sid);
+      console.log(`CALL_STALE_CLEANED callSid=${sid}`);
+    }
+  }
+}, 10 * 60 * 1000);
+
+function supabaseCircuitAllow() {
+  const now = Date.now();
+  if (supabaseCircuit.state === "CLOSED") return true;
+  if (supabaseCircuit.state === "OPEN") {
+    if (now - supabaseCircuit.lastFailure > supabaseCircuit.RECOVERY_MS) {
+      supabaseCircuit.state = "HALF_OPEN";
+      return true;
+    }
+    return false;
+  }
+  return true; // HALF_OPEN — allow one through
+}
+
+function supabaseCircuitSuccess() {
+  supabaseCircuit.failures = 0;
+  supabaseCircuit.state = "CLOSED";
+}
+
+function supabaseCircuitFailure() {
+  supabaseCircuit.failures += 1;
+  supabaseCircuit.lastFailure = Date.now();
+  if (supabaseCircuit.failures >= supabaseCircuit.FAILURE_THRESHOLD) {
+    if (supabaseCircuit.state !== "OPEN") {
+      console.error("SUPABASE_CIRCUIT_OPEN — degrading to cache/fallback");
+      try { trackError("SUPABASE_CIRCUIT_OPEN"); } catch {}
+    }
+    supabaseCircuit.state = "OPEN";
+  }
+}
+
 const processSpeechLocks = new Map();
 
 function cleanupMaps() {
-  // Cap sessions at 500 — evict oldest first to prevent memory leak
-  if (sessions.size > 500) {
-    const sorted = [...sessions.entries()].sort((a, b) => (a[1].updatedAt || 0) - (b[1].updatedAt || 0));
-    const toDelete = sorted.slice(0, sessions.size - 500);
-    for (const [sid] of toDelete) sessions.delete(sid);
-  }
   const now = Date.now();
+
+  // Hard cap at 500 active sessions — evict oldest first
+  if (sessions.size > 500) {
+    const sorted = [...sessions.entries()]
+      .sort((a, b) => (a[1].updatedAt || 0) - (b[1].updatedAt || 0));
+    const toDelete = sorted.slice(0, sessions.size - 500);
+    for (const [sid] of toDelete) {
+      sessions.delete(sid);
+      activeCallsMap.delete(sid);
+    }
+    console.warn(`SESSION_CAP_EVICTED count=${toDelete.length}`);
+  }
+
+  // Also cap tradie cache to prevent unbounded growth
+  if (TRADIE_CACHE.size > 1000) {
+    const cacheEntries = [...TRADIE_CACHE.entries()]
+      .sort((a, b) => (a[1].exp || 0) - (b[1].exp || 0));
+    const toDelete = cacheEntries.slice(0, TRADIE_CACHE.size - 1000);
+    for (const [k] of toDelete) TRADIE_CACHE.delete(k);
+  }
+
+  // Cap rate limit store
+  if (rateLimitStore && rateLimitStore.size > 5000) {
+    for (const [k, v] of rateLimitStore.entries()) {
+      if (now - v.windowStart > 120000) rateLimitStore.delete(k);
+    }
+  }
+
+  // Cap processed Stripe events
+  if (typeof processedStripeEvents !== "undefined" && processedStripeEvents.size > 500) {
+    for (const [eid, ts] of processedStripeEvents.entries()) {
+      if (now - ts > 120000) processedStripeEvents.delete(eid);
+    }
+  }
   for (const [sid, data] of sessions.entries()) {
     if (!data?.updatedAt || (now - data.updatedAt) > SESSION_TTL_MS) {
       // Send recovery SMS if call had data but never completed
@@ -2840,6 +3117,8 @@ function cleanupMaps() {
 function getSession(callSid, fromNumber = "") {
   cleanupMaps();
   if (!sessions.has(callSid)) {
+    // Each callSid gets a completely fresh isolated session object
+    // No shared references to other sessions — all primitives and new arrays
     sessions.set(callSid, {
       step: "intent",
       intent: "NEW_BOOKING",
@@ -2940,7 +3219,11 @@ function getSession(callSid, fromNumber = "") {
     });
   } else {
     const s = sessions.get(callSid);
-      if (!s.from && fromNumber) s.from = fromNumber;
+    if (!s.from && fromNumber) s.from = fromNumber;
+    // Ensure arrays are not shared references
+    if (!Array.isArray(s.history)) s.history = [];
+    if (!Array.isArray(s._usedAffirmations)) s._usedAffirmations = [];
+    if (!Array.isArray(s.proposedSlots)) s.proposedSlots = [];
   }
   const active = sessions.get(callSid);
   if (!active.conversation_state) active.conversation_state = behaviouralEngine.createConversationState();
@@ -3127,6 +3410,7 @@ function handleVoiceEntry(req, res) {
   const callSid = resolveCallSid(req);
   const fromNumber = (req.body?.From || req.query?.From || "").trim();
   const session = getSession(callSid, fromNumber);
+  registerActiveCall(callSid);
   session.step = "intent";
   session.retryCount = 0;
   session.hasEnteredVoice = true;
@@ -4920,6 +5204,7 @@ app.post("/process", async (req, res) => {
     if (globalOverride === "CANCEL") {
       await missedRevenueAlert(tradie, session, "Caller said cancel").catch(() => {});
       twiml.say("No problem. I’ve cancelled this request. Goodbye.", { voice: "Polly.Amy", language: "en-AU" });
+      deregisterActiveCall(callSid);
       twiml.hangup();
       return sendVoiceTwiml(res, twiml);
     }
@@ -4940,6 +5225,7 @@ app.post("/process", async (req, res) => {
 
       if (session.abuseStrikes >= 5) {
         twiml.say("I am going to have to end this call now.", { voice: "Polly.Amy", language: "en-AU" });
+        deregisterActiveCall(callSid);
         twiml.hangup();
         return sendVoiceTwiml(res, twiml);
       }
@@ -6415,8 +6701,23 @@ app.post("/debug/create-test-event", express.json({ limit: "256kb" }), async (re
 // Error handler
 // 
 app.use((err, req, res, next) => {
-  console.error("UNHANDLED_ROUTE_ERROR", err);
+  console.error("UNHANDLED_ROUTE_ERROR", err?.message || err);
+  try { trackError("ROUTE_ERROR:" + (err?.message || "")); } catch {}
+
   if (res.headersSent) return next(err);
+
+  // For Twilio voice routes return valid TwiML to keep call alive
+  const isTwilioRoute = req.originalUrl.includes("/twilio/") ||
+    req.originalUrl.includes("/process") ||
+    req.originalUrl.includes("/check-availability") ||
+    req.originalUrl.includes("/confirm");
+
+  if (isTwilioRoute) {
+    return res.type("text/xml").send(
+      '<?xml version="1.0" encoding="UTF-8"?><Response><Say voice="Polly.Amy" language="en-AU">Sorry about that — still here. What do you need help with today?</Say><Redirect method="POST">/process</Redirect></Response>'
+    );
+  }
+
   return res.status(500).json({ error: "Internal Server Error" });
 });
 
@@ -6529,6 +6830,32 @@ setInterval(async () => {
     console.error("HEALTH_CHECK_ERROR", schedErr?.message || schedErr);
   }
 }, 60 * 60 * 1000);
+
+// Memory pressure monitoring — alert if heap exceeds 400mb
+setInterval(() => {
+  try {
+    const used = process.memoryUsage();
+    const heapMB = Math.round(used.heapUsed / 1024 / 1024);
+    const rssMB = Math.round(used.rss / 1024 / 1024);
+
+    if (heapMB > 400) {
+      console.error(`MEMORY_PRESSURE heapMB=${heapMB} rssMB=${rssMB} sessions=${sessions.size} activeCalls=${activeCallsMap.size}`);
+      try { trackError("MEMORY_PRESSURE"); } catch {}
+
+      // Emergency cleanup — be more aggressive
+      cleanupMaps();
+
+      // Force GC if available (Node --expose-gc flag)
+      if (global.gc) {
+        global.gc();
+        console.log("FORCED_GC triggered");
+      }
+    } else if (heapMB > 250) {
+      console.warn(`MEMORY_WARNING heapMB=${heapMB} sessions=${sessions.size}`);
+      cleanupMaps();
+    }
+  } catch {}
+}, 5 * 60 * 1000); // Check every 5 minutes
 
 if (require.main === module) {
   app.listen(PORT, () => console.log("Server listening on", PORT));
