@@ -2926,7 +2926,12 @@ function getSession(callSid, fromNumber = "") {
         confirmationPending: false,
         calendarEventPending: true,
         callLockedToFlow: true,
-        smartModeActive: true
+        smartModeActive: true,
+        callCompletionAllowed: false,
+        bookingConfirmed: false,
+        calendarSuccess: false,
+        finalCloseDelivered: false,
+        silenceRetries: 0
       },
 
       accessEditMode: "replace",
@@ -2958,7 +2963,12 @@ function getSession(callSid, fromNumber = "") {
       confirmationPending: false,
       calendarEventPending: true,
       callLockedToFlow: true,
-      smartModeActive: true
+      smartModeActive: true,
+      callCompletionAllowed: false,
+      bookingConfirmed: false,
+      calendarSuccess: false,
+      finalCloseDelivered: false,
+      silenceRetries: 0
     };
   }
   ensureCallFlow(active);
@@ -3386,18 +3396,79 @@ function keepCallAliveForProcessing(req, twiml, message = "") {
   twiml.redirect({ method: "POST" }, checkUrl);
 }
 
-function canHangUp(session) {
-  if (!session || !session.callFlow) return false;
+function logStructured(event, details = {}) {
+  try {
+    console.log(event, details);
+  } catch {}
+}
 
-  return (
-    session.callFlow.bookingConfirmed === true &&
-    session.callFlow.calendarEventCreated === true &&
-    session.callFlow.userFinalAcknowledgement === true
-  );
+function ensureCompletionState(session) {
+  if (!session || typeof session !== "object") return;
+  if (!session.conversationState || typeof session.conversationState !== "object") {
+    session.conversationState = {};
+  }
+  if (typeof session.conversationState.callCompletionAllowed !== "boolean") {
+    session.conversationState.callCompletionAllowed = false;
+  }
+  if (typeof session.conversationState.bookingConfirmed !== "boolean") {
+    session.conversationState.bookingConfirmed = false;
+  }
+  if (typeof session.conversationState.calendarSuccess !== "boolean") {
+    session.conversationState.calendarSuccess = false;
+  }
+  if (typeof session.conversationState.finalCloseDelivered !== "boolean") {
+    session.conversationState.finalCloseDelivered = false;
+  }
+  if (typeof session.conversationState.silenceRetries !== "number") {
+    session.conversationState.silenceRetries = 0;
+  }
+}
+
+function unlockCallCompletionIfReady(session) {
+  ensureCompletionState(session);
+  if (!session?.conversationState) return false;
+  const ready =
+    session.conversationState.bookingConfirmed === true &&
+    session.conversationState.calendarSuccess === true &&
+    session.conversationState.finalCloseDelivered === true;
+  if (ready && session.conversationState.callCompletionAllowed !== true) {
+    session.conversationState.callCompletionAllowed = true;
+    logStructured("CALL_COMPLETION_UNLOCKED", {
+      callSid: session.callSid || "unknown"
+    });
+  }
+  return session.conversationState.callCompletionAllowed === true;
+}
+
+function safeHangupGuard(session, twiml, req) {
+  ensureCompletionState(session);
+  if (!unlockCallCompletionIfReady(session)) {
+    logStructured("HANGUP_BLOCKED", {
+      callSid: session?.callSid || resolveCallSid(req),
+      bookingConfirmed: session?.conversationState?.bookingConfirmed === true,
+      calendarSuccess: session?.conversationState?.calendarSuccess === true,
+      finalCloseDelivered: session?.conversationState?.finalCloseDelivered === true
+    });
+    ask(
+      twiml,
+      "I'm still here — let's finish your booking.",
+      voiceActionUrl(req),
+      { session, input: "speech", timeout: 8, speechTimeout: "auto" }
+    );
+    return false;
+  }
+  twiml.hangup();
+  return true;
+}
+
+function canHangUp(session) {
+  ensureCompletionState(session);
+  return session?.conversationState?.callCompletionAllowed === true;
 }
 
 function ensureCallFlow(session) {
   if (!session || typeof session !== "object") return;
+  ensureCompletionState(session);
   if (!session.callFlow || typeof session.callFlow !== "object") {
     session.callFlow = {
       bookingConfirmed: false,
@@ -3406,7 +3477,10 @@ function ensureCallFlow(session) {
       hangupAllowed: false
     };
   }
-  session.callFlow.hangupAllowed = canHangUp(session);
+  session.callFlow.bookingConfirmed = session.conversationState.bookingConfirmed === true;
+  session.callFlow.calendarEventCreated = session.conversationState.calendarSuccess === true;
+  session.callFlow.userFinalAcknowledgement = session.conversationState.finalCloseDelivered === true;
+  session.callFlow.hangupAllowed = unlockCallCompletionIfReady(session);
 }
 
 function sendVoiceTwiml(res, twiml, fallbackMessage = "Sorry, still here with you. What do you need help with today?") {
@@ -3446,12 +3520,15 @@ function sendVoiceTwiml(res, twiml, fallbackMessage = "Sorry, still here with yo
     const hasHangup = xml.includes("<Hangup");
 
     if (hasHangup && !hangupAllowed) {
-      console.log("HANGUP BLOCKED — booking flow incomplete");
-      xml = '<?xml version="1.0" encoding="UTF-8"?><Response><Say>Before we finish, I just need to confirm a few final details.</Say><Gather input="speech" action="/process" method="POST" speechTimeout="auto"><Say>Let’s continue.</Say></Gather></Response>';
+      logStructured("HANGUP_BLOCKED", {
+        callSid: callSid || "unknown",
+        source: "sendVoiceTwiml"
+      });
+      xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Response><Gather input=\"speech\" action=\"/process\" method=\"POST\" speechTimeout=\"auto\"><Say>I'm still here — let's finish your booking.</Say></Gather></Response>";
     }
 
-    if (!hangupAllowed && !hasGatherOrRedirect && !xml.includes("<Hangup")) {
-      const failsafeSuffix = '<Pause length="1"/><Gather input="speech" action="/process" method="POST" speechTimeout="auto"><Say>Is there anything else you would like help with before we finalise your booking?</Say></Gather>';
+    if (!hangupAllowed && !hasGatherOrRedirect && !hasHangup) {
+      const failsafeSuffix = "<Pause length=\"1\"/><Gather input=\"speech\" action=\"/process\" method=\"POST\" speechTimeout=\"auto\"><Say>I'm still here — let's finish your booking.</Say></Gather>";
       xml = xml.includes("</Response>")
         ? xml.replace("</Response>", `${failsafeSuffix}</Response>`)
         : `${xml}${failsafeSuffix}`;
@@ -4917,13 +4994,27 @@ app.post("/process", async (req, res) => {
     // Handle no-speech timeout from <Gather> callback only
     if (!speech && !digits && hasSpeechField) {
       console.log(`NO_SPEECH_TIMEOUT TID=${tradie.key} CALLSID=${callSid} FROM=${fromNumber}`);
+      ensureCompletionState(session);
       session.silenceTries += 1;
+      session.conversationState.silenceRetries += 1;
       session.lastNoSpeechFallback = true;
-      const repeated = await repeatLastStepPrompt(req, res, twiml, session, session.step, "NO_SPEECH", tradie);
-      if (repeated.shouldReset) resetSession(callSid);
+      logStructured("SILENCE_REENGAGEMENT", {
+        callSid,
+        retries: session.conversationState.silenceRetries,
+        step: session.step || "intent"
+      });
+      if (session.conversationState.silenceRetries === 1) {
+        session.lastPrompt = "I didn't catch that — could you repeat?";
+      } else if (session.conversationState.silenceRetries === 2) {
+        session.lastPrompt = "Still there? We can finish your booking quickly.";
+      } else {
+        session.lastPrompt = "I'm still here — let's finish your booking.";
+      }
+      ask(twiml, session.lastPrompt, voiceActionUrl(req), { session, input: "speech", timeout: 8, speechTimeout: "auto" });
       return sendVoiceTwiml(res, twiml);
     } else {
       session.silenceTries = 0;
+      if (session?.conversationState) session.conversationState.silenceRetries = 0;
       if (speech || digits) {
         session.retryCount = 0;
         session.lastNoSpeechFallback = false;
@@ -5627,17 +5718,24 @@ ${historyLine}${memoryLine}${accessLine2}${valueLine || ""}${urgencyLine || ""}$
       }
       if (!eventResult.ok) {
         session.conversationState.calendarEventPending = true;
-        session.step = "confirm";
+        session.conversationState.calendarSuccess = false;
+        ensureCallFlow(session);
+        logStructured("CALENDAR_FAILURE_RETRY", {
+          callSid,
+          reason: eventResult.reason || "unknown"
+        });
+        session.step = "time";
+        setLockedFlowStep(session, "time", "calendar_failure_retry");
         session.confirmPromptSent = false;
-        session.lastPrompt = `I am still working on locking this into the calendar.${customerCalendarNotice} Just to confirm again — should I keep trying this booking?`;
+        session.lastPrompt = `Sorry — I couldn't lock that time in.${customerCalendarNotice} Let's choose another time.`;
         addToHistory(session, "assistant", session.lastPrompt);
         ask(twiml, session.lastPrompt, actionUrl, { session, input: "speech", timeout: 7, speechTimeout: "auto" });
         return sendVoiceTwiml(res, twiml);
       }
       session.conversationState.calendarEventPending = false;
+      session.conversationState.calendarSuccess = true;
+      session.conversationState.bookingConfirmed = true;
       ensureCallFlow(session);
-      session.callFlow.calendarEventCreated = true;
-      session.callFlow.hangupAllowed = canHangUp(session);
       console.log("FLOW STATUS:", session.callFlow);
 
       // Customer SMS: confirm Y/N
@@ -5651,8 +5749,6 @@ ${historyLine}${memoryLine}${accessLine2}${valueLine || ""}${urgencyLine || ""}$
 
       session.bookingConfirmed = true;
       ensureCallFlow(session);
-      session.callFlow.bookingConfirmed = true;
-      session.callFlow.hangupAllowed = canHangUp(session);
       console.log("FLOW STATUS:", session.callFlow);
 
       // Rating SMS 1 hour after booking end — fire and forget
@@ -5745,6 +5841,9 @@ ${historyLine}${memoryLine}${accessLine2}${valueLine || ""}${urgencyLine || ""}$
         : "";
       const finalSummary = summaryText + afterHoursNote + sameDayNote;
       twiml.say(finalSummary, { voice: "Polly.Amy", language: "en-AU" });
+      ensureCompletionState(session);
+      session.conversationState.finalCloseDelivered = true;
+      ensureCallFlow(session);
       setLockedFlowStep(session, "close", "calendar_success");
       session.step = "close";
       session.lastPrompt = "Before we finish, is there anything else you need? You can say yes that's all, thanks, goodbye, or all done.";
@@ -5758,26 +5857,19 @@ ${historyLine}${memoryLine}${accessLine2}${valueLine || ""}${urgencyLine || ""}$
     if (session.step === "close") {
       const finalAck = /\b(yes\s+that'?s\s+all|that'?s\s+all|thanks|thank\s+you|goodbye|all\s+done|no\s+that'?s\s+it|no\s+that'?s\s+all)\b/i.test(speech || "");
       if (finalAck) {
+        ensureCompletionState(session);
+        session.conversationState.finalCloseDelivered = true;
         ensureCallFlow(session);
-        session.callFlow.userFinalAcknowledgement = true;
-        session.callFlow.hangupAllowed = canHangUp(session);
         console.log("FLOW STATUS:", session.callFlow);
       }
 
       if (canHangUp(session)) {
         twiml.say("Perfect. Your booking is fully confirmed. Goodbye.", { voice: "Polly.Amy", language: "en-AU" });
-        twiml.hangup();
+        safeHangupGuard(session, twiml, req);
         return sendVoiceTwiml(res, twiml);
       }
 
-      console.log("HANGUP BLOCKED — booking flow incomplete");
-      twiml.say("Before we finish, I just need to confirm a few final details.", { voice: "Polly.Amy", language: "en-AU" });
-      twiml.gather({
-        input: "speech",
-        action: "/process",
-        method: "POST",
-        speechTimeout: "auto"
-      }).say("Let’s continue.", { voice: "Polly.Amy", language: "en-AU" });
+      safeHangupGuard(session, twiml, req);
       return sendVoiceTwiml(res, twiml);
     }
 
@@ -5795,8 +5887,17 @@ ${historyLine}${memoryLine}${accessLine2}${valueLine || ""}${urgencyLine || ""}$
     trackError("VOICE /process");
     try {
       const recoveryTwiml = new VoiceResponse();
+      const callSid = resolveCallSid(req);
+      const session = callSid ? sessions.get(callSid) : null;
       const recoveryActionUrl = "/process" + (req.query.tid ? `?tid=${encodeURIComponent(req.query.tid)}` : "");
-      recoveryTwiml.say("Sorry about that — still here with you. Let me get your details.", { voice: "Polly.Amy", language: "en-AU" });
+      const currentObjectiveStep = session?.conversationState?.currentStep || mapLegacyStepToLockedStep(session?.step || "intent");
+      const retryPrompt = buildObjectivePrompt(currentObjectiveStep, session?.conversationState?.collectedFields || {});
+      logStructured("ERROR_RECOVERY_TRIGGERED", {
+        callSid,
+        step: currentObjectiveStep,
+        error: err?.message || String(err)
+      });
+      recoveryTwiml.say("Sorry — small system issue. Let's continue.", { voice: "Polly.Amy", language: "en-AU" });
       const recoverGather = recoveryTwiml.gather({
         input: "speech",
         timeout: 8,
@@ -5805,12 +5906,20 @@ ${historyLine}${memoryLine}${accessLine2}${valueLine || ""}${urgencyLine || ""}$
         method: "POST",
         language: "en-AU"
       });
-      recoverGather.say("What do you need help with today?", { voice: "Polly.Amy", language: "en-AU" });
+      recoverGather.say(retryPrompt, { voice: "Polly.Amy", language: "en-AU" });
       return sendVoiceTwiml(res, recoveryTwiml);
     } catch (fatalErr) {
       console.error("FATAL VOICE RECOVERY ERROR:", fatalErr);
       const lastResort = new VoiceResponse();
-      lastResort.say("Sorry — please call back and we will get you sorted.", { voice: "Polly.Amy", language: "en-AU" });
+      lastResort.say("Sorry — small system issue. Let's continue.", { voice: "Polly.Amy", language: "en-AU" });
+      lastResort.gather({
+        input: "speech",
+        timeout: 8,
+        speechTimeout: "auto",
+        action: "/process",
+        method: "POST",
+        language: "en-AU"
+      }).say("I'm still here — let's finish your booking.", { voice: "Polly.Amy", language: "en-AU" });
       return sendVoiceTwiml(res, lastResort);
     }
   }
