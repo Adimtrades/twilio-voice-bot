@@ -2915,9 +2915,14 @@ function getSession(callSid, fromNumber = "") {
           time: "",
           urgency: "",
           address: "",
+          access: "",
           accessNotes: ""
         },
         lastBotQuestion: "",
+        lastQuestionAsked: "",
+        awaitingUserResponse: false,
+        lastQuestionTimestamp: 0,
+        minQuestionGapMs: 1200,
         confirmationPending: false,
         calendarEventPending: true,
         callLockedToFlow: true,
@@ -2942,9 +2947,14 @@ function getSession(callSid, fromNumber = "") {
         time: "",
         urgency: "",
         address: "",
+        access: "",
         accessNotes: ""
       },
       lastBotQuestion: "",
+      lastQuestionAsked: "",
+      awaitingUserResponse: false,
+      lastQuestionTimestamp: 0,
+      minQuestionGapMs: 1200,
       confirmationPending: false,
       calendarEventPending: true,
       callLockedToFlow: true,
@@ -2968,6 +2978,7 @@ function syncConversationStateFromSession(session) {
     time: session.time || "",
     urgency: String(session.urgencyScore || ""),
     address: session.address || "",
+    access: session.accessNote || "",
     accessNotes: session.accessNote || ""
   };
   session.conversationState.confirmationPending = session.step === "confirm";
@@ -3157,8 +3168,109 @@ function applyTonePolishSafe(session, responseText) {
   }
 }
 
+function compressBotResponse(text = "") {
+  const original = String(text || "").replace(/\s+/g, " ").trim();
+  if (!original) return "";
+
+  const fillers = [
+    /thanks for that information[, ]*/gi,
+    /that really helps[, ]*/gi,
+    /just so i can\s*/gi,
+    /to make sure we\s*/gi,
+    /if that's okay\.?/gi
+  ];
+
+  let compressed = original;
+  fillers.forEach((pattern) => {
+    compressed = compressed.replace(pattern, "");
+  });
+
+  compressed = compressed.replace(/\s+/g, " ").trim();
+  const questionIndex = compressed.indexOf("?");
+  if (questionIndex >= 0) {
+    const questionSentence = compressed.slice(0, questionIndex + 1).trim();
+    compressed = questionSentence;
+  }
+
+  const isConfirmationSummary = /just to confirm|confirm\?/i.test(compressed);
+  if (!isConfirmationSummary && compressed.length > 140) {
+    compressed = compressed.slice(0, 140).trim();
+  }
+
+  if (compressed && compressed !== original) {
+    console.log("RESPONSE_COMPRESSED", { beforeLength: original.length, afterLength: compressed.length });
+  }
+
+  return compressed || original;
+}
+
+function isFieldValid(field, value, session = {}) {
+  const text = String(value || "").trim();
+  if (field === "name") return text.length >= 2;
+  if (field === "job") return text.length >= 3;
+  if (field === "time") return !!(session.bookedStartMs || text.length >= 3);
+  if (field === "urgency") return text.length > 0;
+  if (field === "address") return text.length >= 6;
+  if (field === "access") return text.length >= 0;
+  return false;
+}
+
+function maybeSkipCollectedField(session, step) {
+  const stepToField = {
+    name: "name",
+    job: "job",
+    time: "time",
+    urgency: "urgency",
+    address: "address",
+    access: "access"
+  };
+  const field = stepToField[step];
+  if (!field) return false;
+  const fields = session?.conversationState?.collectedFields || {};
+  const value = field === "access" ? (session.accessNote ?? fields.access ?? "") : fields[field];
+  if (!isFieldValid(field, value, session)) return false;
+  console.log(`FIELD_ALREADY_COLLECTED_SKIP step=${step} field=${field}`);
+  if (step === "job") session.step = "address";
+  else if (step === "address") session.step = "name";
+  else if (step === "name") session.step = "access";
+  else if (step === "access") session.step = "time";
+  else if (step === "time") session.step = "confirm";
+  return true;
+}
+
 function ask(twiml, prompt, actionUrl, options = {}) {
-  const polishedPrompt = applyTonePolishSafe(options?.session, prompt);
+  const session = options?.session;
+  const polishedPrompt = compressBotResponse(applyTonePolishSafe(session, prompt));
+  const activeStep = session?.step || "";
+  const now = Date.now();
+  if (session?.conversationState) {
+    const minGap = Number(session.conversationState.minQuestionGapMs || 1200);
+    const isSameQuestion = session.conversationState.lastQuestionAsked === activeStep;
+    const gapMs = now - Number(session.conversationState.lastQuestionTimestamp || 0);
+    if (isSameQuestion && gapMs < minGap) {
+      console.log(`QUESTION_LOCKED step=${activeStep} gapMs=${gapMs}`);
+      const lockPrompt = "I didn’t quite catch that — could you repeat it?";
+      const gatherLocked = twiml.gather({
+        input: "speech",
+        speechTimeout: "auto",
+        action: actionUrl,
+        method: "POST",
+        language: "en-AU",
+        timeout: VOICE_GATHER_TIMEOUT_SECONDS,
+        speechModel: "phone_call",
+        enhanced: true,
+        hints: buildSpeechHints(typeof tradie !== "undefined" ? tradie : {}),
+        ...options
+      });
+      gatherLocked.say(lockPrompt, { voice: "Polly.Amy", language: "en-AU" });
+      twiml.pause({ length: 1 });
+      return;
+    }
+    session.conversationState.lastQuestionAsked = activeStep;
+    session.conversationState.lastQuestionTimestamp = now;
+    session.conversationState.awaitingUserResponse = true;
+    session.conversationState.lastBotQuestion = polishedPrompt;
+  }
   const gather = twiml.gather({
     input: "speech",
     speechTimeout: "auto",
@@ -3233,21 +3345,18 @@ async function repeatLastStepPrompt(req, res, twiml, session, step, reason = "NO
   const basePrompt = session.lastPrompt || "Could you repeat that?";
 
   if (retryCount <= MAX_NO_SPEECH_RETRIES) {
-    const emotionPrefix = session.lastEmotion === "angry"
-    ? "Take your time — "
-    : session.lastEmotion === "confused"
-    ? "No worries — "
-    : session.lastEmotion === "urgent"
-    ? "Nearly there — "
-    : session.lastEmotion === "rambling"
-    ? "Just quickly — "
-    : session.lastEmotion === "upset"
-    ? "I have got you — "
-    : "No worries — ";
-  const prompt = `${emotionPrefix}${basePrompt}`;
+    console.log(`RETRY_VALIDATION_TRIGGERED step=${step} reason=${reason} attempt=${retryCount}`);
+    let prompt = "I didn’t quite catch that — could you repeat it?";
+    if (retryCount === 2) {
+      prompt = "Just briefly — could you repeat that one more time?";
+    } else if (retryCount >= 3) {
+      prompt = step === "time"
+        ? "Try a clear time like: tomorrow at 2 PM."
+        : "Please repeat in a few words so I can lock this in.";
+    }
     session.lastPrompt = basePrompt;
     console.log(`STEP=${step} speech='' interpreted='${reason}' retryCount=${retryCount}`);
-    ask(twiml, prompt, actionUrl, { input: "speech", timeout: 6, speechTimeout: "auto" });
+    ask(twiml, prompt, actionUrl, { session, input: "speech", timeout: 6, speechTimeout: "auto" });
     return { handled: true };
   }
 
@@ -3257,7 +3366,7 @@ async function repeatLastStepPrompt(req, res, twiml, session, step, reason = "NO
     session.step = "sms_fallback_offer";
     session.lastPrompt = "I didn’t catch that. You can say it again, or say ‘text me’ and I’ll send an SMS link.";
     console.log(`STEP=${step} speech='' interpreted='${reason}' retryCount=${retryCount}`);
-    ask(twiml, session.lastPrompt, actionUrl, { input: "speech", timeout: 6, speechTimeout: "auto" });
+    ask(twiml, session.lastPrompt, actionUrl, { session, input: "speech", timeout: 6, speechTimeout: "auto" });
     return { handled: true };
   }
 
@@ -3265,7 +3374,7 @@ async function repeatLastStepPrompt(req, res, twiml, session, step, reason = "NO
   const silenceRecovery = session.from
     ? "Still there? Take your time — I am here when you are ready."
     : "No worries — I am still here. What do you need help with today?";
-  ask(twiml, silenceRecovery, actionUrl, { input: "speech", timeout: 10, speechTimeout: "auto" });
+  ask(twiml, silenceRecovery, actionUrl, { session, input: "speech", timeout: 10, speechTimeout: "auto" });
   return { handled: true };
 }
 
@@ -4736,13 +4845,29 @@ app.post("/process", async (req, res) => {
       session.lastNoSpeechFallback = false;
       addToHistory(session, "user", speech);
     }
+    if (speech || digits) {
+      session.conversationState.awaitingUserResponse = false;
+    }
+
+    if (
+      session.conversationState.awaitingUserResponse &&
+      hasSpeechField &&
+      !speech &&
+      !digits &&
+      (Date.now() - Number(session.conversationState.lastQuestionTimestamp || 0)) < Number(session.conversationState.minQuestionGapMs || 1200)
+    ) {
+      console.log(`QUESTION_LOCKED step=${session.conversationState.lastQuestionAsked || session.step || "unknown"} reason=no_valid_user_data`);
+      session.lastPrompt = "I didn’t quite catch that — could you repeat it?";
+      ask(twiml, session.lastPrompt, voiceActionUrl(req), { session, input: "speech", timeout: 6, speechTimeout: "auto" });
+      return sendVoiceTwiml(res, twiml);
+    }
 
     const globalOverride = detectGlobalVoiceOverride(speech);
     if (globalOverride === "START_OVER") {
       console.log(`FLOW_GUARD_BLOCK callSid=${callSid} reason=start_over_blocked`);
       const retryPrompt = buildObjectivePrompt(session.conversationState.currentStep, session.conversationState.collectedFields);
       session.lastPrompt = retryPrompt;
-      ask(twiml, retryPrompt, voiceActionUrl(req), { input: "speech", timeout: 7, speechTimeout: "auto" });
+      ask(twiml, retryPrompt, voiceActionUrl(req), { session, input: "speech", timeout: 7, speechTimeout: "auto" });
       return sendVoiceTwiml(res, twiml);
     }
     if (globalOverride === "CANCEL") {
@@ -4989,7 +5114,7 @@ app.post("/process", async (req, res) => {
       addToHistory(session, "assistant", session.lastPrompt);
 
       const actionUrl = "/process" + (req.query.tid ? `?tid=${encodeURIComponent(req.query.tid)}` : "");
-      ask(twiml, session.lastPrompt, actionUrl);
+      ask(twiml, session.lastPrompt, actionUrl, { session });
       return sendVoiceTwiml(res, twiml);
     }
 
@@ -4999,7 +5124,7 @@ app.post("/process", async (req, res) => {
       addToHistory(session, "assistant", session.lastPrompt);
 
       const actionUrl = "/process" + (req.query.tid ? `?tid=${encodeURIComponent(req.query.tid)}` : "");
-      ask(twiml, session.lastPrompt, actionUrl);
+      ask(twiml, session.lastPrompt, actionUrl, { session });
       return sendVoiceTwiml(res, twiml);
     }
 
@@ -5007,6 +5132,12 @@ app.post("/process", async (req, res) => {
     // MAIN FLOW
     // ------------------------------------------------------------------------
     const actionUrl = "/process" + (req.query.tid ? `?tid=${encodeURIComponent(req.query.tid)}` : "");
+
+    ["job", "address", "name", "access", "time"].forEach((stepName) => {
+      if (session.step === stepName) {
+        maybeSkipCollectedField(session, stepName);
+      }
+    });
 
     // STEP: intent
     if (session.step === "intent") {
@@ -5017,7 +5148,7 @@ app.post("/process", async (req, res) => {
         session.step = "address";
         session.lastPrompt = `${affIntent} And whereabouts is the job? What is the address?`;
         addToHistory(session, "assistant", session.lastPrompt);
-        ask(twiml, session.lastPrompt, actionUrl);
+        ask(twiml, session.lastPrompt, actionUrl, { session });
         return sendVoiceTwiml(res, twiml);
       }
       const normalized = normalizeIntentSpeech(speech);
@@ -5032,7 +5163,7 @@ app.post("/process", async (req, res) => {
           session.step = "name";
           session.lastPrompt = "No worries. What is your name so we can reschedule you?";
           addToHistory(session, "assistant", session.lastPrompt);
-          ask(twiml, session.lastPrompt, actionUrl);
+          ask(twiml, session.lastPrompt, actionUrl, { session });
           return sendVoiceTwiml(res, twiml);
         }
 
@@ -5041,7 +5172,7 @@ app.post("/process", async (req, res) => {
           session.step = "job";
           session.lastPrompt = "Sure. What do you need a quote for?";
           addToHistory(session, "assistant", session.lastPrompt);
-          ask(twiml, session.lastPrompt, actionUrl);
+          ask(twiml, session.lastPrompt, actionUrl, { session });
           return sendVoiceTwiml(res, twiml);
         }
 
@@ -5049,7 +5180,7 @@ app.post("/process", async (req, res) => {
         session.step = "job";
         session.lastPrompt = "What job do you need help with?";
         addToHistory(session, "assistant", session.lastPrompt);
-        ask(twiml, session.lastPrompt, actionUrl);
+        ask(twiml, session.lastPrompt, actionUrl, { session });
         return sendVoiceTwiml(res, twiml);
       }
 
@@ -5061,7 +5192,7 @@ app.post("/process", async (req, res) => {
       session.step = "address";
       session.lastPrompt = `${affirmJob} And whereabouts is the job? What is the address?`;
       addToHistory(session, "assistant", session.lastPrompt);
-      ask(twiml, session.lastPrompt, actionUrl, { input: "speech" });
+      ask(twiml, session.lastPrompt, actionUrl, { session, input: "speech" });
       return sendVoiceTwiml(res, twiml);
     }
 
@@ -5072,7 +5203,7 @@ app.post("/process", async (req, res) => {
       if (shouldReject("job", session.job, confidence)) {
         session.lastPrompt = "Sorry — what job do you need help with?";
         addToHistory(session, "assistant", session.lastPrompt);
-        ask(twiml, session.lastPrompt, actionUrl);
+        ask(twiml, session.lastPrompt, actionUrl, { session });
         return sendVoiceTwiml(res, twiml);
       }
 
@@ -5081,7 +5212,7 @@ app.post("/process", async (req, res) => {
       session.step = "address";
       session.lastPrompt = `${affJob} And whereabouts is the job? What is the full address?`;
       addToHistory(session, "assistant", session.lastPrompt);
-      ask(twiml, session.lastPrompt, actionUrl);
+      ask(twiml, session.lastPrompt, actionUrl, { session });
       return sendVoiceTwiml(res, twiml);
     }
 
@@ -5101,7 +5232,7 @@ app.post("/process", async (req, res) => {
         session.addressReadBack = true;
         session.lastPrompt = `Sorry — just to confirm, I heard "${session.address}". Is that right?`;
         addToHistory(session, "assistant", session.lastPrompt);
-        ask(twiml, session.lastPrompt, actionUrl);
+        ask(twiml, session.lastPrompt, actionUrl, { session });
         return sendVoiceTwiml(res, twiml);
       }
 
@@ -5109,7 +5240,7 @@ app.post("/process", async (req, res) => {
         const suburbHint = session.suburb ? ` Is it in ${session.suburb}?` : "";
         session.lastPrompt = `Sorry — what is the full street address?${suburbHint}`;
         addToHistory(session, "assistant", session.lastPrompt);
-        ask(twiml, session.lastPrompt, actionUrl);
+        ask(twiml, session.lastPrompt, actionUrl, { session });
         return sendVoiceTwiml(res, twiml);
       }
 
@@ -5122,7 +5253,7 @@ app.post("/process", async (req, res) => {
         session.pendingStep = "name";
         session.step = "address_confirm";
         addToHistory(session, "assistant", session.lastPrompt);
-        ask(twiml, session.lastPrompt, actionUrl);
+        ask(twiml, session.lastPrompt, actionUrl, { session });
         return sendVoiceTwiml(res, twiml);
       }
       session.addressConfirmed = true;
@@ -5139,7 +5270,7 @@ app.post("/process", async (req, res) => {
       session.step = "name";
       session.lastPrompt = `${affirmAddr} And what name should I put the booking under?`;
       addToHistory(session, "assistant", session.lastPrompt);
-      ask(twiml, session.lastPrompt, actionUrl);
+      ask(twiml, session.lastPrompt, actionUrl, { session });
       return sendVoiceTwiml(res, twiml);
     }
 
@@ -5151,7 +5282,7 @@ app.post("/process", async (req, res) => {
         session.step = "name";
         session.lastPrompt = `${affirmAddrConfirm} And what name should I put the booking under?`;
         addToHistory(session, "assistant", session.lastPrompt);
-        ask(twiml, session.lastPrompt, actionUrl);
+        ask(twiml, session.lastPrompt, actionUrl, { session });
         return sendVoiceTwiml(res, twiml);
       } else {
         session.address = "";
@@ -5159,7 +5290,7 @@ app.post("/process", async (req, res) => {
         session.step = "address";
         session.lastPrompt = "No worries — what is the correct address?";
         addToHistory(session, "assistant", session.lastPrompt);
-        ask(twiml, session.lastPrompt, actionUrl);
+        ask(twiml, session.lastPrompt, actionUrl, { session });
         return sendVoiceTwiml(res, twiml);
       }
     }
@@ -5174,7 +5305,7 @@ app.post("/process", async (req, res) => {
       if (nameIsEmpty) {
         session.lastPrompt = "Sorry — what name should I put the booking under?";
         addToHistory(session, "assistant", session.lastPrompt);
-        ask(twiml, session.lastPrompt, actionUrl);
+        ask(twiml, session.lastPrompt, actionUrl, { session });
         return sendVoiceTwiml(res, twiml);
       }
 
@@ -5183,7 +5314,7 @@ app.post("/process", async (req, res) => {
       session.step = "access";
       session.lastPrompt = `${affName}${firstName ? " " + firstName + " —" : ""} any access notes like a gate code, parking, or pets? Just say none if not.`;
       addToHistory(session, "assistant", session.lastPrompt);
-      ask(twiml, session.lastPrompt, actionUrl);
+      ask(twiml, session.lastPrompt, actionUrl, { session });
       return sendVoiceTwiml(res, twiml);
     }
 
@@ -5224,7 +5355,7 @@ app.post("/process", async (req, res) => {
       session.step = "time";
       session.lastPrompt = `${affAccess} ${micro_commitment_question("day")} ${micro_commitment_question("time")}`;
       addToHistory(session, "assistant", session.lastPrompt);
-      ask(twiml, session.lastPrompt, actionUrl);
+      ask(twiml, session.lastPrompt, actionUrl, { session });
       return sendVoiceTwiml(res, twiml);
     }
 
@@ -5243,12 +5374,12 @@ app.post("/process", async (req, res) => {
           session.lastPrompt = `${recallLine ? recallLine + ". " : ""}The next available slot is ${asapSlotText}. Does that work for you?`;
           session.bookedStartMs = dt.toMillis();
           addToHistory(session, "assistant", session.lastPrompt);
-          ask(twiml, session.lastPrompt, actionUrl, { input: "speech", timeout: 7, speechTimeout: "auto" });
+          ask(twiml, session.lastPrompt, actionUrl, { session, input: "speech", timeout: 7, speechTimeout: "auto" });
           return sendVoiceTwiml(res, twiml);
         }
         if (!dt && speech) {
           session.lastPrompt = "Sorry, I did not quite catch that time. Please say it again — for example: tomorrow at 2 pm.";
-          ask(twiml, session.lastPrompt, actionUrl, { input: "speech", timeout: 6, speechTimeout: "auto" });
+          ask(twiml, session.lastPrompt, actionUrl, { session, input: "speech", timeout: 6, speechTimeout: "auto" });
           return sendVoiceTwiml(res, twiml);
         }
         if (!dt && isAfterHoursNow(tradie)) dt = nextBusinessOpenSlot(tradie);
@@ -5298,19 +5429,17 @@ app.post("/process", async (req, res) => {
       const accessLine = session.accessNote ? `Access notes: ${session.accessNote}. ` : "";
 
       if (session.confirmPromptSent) {
-        ask(twiml, session.lastPrompt, actionUrl, { input: "speech", timeout: 7, speechTimeout: "auto" });
+        ask(twiml, session.lastPrompt, actionUrl, { session, input: "speech", timeout: 7, speechTimeout: "auto" });
         return sendVoiceTwiml(res, twiml);
       }
       session.confirmPromptSent = true;
 
       const cfFirstName = session.name ? session.name.split(" ")[0] : "";
-      const cfPrompt = `${cfFirstName ? "Perfect " + cfFirstName + " — " : ""}just to confirm — ${session.job} at ${session.address}, ${whenText}. ${noteLine || ""}${accessLine || ""}Does that all sound right? Say yes to confirm or no to change something.`;
+      const cfPrompt = `Booking for ${session.job} at ${session.address} ${whenText}. Confirm?`;
       session.lastPrompt = cfPrompt;
 
       addToHistory(session, "assistant", session.lastPrompt);
-      // Slow readback of address and time so caller can verify
-      saySlowly(twiml, `${session.job} at ${session.address}, ${whenText}.`);
-      ask(twiml, session.lastPrompt, actionUrl, { input: "speech", timeout: 7, speechTimeout: "auto" });
+      ask(twiml, session.lastPrompt, actionUrl, { session, input: "speech", timeout: 7, speechTimeout: "auto" });
       return sendVoiceTwiml(res, twiml);
     }
 
@@ -5320,7 +5449,7 @@ app.post("/process", async (req, res) => {
         const slots = (session.proposedSlots || []).map((ms) => DateTime.fromMillis(ms, { zone: tz }));
         session.lastPrompt = `No worries. Options are: ${slotsVoiceLine(slots, tz)} Say first, second, or third — or tell me another time.`;
         addToHistory(session, "assistant", session.lastPrompt);
-        ask(twiml, session.lastPrompt, actionUrl);
+        ask(twiml, session.lastPrompt, actionUrl, { session });
         return sendVoiceTwiml(res, twiml);
       }
 
@@ -5333,7 +5462,7 @@ app.post("/process", async (req, res) => {
         session.step = "time";
         session.lastPrompt = "Got it. Let me check that time.";
         addToHistory(session, "assistant", session.lastPrompt);
-        ask(twiml, session.lastPrompt, actionUrl);
+        ask(twiml, session.lastPrompt, actionUrl, { session });
         return sendVoiceTwiml(res, twiml);
       }
 
@@ -5341,7 +5470,7 @@ app.post("/process", async (req, res) => {
       if (idx == null || !slots[idx]) {
         session.lastPrompt = "Say first, second, or third. Or press 1, 2, or 3. Or tell me another time.";
         addToHistory(session, "assistant", session.lastPrompt);
-        ask(twiml, session.lastPrompt, actionUrl);
+        ask(twiml, session.lastPrompt, actionUrl, { session });
         return sendVoiceTwiml(res, twiml);
       }
 
@@ -5354,19 +5483,17 @@ app.post("/process", async (req, res) => {
       const accessLine = session.accessNote ? `Access notes: ${session.accessNote}. ` : "";
 
       if (session.confirmPromptSent) {
-        ask(twiml, session.lastPrompt, actionUrl, { input: "speech", timeout: 7, speechTimeout: "auto" });
+        ask(twiml, session.lastPrompt, actionUrl, { session, input: "speech", timeout: 7, speechTimeout: "auto" });
         return sendVoiceTwiml(res, twiml);
       }
       session.confirmPromptSent = true;
 
       const cfFirstName = session.name ? session.name.split(" ")[0] : "";
-      const cfPrompt = `${cfFirstName ? "Perfect " + cfFirstName + " — " : ""}just to confirm — ${session.job} at ${session.address}, ${whenText}. ${noteLine || ""}${accessLine || ""}Does that all sound right? Say yes to confirm or no to change something.`;
+      const cfPrompt = `Booking for ${session.job} at ${session.address} ${whenText}. Confirm?`;
       session.lastPrompt = cfPrompt;
 
       addToHistory(session, "assistant", session.lastPrompt);
-      // Slow readback of address and time so caller can verify
-      saySlowly(twiml, `${session.job} at ${session.address}, ${whenText}.`);
-      ask(twiml, session.lastPrompt, actionUrl, { input: "speech", timeout: 7, speechTimeout: "auto" });
+      ask(twiml, session.lastPrompt, actionUrl, { session, input: "speech", timeout: 7, speechTimeout: "auto" });
       return sendVoiceTwiml(res, twiml);
     }
 
@@ -5390,7 +5517,7 @@ app.post("/process", async (req, res) => {
         console.log(`AMBIGUOUS_INPUT_RETRY callSid=${callSid} step=confirm reason=correction_phrase`);
         session.lastPrompt = "No worries — tell me exactly what you want changed, and I’ll update it.";
         addToHistory(session, "assistant", session.lastPrompt);
-        ask(twiml, session.lastPrompt, actionUrl);
+        ask(twiml, session.lastPrompt, actionUrl, { session });
         return sendVoiceTwiml(res, twiml);
       }
 
@@ -5398,7 +5525,7 @@ app.post("/process", async (req, res) => {
         console.log(`AMBIGUOUS_INPUT_RETRY callSid=${callSid} step=confirm reason=explicit_no`);
         session.lastPrompt = "No worries — what should I correct: job, time, address, or access notes?";
         addToHistory(session, "assistant", session.lastPrompt);
-        ask(twiml, session.lastPrompt, actionUrl, { input: "speech", timeout: 7, speechTimeout: "auto" });
+        ask(twiml, session.lastPrompt, actionUrl, { session, input: "speech", timeout: 7, speechTimeout: "auto" });
         return sendVoiceTwiml(res, twiml);
       }
 
@@ -5504,7 +5631,7 @@ ${historyLine}${memoryLine}${accessLine2}${valueLine || ""}${urgencyLine || ""}$
         session.confirmPromptSent = false;
         session.lastPrompt = `I am still working on locking this into the calendar.${customerCalendarNotice} Just to confirm again — should I keep trying this booking?`;
         addToHistory(session, "assistant", session.lastPrompt);
-        ask(twiml, session.lastPrompt, actionUrl, { input: "speech", timeout: 7, speechTimeout: "auto" });
+        ask(twiml, session.lastPrompt, actionUrl, { session, input: "speech", timeout: 7, speechTimeout: "auto" });
         return sendVoiceTwiml(res, twiml);
       }
       session.conversationState.calendarEventPending = false;
@@ -5608,7 +5735,7 @@ ${historyLine}${memoryLine}${accessLine2}${valueLine || ""}${urgencyLine || ""}$
       const summaryName = session.name || "you";
       const summaryAddress = session.address || "your address";
       const summaryTime = session.time || "your requested time";
-      const summaryText = `All set ${summaryName}. Your booking reference is ${session.bookingRef || "confirmed"}. We have booked ${summaryJob} at ${summaryAddress} for ${summaryTime}. You are locked in and the tradie has been notified. We have sent you a text with the details. Thanks for calling — speak soon.`;
+      const summaryText = `Booked: ${summaryJob} at ${summaryAddress} ${summaryTime}. Ref ${session.bookingRef || "confirmed"}.`;
       const afterHoursNote = req._isAfterHours
         ? " We are closed right now but the tradie will confirm your booking first thing tomorrow morning."
         : "";
@@ -5624,7 +5751,7 @@ ${historyLine}${memoryLine}${accessLine2}${valueLine || ""}${urgencyLine || ""}$
       ensureCallFlow(session);
       session.callFlow.hangupAllowed = canHangUp(session);
       console.log("FLOW STATUS:", session.callFlow);
-      ask(twiml, session.lastPrompt, actionUrl, { input: "speech", timeout: 7, speechTimeout: "auto" });
+      ask(twiml, session.lastPrompt, actionUrl, { session, input: "speech", timeout: 7, speechTimeout: "auto" });
       return sendVoiceTwiml(res, twiml);
     }
 
@@ -5658,7 +5785,7 @@ ${historyLine}${memoryLine}${accessLine2}${valueLine || ""}${urgencyLine || ""}$
     console.log(`FLOW_GUARD_BLOCK callSid=${callSid} reason=unknown_step step=${session.step}`);
     session.lastPrompt = buildObjectivePrompt(session.conversationState.currentStep, session.conversationState.collectedFields);
     addToHistory(session, "assistant", session.lastPrompt);
-    ask(twiml, session.lastPrompt, actionUrl, { input: "speech" });
+    ask(twiml, session.lastPrompt, actionUrl, { session, input: "speech" });
     return sendVoiceTwiml(res, twiml);
     } finally {
       session.processing = false;
