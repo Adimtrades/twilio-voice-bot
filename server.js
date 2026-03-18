@@ -3161,6 +3161,7 @@ function getSession(callSid, fromNumber = "") {
       bookingRef: "",
       totalFailedAttempts: 0,
       transferredToOwner: false,
+      _needsTransfer: false,
       bookingConfirmed: false,
       callFlow: {
         bookingConfirmed: false,
@@ -3580,6 +3581,57 @@ function incrementRetryCountForStep(session, step) {
   return session.retryCountByStep[step];
 }
 
+async function checkAndTransferIfNeeded(req, res, twiml, session, tradie) {
+  // Increment total failed attempts counter
+  session.totalFailedAttempts = Number(session.totalFailedAttempts || 0) + 1;
+
+  console.log(`FAILED_ATTEMPT callSid=${session.callSid || ""} total=${session.totalFailedAttempts} step=${session.step}`);
+
+  // Transfer to owner after 3 total failed attempts
+  if (session.totalFailedAttempts >= 3 && !session.transferredToOwner) {
+    const ownerNumber = tradie?.ownerSmsTo || process.env.OWNER_SMS_TO || "";
+
+    if (!ownerNumber) {
+      console.log("TRANSFER_SKIPPED no owner number configured");
+      return false;
+    }
+
+    session.transferredToOwner = true;
+    console.log(`TRANSFER_TO_OWNER callSid=${session.callSid || ""} owner=${ownerNumber}`);
+
+    // Alert owner via SMS so they know a call is coming
+    try {
+      await sendOwnerSms(tradie,
+        `📞 CALL TRANSFER
+A customer could not be understood by the bot after 3 attempts.
+Caller: ${session.from || "unknown"}
+Job hint: ${session.job || "unknown"}
+Transferring now — please answer.`
+      );
+    } catch {}
+
+    // Say warm handoff message then dial owner
+    const transferTwiml = new VoiceResponse();
+    transferTwiml.say(
+      "No worries — let me get someone from the team on the line for you right now. Please hold for just a moment.",
+      { voice: "Polly.Amy", language: "en-AU" }
+    );
+
+    const dial = transferTwiml.dial({
+      timeout: 25,
+      callerId: req.body?.To || tradie?.twilioNumber || "",
+      action: "/process" + (req.query.tid ? `?tid=${encodeURIComponent(req.query.tid)}` : ""),
+      method: "POST"
+    });
+    dial.number(ownerNumber);
+
+    res.type("text/xml").send(transferTwiml.toString());
+    return true; // signal that transfer happened — caller handled
+  }
+
+  return false; // no transfer — continue normal flow
+}
+
 function repeatLastStepPrompt(req, twiml, session, step, reason = "NO_SPEECH") {
   const retryCount = incrementRetryCountForStep(session, step);
   const actionUrl = voiceActionUrl(req);
@@ -3615,6 +3667,17 @@ function repeatLastStepPrompt(req, twiml, session, step, reason = "NO_SPEECH") {
     session.lastPrompt = "No worries — you can keep trying or say text me and I will send a link to your phone.";
     ask(twiml, session.lastPrompt, actionUrl, { input: "speech", timeout: 8, speechTimeout: "auto" });
     return { handled: true };
+  }
+
+  // Increment total failed attempts and check for transfer
+  // We pass null for res here so transfer is handled by caller
+  session.totalFailedAttempts = Number(session.totalFailedAttempts || 0) + 1;
+  console.log(`REPEAT_PROMPT_FAIL step=${step} total=${session.totalFailedAttempts}`);
+
+  if (session.totalFailedAttempts >= 3 && !session.transferredToOwner) {
+    // Signal to caller that transfer is needed
+    // Caller must handle the actual transfer since we don't have res here
+    session._needsTransfer = true;
   }
 
   // Beyond MAX+1 — rotate recovery phrases and keep call alive forever
@@ -5187,6 +5250,39 @@ app.post("/process", async (req, res) => {
       return sendVoiceTwiml(res, twiml);
     }
 
+    // Handle dial callback — if owner did not answer re-engage caller
+    if (req.body?.DialCallStatus) {
+      const dialStatus = req.body.DialCallStatus;
+      console.log(`DIAL_CALLBACK callSid=${callSid} dialStatus=${dialStatus}`);
+      if (dialStatus !== "completed") {
+        // Owner did not answer — reset transfer flag and re-engage
+        session.transferredToOwner = false;
+        session.totalFailedAttempts = 0;
+        session._needsTransfer = false;
+        const reEngageTwiml = new VoiceResponse();
+        reEngageTwiml.say(
+          "Sorry about that — our team member is not available right now. Let me take your details and we will call you back shortly.",
+          { voice: "Polly.Amy", language: "en-AU" }
+        );
+        const reEngageActionUrl = "/process" + (req.query.tid ? `?tid=${encodeURIComponent(req.query.tid)}` : "");
+        const reEngageGather = reEngageTwiml.gather({
+          input: "speech",
+          timeout: 10,
+          speechTimeout: "auto",
+          action: reEngageActionUrl,
+          method: "POST",
+          language: "en-AU"
+        });
+        reEngageGather.say(session.lastPrompt || "What do you need help with today?", { voice: "Polly.Amy", language: "en-AU" });
+        return sendVoiceTwiml(res, reEngageTwiml);
+      }
+      // Owner answered and completed — end call cleanly
+      resetSession(callSid);
+      const doneTwiml = new VoiceResponse();
+      doneTwiml.hangup();
+      return res.type("text/xml").send(doneTwiml.toString());
+    }
+
     console.log(`TID=${tradie.key} CALLSID=${callSid} TO=${req.body.To} FROM=${fromNumber} STEP=${session.step} Speech="${speech}" Digits="${digits}" Confidence=${confidence}`);
     logVoiceStep(req, { callSid, step: session.step, speech, retryCount: session.silenceTries || 0 });
 
@@ -5226,6 +5322,10 @@ app.post("/process", async (req, res) => {
       session.conversationState.silenceRetries += 1;
       session.lastNoSpeechFallback = true;
 
+      // Check if we should transfer to owner
+      const transferred = await checkAndTransferIfNeeded(req, res, twiml, session, tradie);
+      if (transferred) return;
+
       // After first silence re-ask the actual last question
       // After second silence use a gentle prompt
       // After that keep alternating
@@ -5260,6 +5360,10 @@ app.post("/process", async (req, res) => {
       const currentStep = session.step || "intent";
       session.lowConfidenceStreak = Number(session.lowConfidenceStreak || 0) + 1;
       console.log(`LOW_CONFIDENCE TID=${tradie.key} CALLSID=${callSid} STEP=${currentStep} confidence=${confidence} streak=${session.lowConfidenceStreak}`);
+
+      // Check if we should transfer to owner
+      const lcTransferred = await checkAndTransferIfNeeded(req, res, twiml, session, tradie);
+      if (lcTransferred) return sendVoiceTwiml(res, twiml);
 
       // After 3 consecutive low confidence turns accept the speech anyway
       // and let the step handler deal with it — better than being stuck forever
@@ -5321,7 +5425,12 @@ app.post("/process", async (req, res) => {
         return sendVoiceTwiml(res, twiml);
       }
 
-      const repeatedFallback = repeatLastStepPrompt(req, twiml, session, "sms_fallback_offer", speech ? "UNCLEAR" : "NO_SPEECH");
+      repeatLastStepPrompt(req, twiml, session, "sms_fallback_offer", speech ? "UNCLEAR" : "NO_SPEECH");
+      if (session._needsTransfer && !session.transferredToOwner) {
+        session._needsTransfer = false;
+        const needsXfer = await checkAndTransferIfNeeded(req, res, twiml, session, tradie);
+        if (needsXfer) return;
+      }
       return sendVoiceTwiml(res, twiml);
     }
 
@@ -5844,6 +5953,11 @@ app.post("/process", async (req, res) => {
         const interpreted = !speech ? "NO_SPEECH" : (confirmConfidenceTooLow ? "UNCLEAR" : "UNCLEAR");
         console.log(`STEP=confirm speech='${speech}' interpreted='${interpreted}' retryCount=${getRetryCountForStep(session, "confirm") + 1}`);
         repeatLastStepPrompt(req, twiml, session, "confirm", interpreted);
+        if (session._needsTransfer && !session.transferredToOwner) {
+          session._needsTransfer = false;
+          const xferConfirm = await checkAndTransferIfNeeded(req, res, twiml, session, tradie);
+          if (xferConfirm) return;
+        }
         return sendVoiceTwiml(res, twiml);
       }
 
