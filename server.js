@@ -884,7 +884,7 @@ const ADMIN_DASH_PASSWORD = process.env.ADMIN_DASH_PASSWORD || "";
 const LLM_ENABLED = String(process.env.LLM_ENABLED || "false").toLowerCase() === "true";
 const LLM_BASE_URL = process.env.LLM_BASE_URL || "https://api.openai.com/v1/responses";
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
-const LLM_MODEL = process.env.LLM_MODEL || "gpt-5-mini";
+const LLM_MODEL = process.env.LLM_MODEL || "gpt-4o-mini";
 const LLM_MAX_OUTPUT_TOKENS = Number(process.env.LLM_MAX_OUTPUT_TOKENS || 220);
 const LLM_MAX_TURNS = Number(process.env.LLM_MAX_TURNS || 8);
 const LLM_REQUIRE_FOR_OFFSCRIPT = String(process.env.LLM_REQUIRE_FOR_OFFSCRIPT || "true").toLowerCase() === "true";
@@ -4196,107 +4196,6 @@ function composeAdaptivePrompt(session, basePrompt, conversationState, step) {
 // 
 // Time parsing
 // 
-function pickRandom(arr) {
-  return arr[Math.floor(Math.random() * arr.length)];
-}
-
-function getAffirmation(session) {
-  const used = session._usedAffirmations || [];
-  const all = ["Perfect.", "Got it.", "Lovely.", "No worries.", "Brilliant.", "Good one.", "Great stuff.", "Noted."];
-  const available = all.filter(a => !used.includes(a));
-  const pool = available.length > 0 ? available : all;
-  const pick = pickRandom(pool);
-  session._usedAffirmations = [...used.slice(-4), pick];
-  return pick;
-}
-
-function getTimeOfDayGreeting(tz) {
-  const hour = DateTime.now().setZone(tz || "Australia/Sydney").hour;
-  if (hour < 12) return "Good morning";
-  if (hour < 17) return "Good afternoon";
-  return "Thanks for calling this evening";
-}
-
-function getJobEmpathy(job) {
-  const j = String(job || "").toLowerCase();
-  if (/burst pipe|flooding|leak.*bad|emergency|gas leak|sparking|no power/.test(j))
-    return "Oh no — let us get that sorted fast.";
-  if (/blocked drain|blocked toilet|overflow/.test(j))
-    return "That is never fun — let us get someone out to you.";
-  if (/hot water|no hot water/.test(j))
-    return "No hot water is rough — let us fix that quickly.";
-  if (/broken|not working|damaged/.test(j))
-    return "That sounds frustrating — let us get it sorted.";
-  return "";
-}
-
-function getCalendarWaitMessage() {
-  return pickRandom([
-    "Just checking the calendar — won't be a moment.",
-    "Bear with me one sec while I check availability.",
-    "Let me just check that time for you.",
-    "One moment — just pulling up the calendar.",
-    "Just a sec — checking that now."
-  ]);
-}
-
-function isAustralianPublicHoliday(tz) {
-  const now = DateTime.now().setZone(tz || "Australia/Sydney");
-  const month = now.month;
-  const day = now.day;
-  // Fixed Australian public holidays
-  const fixed = [
-    [1, 1],   // New Year's Day
-    [1, 26],  // Australia Day
-    [4, 25],  // Anzac Day
-    [12, 25], // Christmas Day
-    [12, 26], // Boxing Day
-  ];
-  return fixed.some(([m, d]) => m === month && d === day);
-}
-
-function normaliseSpokenNumber(text) {
-  if (!text) return text;
-  const words = {
-    "zero": "0", "one": "1", "two": "2", "three": "3", "four": "4",
-    "five": "5", "six": "6", "seven": "7", "eight": "8", "nine": "9",
-    "ten": "10", "eleven": "11", "twelve": "12", "thirteen": "13",
-    "fourteen": "14", "fifteen": "15", "sixteen": "16", "seventeen": "17",
-    "eighteen": "18", "nineteen": "19", "twenty": "20", "thirty": "30",
-    "forty": "40", "fifty": "50", "sixty": "60", "seventy": "70",
-    "eighty": "80", "ninety": "90", "hundred": "100"
-  };
-  let t = String(text).toLowerCase();
-  for (const [word, num] of Object.entries(words)) {
-    t = t.replace(new RegExp(`\\b${word}\\b`, "g"), num);
-  }
-  return t;
-}
-
-function normaliseAussieSlang(text, tz) {
-  if (!text) return text;
-  let t = String(text).toLowerCase();
-  // Time slang
-  t = t.replace(/\bthis arvo\b/g, "this afternoon");
-  t = t.replace(/\barvo\b/g, "afternoon");
-  t = t.replace(/\bsmoko\b/g, "10am");
-  t = t.replace(/\bhalf two\b/g, "2:30pm");
-  t = t.replace(/\bhalf three\b/g, "3:30pm");
-  t = t.replace(/\bhalf four\b/g, "4:30pm");
-  t = t.replace(/\bhalf five\b/g, "5:30pm");
-  t = t.replace(/\bhalf six\b/g, "6:30pm");
-  t = t.replace(/\bhalf seven\b/g, "7:30am");
-  t = t.replace(/\bhalf eight\b/g, "8:30am");
-  t = t.replace(/\bhalf nine\b/g, "9:30am");
-  t = t.replace(/\bhalf ten\b/g, "10:30am");
-  t = t.replace(/\bhalf eleven\b/g, "11:30am");
-  t = t.replace(/\bhalf twelve\b/g, "12:30pm");
-  t = t.replace(/\barvie\b/g, "afternoon");
-  t = t.replace(/\btomoz\b/g, "tomorrow");
-  t = t.replace(/\bnext week sometime\b/g, "next week");
-  return t;
-}
-
 function wrapSsml(text, rate = "medium", pitch = "medium") {
   return `<speak><prosody rate="${rate}" pitch="${pitch}">${text}</prosody></speak>`;
 }
@@ -4515,11 +4414,32 @@ function detectYesNoFromDigits(d) {
 }
 function detectYesNo(text) {
   const t = (text || "").toLowerCase().trim();
-  const yes = ["yes","yeah","yep","yup","sure","ok","okay","correct","that's right","thats right","that works","that is fine","that is good","works for me","perfect","sounds good","go ahead","lock it in","book it","yes please","definitely","for sure","absolutely","go for it","that’s right","confirm"];
-  const no = ["no","nope","nah","wrong","not right","don’t","dont","change","edit"];
+  if (!t) return null;
 
-  if (yes.some((w) => t === w || t.includes(w))) return "YES";
-  if (no.some((w) => t === w || t.includes(w))) return "NO";
+  // Hard exclusions — never treat these as YES even if they contain a yes-word
+  const neverYes = [
+    /\b(time|what time|the time|what's the time)\b/,
+    /\b(how much|cost|price|quote|charge|fee|rate)\b/,
+    /\b(oh my god|oh god|oh no|oh wow|oh gosh|omg)\b/,
+    /\b(wait|hang on|actually|no wait)\b/,
+    /\b(what|where|when|why|how)\b/
+  ];
+  if (neverYes.some((r) => r.test(t))) return null;
+
+  // Must be a genuine affirmation — use exact match first, then careful includes
+  const yesExact = ["yes","yeah","yep","yup","sure","ok","okay","correct","definitely","absolutely","confirm","confirmed","for sure","go ahead","go for it","book it","lock it in","yes please","sounds good","that works","that's right","thats right","that is right","that is fine","that is good","works for me","perfect"];
+  if (yesExact.some((w) => t === w)) return "YES";
+
+  // Only use includes for multi-word phrases — never for single word fragments
+  const yesPhrase = ["that's right","thats right","that is right","that is fine","that is good","that works","sounds good","go ahead","lock it in","book it","yes please","works for me","go for it","all good"];
+  if (yesPhrase.some((w) => t.includes(w))) return "YES";
+
+  const noExact = ["no","nope","nah","wrong","dont","don't","change","edit","not right","incorrect"];
+  if (noExact.some((w) => t === w)) return "NO";
+
+  const noPhrase = ["not right","don't want","dont want","change the","edit the","that's wrong","thats wrong","that is wrong"];
+  if (noPhrase.some((w) => t.includes(w))) return "NO";
+
   return null;
 }
 function detectGlobalVoiceOverride(text) {
@@ -5188,6 +5108,12 @@ app.post("/process", async (req, res) => {
     const confidence = hasConfidence ? Number(confidenceRaw) : null;
 
     const session = getSession(callSid, fromNumber);
+    // Early exit — call already finished (booking confirmed + session reset then recreated by stale webhook)
+    if (session.bookingFinished) {
+      const finishedTwiml = new VoiceResponse();
+      finishedTwiml.hangup();
+      return sendVoiceTwiml(res, finishedTwiml);
+    }
     if (session.processing === true) {
       console.log("FLOW LOCK — duplicate webhook");
       return sendVoiceTwiml(res, twiml);
@@ -5704,6 +5630,14 @@ app.post("/process", async (req, res) => {
 
     // STEP: address
     if (session.step === "address") {
+      // If caller asks a price question during address step, answer and re-ask address
+      if (/\b(how much|cost|price|quote|charge|fee|rate)\b/i.test(speech || "")) {
+        const priceAddrReply = "Pricing depends on the job and will be confirmed by the tradie. " +
+          (session.lastPrompt || "What is the address for the job?");
+        addToHistory(session, "assistant", priceAddrReply);
+        ask(twiml, priceAddrReply, actionUrl, { session, input: "speech", timeout: 10, speechTimeout: "auto" });
+        return sendVoiceTwiml(res, twiml);
+      }
       if (speech) session.address = speech;
 
       // Low confidence but not empty — read it back to confirm
@@ -5806,6 +5740,14 @@ app.post("/process", async (req, res) => {
 
     // STEP: access (fixed)
     if (session.step === "access") {
+      // If caller asks a price question during access notes, answer and re-ask access
+      if (/\b(how much|cost|price|quote|charge|fee|rate)\b/i.test(speech || "")) {
+        const priceAccessReply = "Pricing depends on the job and will be confirmed by the tradie on the day. " +
+          (session.lastPrompt || "Any access notes like a gate code, parking, or pets? Just say none if not.");
+        addToHistory(session, "assistant", priceAccessReply);
+        ask(twiml, priceAccessReply, actionUrl, { session, input: "speech", timeout: 10, speechTimeout: "auto" });
+        return sendVoiceTwiml(res, twiml);
+      }
       const a = interpretAccessUtterance(speech);
 
       if (a.kind === "CLEAR") session.accessNote = "";
@@ -5846,8 +5788,10 @@ app.post("/process", async (req, res) => {
 
     // STEP: time
     if (session.step === "time") {
+      // Filter out emotional exclamations that are not time values
+      const isExclamation = /^(oh my god|oh god|oh no|oh wow|oh gosh|omg|wow|really|seriously|what the|geez|bloody hell|crikey|jeez)\b/i.test((speech || "").trim());
       // Always try to parse new speech first — never skip if caller gave a time
-      if (speech && speech.trim().length > 2) {
+      if (speech && speech.trim().length > 2 && !isExclamation) {
         session.time = speech;
         session.bookedStartMs = null;
         // Reset calendar and confirm flags for fresh check
@@ -5997,7 +5941,11 @@ app.post("/process", async (req, res) => {
     if (session.step === "confirm") {
       // Never treat price questions as YES
       const isPriceQ = /\b(how much|cost|price|quote|charge|fee|rate)\b/i.test(speech || "");
-      const isTimeRepeat = !isPriceQ && speech && parseRequestedDateTime &&
+      // Only treat as a time repeat if speech looks like a genuine time utterance
+      // — has a day/time keyword and no question word that would make it off-script
+      const hasTimeKeyword = /\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday|today|tomorrow|morning|afternoon|evening|am\b|pm\b|\d{1,2}(:\d{2})?\s*(am|pm))\b/i.test(speech || "");
+      const hasQuestionWord = /\b(how|what|when|where|why|can you|do you|is it)\b/i.test(speech || "");
+      const isTimeRepeat = !isPriceQ && !hasQuestionWord && hasTimeKeyword && speech &&
         !!parseRequestedDateTime(speech, tz);
       const yn2 = isPriceQ ? null : (detectYesNo(speech) || (isTimeRepeat ? "YES" : null));
       const confirmConfidenceTooLow = typeof confidence === "number" &&
@@ -6304,6 +6252,8 @@ ${historyLine}${memoryLine}${accessLine2}${valueLine || ""}${urgencyLine || ""}$
       session.conversationState.callCompletionAllowed = true;
       session.conversationState.calendarSuccess = true;
       session.conversationState.bookingConfirmed = true;
+      session.bookingConfirmed = true;
+      session.bookingFinished = true;
       deregisterActiveCall(callSid);
       twiml.hangup();
       resetSession(callSid);
