@@ -3836,7 +3836,7 @@ function sendVoiceTwiml(res, twiml, fallbackMessage = "Still here — what do yo
 }
 
 
-async function performCalendarAvailabilityCheck({ tradie, dt, tz, callSid, session }) {
+async function performCalendarAvailabilityCheck({ tradie, dt, tz, callSid, session, req, res }) {
   const startedAt = Date.now();
   console.log("CALENDAR_CHECK_START", {
     callSid,
@@ -3876,6 +3876,49 @@ async function performCalendarAvailabilityCheck({ tradie, dt, tz, callSid, sessi
         responseMs,
         error: err?.message || String(err)
       });
+
+      // Handle expired or revoked Google token gracefully
+      const isTokenError = String(err?.message || err || "").includes("invalid_grant") ||
+        String(err?.message || err || "").includes("Token has been expired") ||
+        String(err?.message || err || "").includes("invalid_token");
+
+      if (isTokenError) {
+        console.error(`GOOGLE_TOKEN_EXPIRED tradie=${tradie.key} — marking disconnected`);
+        // Mark token as disconnected in Supabase so health check catches it
+        try {
+          await supabase
+            .from(SUPABASE_TRADIES_TABLE)
+            .update({
+              google_connected: false,
+              updated_at: new Date().toISOString()
+            })
+            .eq("id", tradie.id);
+        } catch {}
+
+        // Alert owner to reconnect
+        await sendOwnerSms(tradie,
+          `⚠️ CALENDAR DISCONNECTED
+Your Google Calendar connection has expired.
+Please reconnect at: ${process.env.BASE_URL || "https://twilio-voice-bot-w9gq.onrender.com"}/api/google/connect?tradieId=${tradie.id}`
+        ).catch(() => {});
+
+        // Tell caller gracefully
+        const twiml = new VoiceResponse();
+        const actionUrl = "/process" + (req.query.tid ? `?tid=${encodeURIComponent(req.query.tid)}` : "");
+        const gather = twiml.gather({
+          input: "speech",
+          timeout: 10,
+          speechTimeout: "auto",
+          action: actionUrl,
+          method: "POST",
+          language: "en-AU"
+        });
+        gather.say(
+          "I have taken your booking details and the tradie will confirm your time directly. You will receive a text shortly.",
+          { voice: "Polly.Amy", language: "en-AU" }
+        );
+        return sendVoiceTwiml(res, twiml);
+      }
     }
     return { ok: false, slots: [], error: err };
   }
@@ -6651,7 +6694,8 @@ app.post("/check-availability", async (req, res) => {
     session.calendarCheck.attempts = Number(session.calendarCheck.attempts || 0);
 
     session.calendarCheck.attempts += 1;
-    const result = await performCalendarAvailabilityCheck({ tradie, dt, tz, callSid, session });
+    const result = await performCalendarAvailabilityCheck({ tradie, dt, tz, callSid, session, req, res });
+    if (res.headersSent) return;
     if (result.ok) {
       const slots = Array.isArray(result.slots) ? result.slots : [];
       const requestedDt = DateTime.fromISO(session.calendarCheck.requestedDtISO || dt.toISO(), { zone: tz });
