@@ -882,7 +882,7 @@ const ADMIN_DASH_PASSWORD = process.env.ADMIN_DASH_PASSWORD || "";
 // Optional LLM (off-script helper)
 // ----------------------------------------------------------------------------
 const LLM_ENABLED = String(process.env.LLM_ENABLED || "false").toLowerCase() === "true";
-const LLM_BASE_URL = process.env.LLM_BASE_URL || "https://api.openai.com/v1/responses";
+const LLM_BASE_URL = process.env.LLM_BASE_URL || "https://api.openai.com/v1/chat/completions";
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 const LLM_MODEL = process.env.LLM_MODEL || "gpt-4o-mini";
 const LLM_MAX_OUTPUT_TOKENS = Number(process.env.LLM_MAX_OUTPUT_TOKENS || 220);
