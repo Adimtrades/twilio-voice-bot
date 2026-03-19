@@ -902,12 +902,22 @@ function trimHistory(history, maxItems = 12) {
 }
 function isOffScriptSpeech(speech) {
   if (!speech) return false;
-  const s = String(speech).trim();
+  const s = String(speech).trim().toLowerCase();
   const wordCount = s.split(/\s+/).filter(Boolean).length;
-  const long = wordCount >= 18;
-  const questiony = /\?|\b(can you|do you|what is|how do|why)\b/i.test(s);
-  const hasStory = /(so|because|then|after|before|yesterday|last week|last time)/i.test(s) && wordCount >= 14;
-  return long || questiony || hasStory;
+
+  // Long speech is always off-script
+  const long = wordCount >= 12;
+
+  // Direct questions
+  const questionY = /\?|\b(can you|do you|what is|how do|why|who|where|when|is this|are you|do you guys|do you do)\b/i.test(s);
+
+  // Story or context words
+  const hasStory = /(so|because|then|after|before|yesterday|last week|last time)/i.test(s) && wordCount >= 8;
+
+  // Nonsense or clearly not an answer to the current question
+  const isNonsense = wordCount >= 4 && !/(yes|no|yeah|nope|street|road|avenue|drive|court|place|monday|tuesday|wednesday|thursday|friday|saturday|sunday|today|tomorrow|morning|afternoon|am|pm|my name is|it's|its|access|gate|dog|cat|no pets|no access)\b/i.test(s);
+
+  return long || questionY || hasStory || isNonsense;
 }
 function buildLlmSystemPrompt(tradie, session = {}) {
   const biz = tradie.bizName ? `Business name: ${tradie.bizName}.` : "";
