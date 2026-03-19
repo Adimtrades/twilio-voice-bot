@@ -3749,22 +3749,20 @@ function unlockCallCompletionIfReady(session) {
 }
 
 function safeHangupGuard(session, twiml, req) {
-  ensureCompletionState(session);
-  if (unlockCallCompletionIfReady(session)) {
-    // All conditions met — hang up cleanly
+  // If booking confirmed always allow hangup
+  if (session?.conversationState?.bookingConfirmed === true) {
     twiml.hangup();
     return true;
   }
-  // Not ready to hang up — keep caller on line
-  logStructured("HANGUP_BLOCKED", {
-    callSid: session?.callSid || resolveCallSid(req),
-    bookingConfirmed: session?.conversationState?.bookingConfirmed === true,
-    calendarSuccess: session?.conversationState?.calendarSuccess === true,
-    finalCloseDelivered: session?.conversationState?.finalCloseDelivered === true
-  });
+  ensureCompletionState(session);
+  if (unlockCallCompletionIfReady(session)) {
+    twiml.hangup();
+    return true;
+  }
+  // Not ready — keep alive
   ask(
     twiml,
-    "I am still here — just say goodbye when you are ready.",
+    session?.lastPrompt || "I am still here — just say goodbye when you are ready.",
     voiceActionUrl(req),
     { session, input: "speech", timeout: 10, speechTimeout: "auto" }
   );
@@ -3991,8 +3989,21 @@ function shouldReject(step, speech, confidence) {
   const s = String(speech || "").trim();
   if (!s || s.length < 2) return true;
 
-  // Address and time — accept anything 3+ chars, numbers score low naturally
-  if (step === "address" || step === "time") return s.length < 3;
+  if (step === "address") {
+    if (s.length < 5) return true;
+    // Reject if speech is repeated gibberish like "do do do do"
+    const words = s.split(/\s+/).filter(Boolean);
+    if (words.length >= 4) {
+      const unique = new Set(words.map(w => w.toLowerCase()));
+      if (unique.size === 1) return true; // all same word
+    }
+    // Must contain at least one number or recognisable street word
+    const hasNumber = /\d/.test(s);
+    const hasStreetWord = /\b(street|st|road|rd|avenue|ave|drive|dr|close|court|ct|place|pl|lane|ln|way|crescent|boulevard|blvd)\b/i.test(s);
+    const hasSuburb = s.split(/\s+/).length >= 2;
+    return !(hasNumber || hasStreetWord || hasSuburb);
+  }
+  if (step === "time") return s.length < 3;
 
   // Name — accept any 2+ char response
   if (step === "name") return s.length < 2;
@@ -5984,13 +5995,23 @@ app.post("/process", async (req, res) => {
 
     // STEP: confirm
     if (session.step === "confirm") {
-      // If caller repeats the time instead of saying yes/no
-      // treat it as a YES confirmation — they are confirming the time
-      const isTimeRepeat = speech && parseRequestedDateTime &&
+      // Never treat price questions as YES
+      const isPriceQ = /\b(how much|cost|price|quote|charge|fee|rate)\b/i.test(speech || "");
+      const isTimeRepeat = !isPriceQ && speech && parseRequestedDateTime &&
         !!parseRequestedDateTime(speech, tz);
-      const yn2 = detectYesNo(speech) || (isTimeRepeat ? "YES" : null);
+      const yn2 = isPriceQ ? null : (detectYesNo(speech) || (isTimeRepeat ? "YES" : null));
       const confirmConfidenceTooLow = typeof confidence === "number" &&
         confidence > 0 && confidence < 0.35;
+
+      // If caller asks price at confirm give a range then re-ask confirm
+      if (isPriceQ) {
+        session.lastPrompt = session.lastPrompt ||
+          `Just to confirm — ${session.job} at ${session.address}. Does that sound right?`;
+        const priceReply = "Pricing depends on the job and will be confirmed by the tradie. " + session.lastPrompt;
+        addToHistory(session, "assistant", priceReply);
+        ask(twiml, priceReply, actionUrl, { session, input: "speech", timeout: 10, speechTimeout: "auto" });
+        return sendVoiceTwiml(res, twiml);
+      }
 
       if (!speech || (confirmConfidenceTooLow && !yn2)) {
         const interpreted = !speech ? "NO_SPEECH" : (confirmConfidenceTooLow ? "UNCLEAR" : "UNCLEAR");
@@ -6290,12 +6311,6 @@ ${historyLine}${memoryLine}${accessLine2}${valueLine || ""}${urgencyLine || ""}$
     }
 
     if (session.step === "close") {
-      // Any speech in close step means caller acknowledged — hang up
-      ensureCompletionState(session);
-      session.conversationState.finalCloseDelivered = true;
-      ensureCallFlow(session);
-      session.callFlow.hangupAllowed = true;
-      session.conversationState.callCompletionAllowed = true;
       deregisterActiveCall(callSid);
       twiml.say("Thanks for calling. Speak soon. Goodbye.", { voice: "Polly.Amy", language: "en-AU" });
       twiml.hangup();
