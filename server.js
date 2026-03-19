@@ -3749,8 +3749,7 @@ function unlockCallCompletionIfReady(session) {
 }
 
 function safeHangupGuard(session, twiml, req) {
-  // If booking confirmed always allow hangup
-  if (session?.conversationState?.bookingConfirmed === true) {
+  if (session.bookingConfirmed && session.hangupAllowed && session.userFinalAcknowledgement) {
     twiml.hangup();
     return true;
   }
@@ -5630,6 +5629,13 @@ app.post("/process", async (req, res) => {
 
     // STEP: address
     if (session.step === "address") {
+      const isPriceQ = /\b(price|cost|how much|quote|rate|charge|fee)\b/i.test(speech);
+      if (isPriceQ) {
+        const pricePrompt = "I can't provide pricing over the phone, but the owner will be in touch about costs. Now, what is the job address?";
+        addToHistory(session, "assistant", pricePrompt);
+        ask(twiml, pricePrompt, actionUrl, { session, input: "speech", timeout: 10, speechTimeout: "auto" });
+        return sendVoiceTwiml(res, twiml);
+      }
       // If caller asks a price question during address step, answer and re-ask address
       if (/\b(how much|cost|price|quote|charge|fee|rate)\b/i.test(speech || "")) {
         const priceAddrReply = "Pricing depends on the job and will be confirmed by the tradie. " +
@@ -5740,6 +5746,13 @@ app.post("/process", async (req, res) => {
 
     // STEP: access (fixed)
     if (session.step === "access") {
+      const isPriceQ = /\b(price|cost|how much|quote|rate|charge|fee)\b/i.test(speech);
+      if (isPriceQ) {
+        const pricePrompt = "I can't provide pricing over the phone, but the owner will be in touch about costs. Any access notes like a gate code or pets?";
+        addToHistory(session, "assistant", pricePrompt);
+        ask(twiml, pricePrompt, actionUrl, { session, input: "speech", timeout: 10, speechTimeout: "auto" });
+        return sendVoiceTwiml(res, twiml);
+      }
       // If caller asks a price question during access notes, answer and re-ask access
       if (/\b(how much|cost|price|quote|charge|fee|rate)\b/i.test(speech || "")) {
         const priceAccessReply = "Pricing depends on the job and will be confirmed by the tradie on the day. " +
@@ -5788,10 +5801,17 @@ app.post("/process", async (req, res) => {
 
     // STEP: time
     if (session.step === "time") {
+      const isExclamation = /^(oh my god|oh god|wow|oh no|geez|goodness|seriously|really|ugh|hmm+|um+|uh|eh|ah+|oh+)\s*[!?.]?$/i.test((speech || "").trim());
+      if (isExclamation) {
+        session.lastPrompt = "Sorry about that — what day and time works best for you?";
+        addToHistory(session, "assistant", session.lastPrompt);
+        ask(twiml, session.lastPrompt, actionUrl, { session, input: "speech", timeout: 10, speechTimeout: "auto" });
+        return sendVoiceTwiml(res, twiml);
+      }
       // Filter out emotional exclamations that are not time values
-      const isExclamation = /^(oh my god|oh god|oh no|oh wow|oh gosh|omg|wow|really|seriously|what the|geez|bloody hell|crikey|jeez)\b/i.test((speech || "").trim());
+      const isExclamationLegacy = /^(oh my god|oh god|oh no|oh wow|oh gosh|omg|wow|really|seriously|what the|geez|bloody hell|crikey|jeez)\b/i.test((speech || "").trim());
       // Always try to parse new speech first — never skip if caller gave a time
-      if (speech && speech.trim().length > 2 && !isExclamation) {
+      if (speech && speech.trim().length > 2 && !isExclamationLegacy) {
         session.time = speech;
         session.bookedStartMs = null;
         // Reset calendar and confirm flags for fresh check
@@ -5941,6 +5961,11 @@ app.post("/process", async (req, res) => {
     if (session.step === "confirm") {
       // Never treat price questions as YES
       const isPriceQ = /\b(how much|cost|price|quote|charge|fee|rate)\b/i.test(speech || "");
+      const singleWordAmbiguous = /^(time|ok|alright|fine|what|sure|hmm|um|uh|eh)$/i.test((speech || "").trim());
+      if (singleWordAmbiguous) {
+        repeatLastStepPrompt(req, twiml, session, "confirm", "UNCLEAR");
+        return sendVoiceTwiml(res, twiml);
+      }
       // Only treat as a time repeat if speech looks like a genuine time utterance
       // — has a day/time keyword and no question word that would make it off-script
       const hasTimeKeyword = /\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday|today|tomorrow|morning|afternoon|evening|am\b|pm\b|\d{1,2}(:\d{2})?\s*(am|pm))\b/i.test(speech || "");
@@ -6154,6 +6179,8 @@ ${historyLine}${memoryLine}${accessLine2}${valueLine || ""}${urgencyLine || ""}$
       }
 
       session.bookingConfirmed = true;
+      session.hangupAllowed = true;
+      session.userFinalAcknowledgement = true;
       ensureCallFlow(session);
       console.log("FLOW STATUS:", session.callFlow);
 
@@ -6246,6 +6273,8 @@ ${historyLine}${memoryLine}${accessLine2}${valueLine || ""}${urgencyLine || ""}$
         ? " I will make sure the tradie sees this straight away."
         : "";
       const summaryText = summaryBaseText + afterHoursNote + sameDayNote;
+      session.userFinalAcknowledgement = true;
+      session.hangupAllowed = true;
       twiml.say(summaryText, { voice: "Polly.Amy", language: "en-AU" });
       ensureCompletionState(session);
       session.conversationState.finalCloseDelivered = true;
@@ -6253,6 +6282,8 @@ ${historyLine}${memoryLine}${accessLine2}${valueLine || ""}${urgencyLine || ""}$
       session.conversationState.calendarSuccess = true;
       session.conversationState.bookingConfirmed = true;
       session.bookingConfirmed = true;
+      session.hangupAllowed = true;
+      session.userFinalAcknowledgement = true;
       session.bookingFinished = true;
       deregisterActiveCall(callSid);
       twiml.hangup();
