@@ -1086,10 +1086,10 @@ async function safeLLMCall(payload) {
   const timeout = setTimeout(() => controller.abort(), 9000);
 
   try {
-    return await openai.chat.completions.create({
-      ...payload,
-      signal: controller.signal
-    });
+    return await openai.chat.completions.create(
+      payload,
+      { signal: controller.signal }
+    );
   } catch (e) {
     console.error("LLM FAIL:", e);
     return null;
