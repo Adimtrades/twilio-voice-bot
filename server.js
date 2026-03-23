@@ -900,24 +900,300 @@ function trimHistory(history, maxItems = 12) {
   if (arr.length <= maxItems) return arr;
   return arr.slice(arr.length - maxItems);
 }
-function isOffScriptSpeech(speech) {
+const SPEECH_CLASS = {
+  JOB_REALITY: "JOB_REALITY",
+  BOOKING_ANSWER: "BOOKING_ANSWER",
+  OFF_SCRIPT: "OFF_SCRIPT",
+  EMOTIONAL: "EMOTIONAL",
+  PRICE_QUESTION: "PRICE_QUESTION",
+  GENERAL_QUESTION: "GENERAL_QUESTION",
+  COMPETITOR: "COMPETITOR",
+  CORRECTION: "CORRECTION",
+  EMERGENCY: "EMERGENCY",
+  ABUSE: "ABUSE",
+  AMBIGUOUS: "AMBIGUOUS"
+};
+
+function classifyCallerSpeech(speech, session = {}) {
+  const raw = String(speech || "").trim();
+  if (!raw) return { class: SPEECH_CLASS.AMBIGUOUS, confidence: 0, reasons: ["empty"] };
+
+  const s = raw.toLowerCase();
+  const words = s.split(/\s+/).filter(Boolean);
+  const wordCount = words.length;
+  const reasons = [];
+
+  const emergencySignals = [
+    /\b(burst pipe|burst pipes|flooding|flood|gas leak|leaking gas|no gas)\b/,
+    /\b(sparking|electrical fire|no power|power out|power outage|blackout)\b/,
+    /\b(sewage|sewer overflow|overflowing toilet|toilet overflow)\b/,
+    /\b(fire|smoke alarm|smoke detector|carbon monoxide)\b/,
+    /\b(emergency|urgent|asap|right now|immediately|straight away)\b/,
+    /\b(roof collapse|ceiling collapse|structural)\b/
+  ];
+  if (emergencySignals.some((r) => r.test(s))) {
+    reasons.push("emergency_signal");
+    return { class: SPEECH_CLASS.EMERGENCY, confidence: 0.95, reasons };
+  }
+
+  const abuseWords = [
+    "fuck", "shit", "cunt", "bitch", "asshole", "arsehole",
+    "idiot", "moron", "retard", "dickhead", "bloody idiot",
+    "kill yourself", "go to hell", "f*** you", "f**k"
+  ];
+  if (abuseWords.some((w) => s.includes(w))) {
+    reasons.push("abuse_detected");
+    return { class: SPEECH_CLASS.ABUSE, confidence: 0.95, reasons };
+  }
+
+  const pricePatterns = [
+    /\b(how much|what('s| is| does) (it|this|that) cost|what are (your |the )?rates?)\b/,
+    /\b(give me a (quote|price|estimate)|how much (will|would|do) (it|you|this))\b/,
+    /\b(ballpark|rough (price|quote|cost|estimate)|price range|cost range)\b/,
+    /\b(too expensive|can('t| not) afford|cheaper|other quotes?|better price)\b/,
+    /\b(what do you charge|your (pricing|rates?|fees?))\b/
+  ];
+  if (pricePatterns.some((r) => r.test(s))) {
+    reasons.push("price_pattern");
+    return { class: SPEECH_CLASS.PRICE_QUESTION, confidence: 0.9, reasons };
+  }
+
+  const competitorPatterns = [
+    /\b(another (company|tradie|plumber|sparky|electrician|builder))\b/,
+    /\b(last (guy|bloke|tradie|plumber|sparky)|previous (tradie|company))\b/,
+    /\b(someone else (quoted|said|told)|i got another quote)\b/,
+    /\b(they (said|quoted|charged|asked)|the other (guy|company))\b/,
+    /\b(shopping around|comparing (quotes|prices))\b/
+  ];
+  if (competitorPatterns.some((r) => r.test(s))) {
+    reasons.push("competitor_mention");
+    return { class: SPEECH_CLASS.COMPETITOR, confidence: 0.88, reasons };
+  }
+
+  const correctionPatterns = [
+    /\b(actually|wait|no wait|sorry|i meant|correction|hang on)\b/,
+    /\b(that('s| is) (wrong|incorrect|not right)|change (the|my|that))\b/,
+    /\b(i said (the )?wrong|wrong (address|time|name|job))\b/
+  ];
+  if (correctionPatterns.some((r) => r.test(s)) && wordCount <= 15) {
+    reasons.push("correction_signal");
+    return { class: SPEECH_CLASS.CORRECTION, confidence: 0.82, reasons };
+  }
+
+  const emotionalPatterns = [
+    /\b(so frustrated|really (upset|angry|pissed|annoyed)|fed up)\b/,
+    /\b(been waiting (for )?(weeks?|days?|months?|ages?))\b/,
+    /\b(this is (ridiculous|outrageous|unacceptable|a joke|not good enough))\b/,
+    /\b(i can'?t (believe|deal with)|sick of (this|waiting|being told))\b/,
+    /\b(stressed|panicking|freaking out|losing my mind|at my wit'?s end)\b/,
+    /\b(you guys (never|always|keep)|every time (i call|i ring))\b/
+  ];
+  if (emotionalPatterns.some((r) => r.test(s))) {
+    reasons.push("emotional_signal");
+    return { class: SPEECH_CLASS.EMOTIONAL, confidence: 0.85, reasons };
+  }
+
+  const generalQuestionPatterns = [
+    /\b(do you (do|fix|handle|cover|service|work on|install))\b/,
+    /\b(are you (available|open|able to|licensed|insured|based in))\b/,
+    /\b(what (areas?|suburbs?|jobs?) do you (cover|do|handle|service))\b/,
+    /\b(how (long|quickly|soon) (will|can|do) you)\b/,
+    /\b(is (this|it) (covered|included|part of)|does (that|this) include)\b/,
+    /\b(who (is|are) (this|you|the tradie)|what (company|business) (is|are) (this|you))\b/,
+    /\b(can (you|i|we) (just|also|please))\b/
+  ];
+  if (generalQuestionPatterns.some((r) => r.test(s))) {
+    reasons.push("general_question");
+    return { class: SPEECH_CLASS.GENERAL_QUESTION, confidence: 0.8, reasons };
+  }
+
+  const jobRealityPatterns = [
+    /\b(leaking|dripping|blocked|burst|broken|not working|stopped working|won't (turn|switch|start|drain))\b/,
+    /\b(cracked|damaged|broken|needs? (replacing|fixing|repairing|servicing))\b/,
+    /\b(water (coming|going|pooling|dripping|leaking)|pipe (burst|leaking|blocked))\b/,
+    /\b(no (hot water|power|lights|gas|heating|cooling|water pressure))\b/,
+    /\b(sparking|tripping|overloading|short circuit|keeps (tripping|blowing))\b/,
+    /\b(roof (leaking|damaged|missing|blown off)|gutter (blocked|overflowing|damaged))\b/,
+    /\b(fence (down|damaged|needs?|falling)|deck (damaged|rotting|needs?))\b/,
+    /\b(i (need|want|have|got) (a |to |the )?(problem|issue|job|booking|plumber|electrician|tradie|sparky|builder))\b/,
+    /\b(can (you|someone) (come (out|and|to)|fix|look at|check|repair|install|replace))\b/,
+    /\b(want (to book|someone|a tradie|a plumber|an electrician))\b/,
+    /\b(it('s| is) (at|in|on|near) (my|the|our) (house|home|unit|flat|property|place|office|shop|backyard|bathroom|kitchen|laundry|garage))\b/,
+    /\b(at (\d+|[a-z]+ street|[a-z]+ road|[a-z]+ avenue|[a-z]+ drive))\b/,
+    /\b(in ([a-z]+|the [a-z]+ area|[a-z]+ suburb))\b/
+  ];
+  if (jobRealityPatterns.some((r) => r.test(s))) {
+    reasons.push("job_reality_signal");
+    return { class: SPEECH_CLASS.JOB_REALITY, confidence: 0.85, reasons };
+  }
+
+  const step = String(session.step || "intent");
+  if (step === "name") {
+    const isNameAnswer = wordCount <= 5 && !/\b(what|how|why|when|where|can|do|is|are|will)\b/.test(s);
+    if (isNameAnswer) {
+      reasons.push("name_answer");
+      return { class: SPEECH_CLASS.BOOKING_ANSWER, confidence: 0.9, reasons };
+    }
+  }
+  if (step === "address" || step === "address_confirm") {
+    const addressSignals = [
+      /\d+\s+[a-z]/,
+      /\b(street|road|avenue|drive|close|court|place|lane|crescent|way|boulevard|terrace)\b/i,
+      /\b(unit|flat|apartment|level)\s+\d+/i,
+      /\b(cnr|corner)\b/i
+    ];
+    if (addressSignals.some((r) => r.test(s))) {
+      reasons.push("address_signal");
+      return { class: SPEECH_CLASS.BOOKING_ANSWER, confidence: 0.92, reasons };
+    }
+  }
+  if (step === "time" || step === "pickSlot") {
+    const timeSignals = [
+      /\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/,
+      /\b(today|tomorrow|this week|next week|this arvo|this afternoon|this morning)\b/,
+      /\b\d{1,2}(:\d{2})?\s*(am|pm)\b/,
+      /\b(morning|afternoon|evening|midday|noon|anytime|asap|soon)\b/,
+      /\b(after work|before (work|school)|first thing|end of (the )?week)\b/
+    ];
+    if (timeSignals.some((r) => r.test(s))) {
+      reasons.push("time_signal");
+      return { class: SPEECH_CLASS.BOOKING_ANSWER, confidence: 0.92, reasons };
+    }
+  }
+  if (step === "access") {
+    const accessSignals = [
+      /\b(gate|code|parking|pet|dog|cat|animal|buzz|intercom|key|lockbox|side entrance|back entrance)\b/,
+      /\b(no (gate|pets?|animals?|parking|access notes?)|none|nothing)\b/,
+      /\b(call (me |us )?(when|before|on arrival)|let yourself in|door will be open)\b/
+    ];
+    if (accessSignals.some((r) => r.test(s))) {
+      reasons.push("access_signal");
+      return { class: SPEECH_CLASS.BOOKING_ANSWER, confidence: 0.92, reasons };
+    }
+    if (wordCount <= 8) {
+      reasons.push("short_access_answer");
+      return { class: SPEECH_CLASS.BOOKING_ANSWER, confidence: 0.8, reasons };
+    }
+  }
+  if (step === "confirm") {
+    const confirmSignals = [
+      /^(yes|yeah|yep|yup|no|nope|nah|correct|wrong|that's right|sounds good|book it|go ahead|confirm)$/i
+    ];
+    if (confirmSignals.some((r) => r.test(raw.trim()))) {
+      reasons.push("confirm_answer");
+      return { class: SPEECH_CLASS.BOOKING_ANSWER, confidence: 0.95, reasons };
+    }
+  }
+
+  let offScriptScore = 0;
+  if (/\b(my neighbour|my partner|my husband|my wife|my landlord|my tenant|my boss)\b/.test(s) && wordCount > 15) {
+    offScriptScore += 2;
+    reasons.push("third_party_story");
+  }
+  if (/\b(what('s| is) (the )?time|what day (is it|is today)|how'?s the weather)\b/.test(s)) {
+    offScriptScore += 3;
+    reasons.push("irrelevant_question");
+  }
+  if (/\b(election|prime minister|government|politics|covid|vaccine|climate change|news)\b/.test(s) && wordCount > 5) {
+    offScriptScore += 3;
+    reasons.push("off_topic_subject");
+  }
+  if (wordCount >= 4) {
+    const unique = new Set(words);
+    if (unique.size <= 2) {
+      offScriptScore += 4;
+      reasons.push("repeated_words_garbage");
+    }
+  }
+  if (wordCount > 20) {
+    const hasAnyBookingWord = [
+      /\b(plumb|electric|build|paint|tile|roof|deck|fence|drain|pipe|tap|leak|fix|repair|book|come out|visit|job|work)\b/,
+      /\b(address|street|road|suburb|monday|tuesday|wednesday|thursday|friday|name|access|gate|parking)\b/
+    ].some((r) => r.test(s));
+    if (!hasAnyBookingWord) {
+      offScriptScore += 2;
+      reasons.push("long_no_booking_context");
+    }
+  }
+
+  const isOpenQuestion = /\?/.test(raw) || /^(what|how|why|when|where|who|is|are|can|could|would|will|does|did)\b/i.test(raw);
+  const questionIsAboutBooking = /\b(book|booking|appointment|time|available|come|address|name|job)\b/.test(s);
+  if (isOpenQuestion && !questionIsAboutBooking) {
+    offScriptScore += 2;
+    reasons.push("non_booking_question");
+  }
+  if (offScriptScore >= 3) {
+    return { class: SPEECH_CLASS.OFF_SCRIPT, confidence: Math.min(0.5 + offScriptScore * 0.1, 0.9), reasons };
+  }
+
+  reasons.push("no_clear_signal");
+  return { class: SPEECH_CLASS.AMBIGUOUS, confidence: 0.4, reasons };
+}
+
+function isOffScriptSpeech(speech, session = {}) {
   if (!speech) return false;
-  const s = String(speech).trim().toLowerCase();
-  const wordCount = s.split(/\s+/).filter(Boolean).length;
+  const result = classifyCallerSpeech(speech, session);
 
-  // Long speech is always off-script
-  const long = wordCount >= 12;
+  const llmTriggerClasses = [
+    SPEECH_CLASS.OFF_SCRIPT,
+    SPEECH_CLASS.EMOTIONAL,
+    SPEECH_CLASS.COMPETITOR,
+    SPEECH_CLASS.AMBIGUOUS
+  ];
+  const onTrackClasses = [
+    SPEECH_CLASS.JOB_REALITY,
+    SPEECH_CLASS.BOOKING_ANSWER,
+    SPEECH_CLASS.CORRECTION,
+    SPEECH_CLASS.EMERGENCY,
+    SPEECH_CLASS.ABUSE
+  ];
 
-  // Direct questions
-  const questionY = /\?|\b(can you|do you|what is|how do|why|who|where|when|is this|are you|do you guys|do you do)\b/i.test(s);
+  if (onTrackClasses.includes(result.class)) return false;
+  if (llmTriggerClasses.includes(result.class)) return true;
+  if (result.class === SPEECH_CLASS.PRICE_QUESTION) return true;
+  if (result.class === SPEECH_CLASS.GENERAL_QUESTION) return true;
+  return false;
+}
 
-  // Story or context words
-  const hasStory = /(so|because|then|after|before|yesterday|last week|last time)/i.test(s) && wordCount >= 8;
+function decideLlmUsage(speech, session, tradie) {
+  if (!speech || !speech.trim()) return { shouldCall: false, reason: "no_speech" };
+  if (!llmReady()) return { shouldCall: false, reason: "llm_not_ready" };
+  if ((session.llmTurns || 0) >= (typeof LLM_MAX_TURNS !== "undefined" ? LLM_MAX_TURNS : 8)) {
+    return { shouldCall: false, reason: "max_turns_reached" };
+  }
 
-  // Nonsense or clearly not an answer to the current question
-  const isNonsense = wordCount >= 4 && !/(yes|no|yeah|nope|street|road|avenue|drive|court|place|monday|tuesday|wednesday|thursday|friday|saturday|sunday|today|tomorrow|morning|afternoon|am|pm|my name is|it's|its|access|gate|dog|cat|no pets|no access)\b/i.test(s);
+  const deterministicSteps = ["confirm", "pickSlot", "address_confirm", "close", "sms_fallback_offer"];
+  if (deterministicSteps.includes(session.step || "")) {
+    return { shouldCall: false, reason: "deterministic_step" };
+  }
 
-  return long || questionY || hasStory || isNonsense;
+  const classification = classifyCallerSpeech(speech, session);
+  const alwaysLlm = [SPEECH_CLASS.EMOTIONAL, SPEECH_CLASS.COMPETITOR, SPEECH_CLASS.OFF_SCRIPT];
+  if (alwaysLlm.includes(classification.class)) {
+    return { shouldCall: true, classification, reason: `always_llm:${classification.class}` };
+  }
+
+  const questionClasses = [SPEECH_CLASS.PRICE_QUESTION, SPEECH_CLASS.GENERAL_QUESTION];
+  if (questionClasses.includes(classification.class)) {
+    const questionStepsToSkip = ["name", "address", "address_confirm"];
+    if (questionStepsToSkip.includes(session.step || "")) {
+      return { shouldCall: false, reason: "question_at_simple_step" };
+    }
+    return { shouldCall: true, classification, reason: `question:${classification.class}` };
+  }
+
+  if (classification.class === SPEECH_CLASS.AMBIGUOUS) {
+    const unclearTurns = session.unclearTurns || 0;
+    if (unclearTurns >= 2) return { shouldCall: true, classification, reason: "ambiguous_repeated" };
+    return { shouldCall: false, reason: "ambiguous_single_turn" };
+  }
+
+  return { shouldCall: false, classification, reason: `on_track:${classification.class}` };
+}
+
+function isBookingFlowAnswer(speech, session) {
+  const result = classifyCallerSpeech(speech, session);
+  return result.class === SPEECH_CLASS.BOOKING_ANSWER || result.class === SPEECH_CLASS.JOB_REALITY;
 }
 function buildLlmSystemPrompt(tradie, session = {}) {
   const biz = tradie.bizName ? `Business name: ${tradie.bizName}.` : "";
@@ -4540,7 +4816,7 @@ function trySlotFill(session, speech, tz) {
 
   // Extract suburb mentioned in passing during other steps
   if (!session.suburb) {
-    const suburbMatch = raw.match(/\bin\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\b/);
+    const suburbMatch = raw.match(/\bin\s+([a-z][a-z]+(?:\s+[a-z][a-z]+)?)\b/i);
     if (suburbMatch?.[1] && suburbMatch[1].length > 3) {
       session.suburb = suburbMatch[1];
     }
@@ -5455,20 +5731,9 @@ app.post("/process", async (req, res) => {
       session.customerNote = await getCustomerNote(tradie.key, session.from).catch(() => null);
     }
 
-    // LLM assist (optional, off-script only by default)
-    const isOffScript = isOffScriptSpeech(speech) ||
-      (session.lastEmotion && session.lastEmotion !== "neutral") ||
-      detectAbuse(speech);
-
-    // Also detect price questions and general questions as off-script
-    const isPriceQuestion = /\b(how much|price|cost|quote|charge|fee|rate|expensive|cheap)\b/i.test(speech || "");
-    const isQuestion = /\?/.test(speech || "") || /\b(what|how|why|when|where|who|can you|do you|is it)\b/i.test(speech || "");
-    const shouldUseLlm =
-      llmReady() &&
-      session.llmTurns < LLM_MAX_TURNS &&
-      !!speech &&
-      (isOffScript || isPriceQuestion || isQuestion) &&
-      !["confirm", "pickSlot", "initial"].includes(session.step);
+    // LLM assist (optional)
+    const llmDecision = decideLlmUsage(speech, session, tradie);
+    const shouldUseLlm = llmDecision.shouldCall;
 
     // Smart mode disabled — step handlers manage the flow directly
 
@@ -5479,6 +5744,7 @@ app.post("/process", async (req, res) => {
 
 
     if (shouldUseLlm) {
+      console.log(`LLM_TRIGGER reason=${llmDecision.reason} class=${llmDecision.classification?.class || "n/a"}`);
       session.llmTurns += 1;
       const llm = await callLlm(tradie, session, speech);
 
@@ -5639,19 +5905,12 @@ app.post("/process", async (req, res) => {
 
     // STEP: address
     if (session.step === "address") {
-      const isPriceQ = /\b(price|cost|how much|quote|rate|charge|fee)\b/i.test(speech);
+      const speechClass = classifyCallerSpeech(speech, session);
+      const isPriceQ = speechClass.class === SPEECH_CLASS.PRICE_QUESTION;
       if (isPriceQ) {
         const pricePrompt = "I can't provide pricing over the phone, but the owner will be in touch about costs. Now, what is the job address?";
         addToHistory(session, "assistant", pricePrompt);
         ask(twiml, pricePrompt, actionUrl, { session, input: "speech", timeout: 10, speechTimeout: "auto" });
-        return sendVoiceTwiml(res, twiml);
-      }
-      // If caller asks a price question during address step, answer and re-ask address
-      if (/\b(how much|cost|price|quote|charge|fee|rate)\b/i.test(speech || "")) {
-        const priceAddrReply = "Pricing depends on the job and will be confirmed by the tradie. " +
-          (session.lastPrompt || "What is the address for the job?");
-        addToHistory(session, "assistant", priceAddrReply);
-        ask(twiml, priceAddrReply, actionUrl, { session, input: "speech", timeout: 10, speechTimeout: "auto" });
         return sendVoiceTwiml(res, twiml);
       }
       if (speech) session.address = speech;
@@ -5756,19 +6015,12 @@ app.post("/process", async (req, res) => {
 
     // STEP: access (fixed)
     if (session.step === "access") {
-      const isPriceQ = /\b(price|cost|how much|quote|rate|charge|fee)\b/i.test(speech);
+      const speechClass = classifyCallerSpeech(speech, session);
+      const isPriceQ = speechClass.class === SPEECH_CLASS.PRICE_QUESTION;
       if (isPriceQ) {
         const pricePrompt = "I can't provide pricing over the phone, but the owner will be in touch about costs. Any access notes like a gate code or pets?";
         addToHistory(session, "assistant", pricePrompt);
         ask(twiml, pricePrompt, actionUrl, { session, input: "speech", timeout: 10, speechTimeout: "auto" });
-        return sendVoiceTwiml(res, twiml);
-      }
-      // If caller asks a price question during access notes, answer and re-ask access
-      if (/\b(how much|cost|price|quote|charge|fee|rate)\b/i.test(speech || "")) {
-        const priceAccessReply = "Pricing depends on the job and will be confirmed by the tradie on the day. " +
-          (session.lastPrompt || "Any access notes like a gate code, parking, or pets? Just say none if not.");
-        addToHistory(session, "assistant", priceAccessReply);
-        ask(twiml, priceAccessReply, actionUrl, { session, input: "speech", timeout: 10, speechTimeout: "auto" });
         return sendVoiceTwiml(res, twiml);
       }
       const a = interpretAccessUtterance(speech);
@@ -5970,7 +6222,8 @@ app.post("/process", async (req, res) => {
     // STEP: confirm
     if (session.step === "confirm") {
       // Never treat price questions as YES
-      const isPriceQ = /\b(how much|cost|price|quote|charge|fee|rate)\b/i.test(speech || "");
+      const speechClass = classifyCallerSpeech(speech, session);
+      const isPriceQ = speechClass.class === SPEECH_CLASS.PRICE_QUESTION;
       const singleWordAmbiguous = /^(time|ok|alright|fine|what|sure|hmm|um|uh|eh)$/i.test((speech || "").trim());
       if (singleWordAmbiguous) {
         repeatLastStepPrompt(req, twiml, session, "confirm", "UNCLEAR");
