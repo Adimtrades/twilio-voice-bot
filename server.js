@@ -2257,18 +2257,59 @@ app.post("/billing/checkout", async (req, res) => {
 // Simple success page (swap for Carrd redirect if you want)
 app.get("/onboarding/success", (req, res) => {
   const base = getBaseUrl(req);
-  const sessionId = String(req.query.session_id || "").trim();
-  if (!sessionId) return res.status(400).send("Missing session_id");
-
-  return res.status(200).send(
-    `<html><body style="font-family:Arial;padding:24px;">
-      <h2>Payment received ✅</h2>
-      <p>Next: complete setup.</p>
-      <p><a href="${base}/onboarding/verify?session_id=${encodeURIComponent(sessionId)}">Continue setup</a></p>
-    </body></html>`
-  );
+  return res.status(200).send(`
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <meta charset="UTF-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1.0">
+      <title>Payment Successful</title>
+      <style>
+        body { font-family: sans-serif; text-align: center; padding: 60px 20px; background: #f0fdf4; }
+        .card { background: white; border-radius: 12px; padding: 40px; max-width: 480px; margin: 0 auto; box-shadow: 0 4px 24px rgba(0,0,0,0.08); }
+        h1 { color: #16a34a; }
+        p { color: #555; line-height: 1.6; }
+      </style>
+    </head>
+    <body>
+      <div class="card">
+        <div style="font-size:48px">✅</div>
+        <h1>Payment received!</h1>
+        <p>Your AI receptionist is being set up.<br>
+        Check your email for next steps including how to connect your Google Calendar.</p>
+        <p style="color:#888;font-size:14px">This usually takes 2-3 minutes.</p>
+      </div>
+    </body>
+    </html>
+  `);
 });
-app.get("/onboarding/cancelled", (req, res) => res.status(200).send("Checkout cancelled."));
+app.get("/onboarding/cancelled", (req, res) => {
+  return res.status(200).send(`
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <meta charset="UTF-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1.0">
+      <title>Checkout Cancelled</title>
+      <style>
+        body { font-family: sans-serif; text-align: center; padding: 60px 20px; background: #fafafa; }
+        .card { background: white; border-radius: 12px; padding: 40px; max-width: 480px; margin: 0 auto; box-shadow: 0 4px 24px rgba(0,0,0,0.08); }
+        h1 { color: #374151; }
+        p { color: #555; line-height: 1.6; }
+        a { color: #2563eb; }
+      </style>
+    </head>
+    <body>
+      <div class="card">
+        <div style="font-size:48px">↩️</div>
+        <h1>No worries</h1>
+        <p>Your checkout was cancelled. No charge was made.</p>
+        <p>Ready to try again? <a href="/">Go back</a></p>
+      </div>
+    </body>
+    </html>
+  `);
+});
 
 // GET /onboarding/verify?session_id=...
 app.get("/onboarding/verify", async (req, res) => {
