@@ -88,7 +88,15 @@ function readGoogleServiceAccount() {
   throw new Error("Missing GOOGLE_SERVICE_JSON env/config");
 }
 
-readGoogleServiceAccount();
+try {
+  readGoogleServiceAccount();
+} catch (googleSaErr) {
+  console.warn(
+    `${LOG_TAG} Google service account not loaded at startup — ` +
+    `calendar features unavailable until GOOGLE_SERVICE_JSON is configured. ` +
+    `Reason: ${googleSaErr?.message || googleSaErr}`
+  );
+}
 
 const requiredEnv = [
   "TWILIO_ACCOUNT_SID",
@@ -113,7 +121,14 @@ if (DEV_MODE) {
 }
 
 // Start Claw bot in background
-require('./claw');
+try {
+  require('./claw');
+} catch (clawErr) {
+  console.warn(
+    `${LOG_TAG} claw module failed to load — background bot unavailable. ` +
+    `Reason: ${clawErr?.message || clawErr}`
+  );
+}
 // ----------------------------------------------------------------------------
 // App bootstrap
 // ----------------------------------------------------------------------------
@@ -133,7 +148,14 @@ app.use((req, res, next) => {
 // Global request timeout — kill any request taking over 25 seconds
 // Twilio webhooks time out at 30s so 25s gives time to respond
 app.use((req, res, next) => {
-  const TIMEOUT_MS = Number(process.env.REQUEST_TIMEOUT_MS || 25000);
+  // Calendar ops can take up to ~27s worst case (3 retries x 8s + gaps)
+  // Voice routes need extra headroom — use 29s for Twilio routes, 25s for others
+  const isTwilioCalendarRoute = req.originalUrl.includes("/check-availability") ||
+    req.originalUrl.includes("/confirm") ||
+    req.originalUrl.includes("/process");
+  const TIMEOUT_MS = isTwilioCalendarRoute
+    ? Number(process.env.CALENDAR_REQUEST_TIMEOUT_MS || 29000)
+    : Number(process.env.REQUEST_TIMEOUT_MS || 25000);
   const timer = setTimeout(() => {
     if (!res.headersSent) {
       console.error(`REQUEST_TIMEOUT ${req.method} ${req.originalUrl}`);
@@ -246,12 +268,35 @@ const safeAsync = (fn) => (req, res, next) =>
   Promise.resolve(fn(req, res, next)).catch((err) => {
     console.error("ROUTE ERROR:", err);
     if (res.headersSent) return;
-    const isSmsLike = (req.originalUrl || "").includes("/sms");
-    const fallbackTwiml = isSmsLike
-      ? "<Response><Message>Sorry, we are experiencing a temporary issue. Let’s continue.</Message></Response>"
-      : "<Response><Say>Sorry, we are experiencing a temporary issue. Let’s continue.</Say></Response>";
-    res.type("text/xml");
-    res.send(fallbackTwiml);
+    const url = req.originalUrl || "";
+    const isTwilioVoice = url.includes("/twilio/voice") || url.includes("/process") ||
+      url.includes("/check-availability") || url.includes("/confirm") ||
+      url.includes("/voice") || url.includes("/next-step") || url.includes("/time");
+    const isSmsLike = url.includes("/sms");
+    const isApiRoute = url.startsWith("/billing") || url.startsWith("/admin") ||
+      url.startsWith("/onboarding") || url.startsWith("/stripe") ||
+      url.startsWith("/api") || url.startsWith("/debug") ||
+      url.startsWith("/form");
+    if (isApiRoute) {
+      return res.status(500).json({ ok: false, error: "Internal server error" });
+    }
+    if (isSmsLike) {
+      res.type("text/xml");
+      return res.send(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>" +
+        "<Response><Message>Sorry, we are experiencing a temporary issue. Let's continue.</Message></Response>"
+      );
+    }
+    if (isTwilioVoice) {
+      res.type("text/xml");
+      return res.send(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>" +
+        "<Response><Say voice=\"Polly.Amy\" language=\"en-AU\">" +
+        "Sorry about that — still here. What do you need help with today?" +
+        "</Say><Redirect method=\"POST\">/process</Redirect></Response>"
+      );
+    }
+    return res.status(500).json({ ok: false, error: "Internal server error" });
   });
 
 function wrapRouteMethod(method) {
@@ -293,6 +338,30 @@ app.use((req, res, next) => {
   next();
 });
 
+
+// Security headers — prevent clickjacking, sniffing, and info leakage
+app.use((req, res, next) => {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("X-XSS-Protection", "1; mode=block");
+  res.setHeader("Referrer-Policy", "no-referrer");
+  res.removeHeader("X-Powered-By");
+  // Only send HSTS on HTTPS
+  if ((req.headers["x-forwarded-proto"] || "").includes("https")) {
+    res.setHeader("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
+  }
+  next();
+});
+
+// Reject oversized non-file request bodies early (defence in depth on top of express limits)
+app.use((req, res, next) => {
+  const contentLength = Number(req.headers["content-length"] || 0);
+  if (contentLength > 10 * 1024 * 1024) { // 10MB hard cap
+    return res.status(413).json({ error: "Payload too large" });
+  }
+  next();
+});
+
 app.get('/health', (req, res) => {
   const mem = process.memoryUsage();
   res.json({
@@ -305,7 +374,7 @@ app.get('/health', (req, res) => {
     heapMB: Math.round(mem.heapUsed / 1024 / 1024),
     rssMB: Math.round(mem.rss / 1024 / 1024),
     supabaseCircuit: typeof supabaseCircuit !== "undefined" ? supabaseCircuit.state : "UNKNOWN",
-    llmCircuit: global._llmCircuit ? global._llmCircuit.state : "CLOSED",
+    llmCircuit: llmCircuit.state,
     errorRateLastHour: typeof errorRateTracker !== "undefined" ? errorRateTracker.count : 0
   });
 });
@@ -475,6 +544,11 @@ function collectRoutesFromStack(stack, basePath = "") {
 }
 
 app.get("/debug/routes", (req, res) => {
+  const secret = String(req.query.secret || "").trim();
+  if (!secret || secret !== process.env.DEBUG_CALENDAR_SECRET) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+
   const stack = app.router?.stack || app._router?.stack || [];
   const routes = collectRoutesFromStack(stack)
     .filter((route) => route.path)
@@ -598,7 +672,12 @@ function normalizePhoneE164AU(phone) {
     return `+${digits}`;
   }
 
-  if (digits.startsWith("61")) {
+  // 11-digit AU number with country code but no + e.g. "61412345678"
+  if (digits.startsWith("61") && digits.length === 11) {
+    return `+${digits}`;
+  }
+  // Longer strings starting with 61 already have full international format
+  if (digits.startsWith("61") && digits.length > 11) {
     return `+${digits}`;
   }
 
@@ -619,6 +698,21 @@ function hashOnboardingToken(token) {
 
 function generateOnboardingToken() {
   return crypto.randomBytes(32).toString("hex");
+}
+
+async function scheduleJobInDb(jobType, payload, runAt) {
+  if (!supabase) return;
+  try {
+    await supabase.from("scheduled_jobs").insert({
+      job_type: jobType,
+      payload,
+      run_at: runAt instanceof Date ? runAt.toISOString() : runAt,
+      status: "pending",
+      created_at: new Date().toISOString()
+    });
+  } catch (sjErr) {
+    console.warn("scheduleJobInDb failed", { jobType, error: sjErr?.message || sjErr });
+  }
 }
 
 async function lookupTradieAccountByCalledNumber({ supabase, calledNumber }) {
@@ -1396,18 +1490,17 @@ async function callLlm(tradie, session, userSpeech) {
   ];
 
   // LLM circuit breaker
-  if (!global._llmCircuit) {
-    global._llmCircuit = { failures: 0, lastFailure: 0, state: "CLOSED" };
-  }
-  const llmC = global._llmCircuit;
+  // Use module-level circuit breaker (consistent with supabaseCircuit pattern)
+  const llmC = llmCircuit;
   const llmNow = Date.now();
-  if (llmC.state === "OPEN" && llmNow - llmC.lastFailure < 60000) {
+  if (llmC.state === "OPEN" && llmNow - llmC.lastFailure < llmC.RECOVERY_MS) {
     console.warn("LLM_CIRCUIT_OPEN skipping LLM call");
     return null;
   }
-  if (llmNow - llmC.lastFailure > 60000) {
+  if (llmC.state === "OPEN" && llmNow - llmC.lastFailure >= llmC.RECOVERY_MS) {
     llmC.state = "CLOSED";
     llmC.failures = 0;
+    console.log("LLM_CIRCUIT_CLOSED recovery window elapsed");
   }
 
   let llmTimer;
@@ -1739,23 +1832,23 @@ async function sendActivationEmailForTradie({ tradie, provisionedPhoneNumber = "
     return;
   }
 
-  // Hard stop — never send activation email twice
-  const { data: sentCheck } = await supabase
-    .from(SUPABASE_TRADIES_TABLE)
-    .select("activation_email_sent")
-    .eq("id", tradie.id)
-    .single();
-
-  if (sentCheck?.activation_email_sent === true) {
-    console.log("activation email skipped: already sent", { tradie_id: tradie.id, source });
-    return;
-  }
-
-  // Mark as sent immediately before sending to prevent race condition
-  await supabase
+  // Atomic claim — only the first concurrent caller wins, others get no rows back
+  const { data: claimResult, error: claimError } = await supabase
     .from(SUPABASE_TRADIES_TABLE)
     .update({ activation_email_sent: true, updated_at: new Date().toISOString() })
-    .eq("id", tradie.id);
+    .eq("id", tradie.id)
+    .eq("activation_email_sent", false)
+    .select("id")
+    .maybeSingle();
+
+  if (claimError) {
+    console.error("activation email claim error", { tradie_id: tradie.id, source, error: claimError.message });
+    return;
+  }
+  if (!claimResult?.id) {
+    console.log("activation email skipped: already sent (atomic check)", { tradie_id: tradie.id, source });
+    return;
+  }
 
   const twilioNumber = String(provisionedPhoneNumber || "").trim() || await getLatestActiveTwilioNumberForTradie(tradie.id);
   const fallbackTriggered = !twilioNumber;
@@ -2032,26 +2125,28 @@ async function provisionTwilioNumberForTradie(tradie, reqForBaseUrl) {
 
   if (supaReady() && supabase) {
     const phoneNumber = allocated.phoneNumber;
-    let existingNumber = null;
-    try {
-      const { data: numRow } = await supabase
-        .from("twilio_numbers")
-        .select("id")
-        .eq("phone_number", phoneNumber)
-        .single();
-      existingNumber = numRow;
-    } catch {}
 
-    if (!existingNumber) {
-      await supabase
-        .from("twilio_numbers")
-        .insert({ phone_number: phoneNumber, tradie_id: tradieId });
-    } else {
-      // Update existing row to point to this tradie
-      await supabase
-        .from("twilio_numbers")
-        .update({ tradie_id: tradieId, updated_at: new Date().toISOString() })
-        .eq("phone_number", phoneNumber);
+    // Upsert into twilio_numbers — single atomic operation, no orphan risk
+    const { error: numUpsertErr } = await supabase
+      .from("twilio_numbers")
+      .upsert(
+        {
+          phone_number: phoneNumber,
+          tradie_id: tradieId,
+          sid: allocated.sid,
+          assigned_tradie_id: tradieId,
+          updated_at: new Date().toISOString()
+        },
+        { onConflict: "phone_number" }
+      );
+    if (numUpsertErr) {
+      console.error("TWILIO_NUMBERS_UPSERT_FAILED", {
+        tradie_id: tradieId,
+        phone_number: phoneNumber,
+        error: numUpsertErr.message
+      });
+      // Do not continue — tradie table update below would create orphan
+      throw new Error(`twilio_numbers upsert failed: ${numUpsertErr.message}`);
     }
 
     await supabase.from(SUPABASE_TRADIE_ACCOUNTS_TABLE).upsert({
@@ -2763,51 +2858,9 @@ app.post("/stripe/webhook", express.raw({ type: "application/json" }), async (re
           });
           cacheSet(`tid:${tradieKey}`, { tradie_key: tradieKey, stripe_customer_id: customerId });
         }
-
-        (async () => {
-          try {
-            console.log("AUTO_PROVISION start", tradieKey);
-            const existing = await getOne(
-              SUPABASE_TRADIES_TABLE,
-              `tradie_key=eq.${encodeURIComponent(tradieKey)}&select=*`
-            );
-            if (!existing) return;
-
-            if (existing.twilio_number || existing.twilio_phone_number) {
-              console.log("AUTO_PROVISION already has number", existing.twilio_number || existing.twilio_phone_number);
-            } else {
-              const provisioned = await provisionTwilioNumberForTradie(existing, req);
-              const phoneNumber = provisioned?.phoneNumber || "";
-              if (phoneNumber) {
-                console.log("AUTO_PROVISION provisioned", phoneNumber);
-                await upsertRow(SUPABASE_TRADIES_TABLE, {
-                  tradie_key: tradieKey,
-                  twilio_number: phoneNumber,
-                  twilio_incoming_sid: provisioned?.sid || null,
-                  updated_at: new Date().toISOString()
-                });
-              }
-            }
-
-            const fresh = await getOne(
-              SUPABASE_TRADIES_TABLE,
-              `tradie_key=eq.${encodeURIComponent(tradieKey)}&select=*`
-            );
-            if (!fresh) return;
-            const twilioNumber = String(fresh.twilio_number || fresh.twilio_phone_number || "").trim();
-            if (!twilioNumber) return;
-
-            const tradieCfg = await getTradieConfig({ query: { tid: tradieKey }, body: {} });
-            await sendOwnerSms(
-              tradieCfg,
-              `Your AI receptionist is live ✅\nYour bot number: ${twilioNumber}\nNext: call it for a quick test, then forward your current business line.`
-            ).catch(() => {});
-
-            // Email send is handled in syncActiveSubscriptionAndProvision to avoid duplicates.
-          } catch (err) {
-            console.error("AUTO_PROVISION failed", err);
-          }
-        })();
+        // Provisioning and owner SMS handled exclusively by
+        // syncActiveSubscriptionAndProvision below — IIFE removed to prevent
+        // duplicate number purchase race condition.
 
         try {
           await syncActiveSubscriptionAndProvision({
@@ -2876,6 +2929,12 @@ app.post("/stripe/webhook", express.raw({ type: "application/json" }), async (re
         });
 
         // Win-back SMS 24 hours after cancellation
+        // Persist win-back SMS to DB so it survives server restarts
+        scheduleJobInDb("winback_sms", {
+          customer_id: customerId,
+          tradie_key: customerId
+        }, new Date(Date.now() + 24 * 60 * 60 * 1000)).catch(() => {});
+
         setTimeout(async () => {
           try {
             const cancelledTradie = await getTradieByStripeRefs({ customerId, subscriptionId });
@@ -3248,6 +3307,14 @@ const supabaseCircuit = {
   RECOVERY_MS: 30000
 };
 
+const llmCircuit = {
+  failures: 0,
+  lastFailure: 0,
+  state: "CLOSED",
+  FAILURE_THRESHOLD: 3,
+  RECOVERY_MS: 60000
+};
+
 // Concurrent call tracking for commercial monitoring
 const activeCallsMap = new Map(); // callSid -> startTime
 
@@ -3347,6 +3414,14 @@ function cleanupMaps() {
   if (typeof processedStripeEvents !== "undefined" && processedStripeEvents.size > 500) {
     for (const [eid, ts] of processedStripeEvents.entries()) {
       if (now - ts > 120000) processedStripeEvents.delete(eid);
+    }
+  }
+
+  // Clean onboarding rate limit map — remove windows older than 2x the window
+  const onboardingRlNow = Date.now();
+  for (const [k, v] of onboardingStartRateLimit.entries()) {
+    if (onboardingRlNow - (v?.resetAt || 0) > ONBOARDING_START_RATE_LIMIT_WINDOW_MS * 2) {
+      onboardingStartRateLimit.delete(k);
     }
   }
   for (const [sid, data] of sessions.entries()) {
@@ -6456,6 +6531,14 @@ ${historyLine}${memoryLine}${accessLine2}${valueLine || ""}${urgencyLine || ""}$
       const ratingNumber = tradie.twilioNumber || tradie.smsFrom || "";
       const ratingTradieKey = tradie.key || "";
       if (ratingFrom && ratingNumber) {
+        // Persist rating SMS to DB so it survives server restarts
+        scheduleJobInDb("rating_sms", {
+          from: ratingNumber,
+          to: ratingFrom,
+          name: ratingName,
+          tradie_key: ratingTradieKey
+        }, new Date(Date.now() + ratingDelayMs)).catch(() => {});
+
         setTimeout(async () => {
           try {
             await sendSms({
@@ -6480,6 +6563,18 @@ ${historyLine}${memoryLine}${accessLine2}${valueLine || ""}${urgencyLine || ""}$
       const checklistAccess = session.accessNote || "";
       const checklistNumber = tradie.twilioNumber || tradie.smsFrom || "";
       if (checklistFrom && checklistNumber && checklistDelayMs) {
+        // Persist checklist SMS to DB so it survives server restarts
+        if (checklistDelayMs) {
+          scheduleJobInDb("checklist_sms", {
+            from: checklistNumber,
+            to: checklistFrom,
+            name: checklistName,
+            job: checklistJob,
+            access: checklistAccess,
+            tradie_key: tradie.key
+          }, new Date(Date.now() + checklistDelayMs)).catch(() => {});
+        }
+
         setTimeout(async () => {
           try {
             const accessLine = checklistAccess && !/^none$/i.test(checklistAccess.trim())
